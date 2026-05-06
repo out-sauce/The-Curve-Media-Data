@@ -1,8 +1,9 @@
 """
 Research stage — scrapes full article text and generates deep summaries.
 
-Runs after tagging, before briefing. Only processes articles in accepted
-clusters that score >= research_score_threshold (default 0.60).
+Runs after tagging. Only processes articles in scored clusters that score
+>= research_score_threshold (default 0.60). Transitions cluster status
+to 'researched' once all articles are processed.
 
 Results stored directly on news_articles rows:
   full_text, word_count, scrape_status, scraped_at
@@ -34,21 +35,21 @@ DEFAULT_RESEARCH_THRESHOLD = 0.60
 # DB helpers
 # ---------------------------------------------------------------------------
 
-def _fetch_research_articles(run_date: str, score_threshold: float) -> list[dict[str, Any]]:
-    """Fetch articles in accepted clusters at or above score_threshold."""
+def _fetch_research_articles(run_date: str, score_threshold: float) -> tuple[list[dict[str, Any]], list[str]]:
+    """Fetch articles in scored clusters at or above score_threshold. Returns (articles, cluster_ids)."""
     client = get_client()
 
     cluster_resp = (
         client.table(CLUSTERS_TABLE)
         .select("cluster_id")
         .eq("date", run_date)
-        .eq("cluster_status", "accepted")
+        .eq("cluster_status", "scored")
         .gte("relevance_score", score_threshold)
         .execute()
     )
     cluster_ids = [r["cluster_id"] for r in (cluster_resp.data or [])]
     if not cluster_ids:
-        return []
+        return [], []
 
     articles = []
     for i in range(0, len(cluster_ids), 50):
@@ -60,7 +61,7 @@ def _fetch_research_articles(run_date: str, score_threshold: float) -> list[dict
             .execute()
         )
         articles.extend(resp.data or [])
-    return articles
+    return articles, cluster_ids
 
 
 def _fetch_cookies_by_source(source_ids: list[int]) -> dict[int, str]:
@@ -129,9 +130,9 @@ def run_research(run_date: str | None = None) -> None:
     audience_doc     = settings.get("audience_doc") or ""
     score_threshold  = float(settings.get("research_score_threshold") or DEFAULT_RESEARCH_THRESHOLD)
 
-    articles = _fetch_research_articles(target_date, score_threshold)
+    articles, research_cluster_ids = _fetch_research_articles(target_date, score_threshold)
     if not articles:
-        logger.info("Research: no articles in accepted clusters for %s", target_date)
+        logger.info("Research: no articles in scored clusters for %s", target_date)
         return
 
     # Skip already-processed articles (except failed — retry those)
@@ -185,6 +186,11 @@ def run_research(run_date: str | None = None) -> None:
         }).eq("id", article_id).execute()
         summarised += 1
         logger.debug("Article %s researched (%d words)", article_id, result.word_count)
+
+    for cluster_id in research_cluster_ids:
+        supabase.table(CLUSTERS_TABLE).update(
+            {"cluster_status": "researched"}
+        ).eq("cluster_id", cluster_id).execute()
 
     logger.info(
         "Research complete — %d scraped, %d summarised, %d paywalled, %d failed",

@@ -1,10 +1,8 @@
 """
 Stage 4b — Tagging.
 
-Assigns topic and geographic tags to accepted clusters using a focused
+Assigns topic and geographic tags to scored clusters using a focused
 Claude call. Runs immediately after scoring on the same date.
-
-Only clusters at or above score_threshold are tagged.
 """
 
 import json
@@ -22,14 +20,13 @@ CLUSTERS_TABLE = "story_clusters"
 TAGGING_MODEL = "claude-haiku-4-5-20251001"
 
 
-def _fetch_accepted_clusters(run_date: str, score_threshold: float) -> list[dict[str, Any]]:
+def _fetch_scored_clusters(run_date: str) -> list[dict[str, Any]]:
     client = get_client()
     response = (
         client.table(CLUSTERS_TABLE)
         .select("id, cluster_id, name")
         .eq("date", run_date)
-        .eq("cluster_status", "accepted")
-        .gte("relevance_score", score_threshold)
+        .eq("cluster_status", "scored")
         .execute()
     )
     return response.data or []
@@ -121,18 +118,17 @@ def run_tagging(run_date: str | None = None) -> None:
     settings = get_pipeline_settings()
     available_tags = settings.get("available_tags") or []
     available_geo_tags = settings.get("available_geo_tags") or []
-    score_threshold = float(settings.get("score_threshold") or 0.4)
 
     if not available_tags and not available_geo_tags:
         logger.info("Tagging: no tags configured in pipeline_settings — skipping")
         return
 
-    clusters = _fetch_accepted_clusters(target_date, score_threshold)
+    clusters = _fetch_scored_clusters(target_date)
     if not clusters:
-        logger.info("Tagging: no accepted clusters to tag for %s", target_date)
+        logger.info("Tagging: no scored clusters to tag for %s", target_date)
         return
 
-    logger.info("Tagging %d clusters for %s", len(clusters), target_date)
+    logger.info("Tagging %d scored clusters for %s", len(clusters), target_date)
 
     cluster_ids = [c["cluster_id"] for c in clusters]
     articles_by_cluster = _fetch_articles_for_clusters(cluster_ids)

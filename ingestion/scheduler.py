@@ -2,7 +2,7 @@
 Scheduler — runs the full daily pipeline at 5am UTC.
 
 Single job:
-  05:00 UTC daily → ingest → filter → cluster → score → tag → brief
+  05:00 UTC daily → ingest → filter → cluster → score → tag → daily-brief
 """
 
 import logging
@@ -16,9 +16,7 @@ from filtering.filter import run_filtering
 from clustering.cluster import run_clustering
 from scoring.score import run_scoring
 from tagging.tag import run_tagging
-from briefing.brief import run_briefing
 from daily_brief.daily_brief import run_daily_brief
-from research.research import run_research
 
 logger = logging.getLogger(__name__)
 
@@ -39,10 +37,8 @@ def run_daily_pipeline() -> None:
       2. Filter new articles
       3. Cluster — week continuity pass then new story grouping
       4. Score pending clusters
-      5. Tag accepted clusters
-      6. Research — scrape full text + deep summaries for high-scoring articles
-      7. Generate briefs for accepted clusters
-      8. Synthesise daily brief from all story briefs
+      5. Tag scored clusters
+      6. Synthesise daily brief from scored stories above score threshold
     """
     from datetime import date
     today = date.today().isoformat()
@@ -59,8 +55,6 @@ def run_daily_pipeline() -> None:
     _run("cluster",      run_clustering,   run_date=today)
     _run("score",        run_scoring,      run_date=today)
     _run("tag",          run_tagging,      run_date=today)
-    _run("research",     run_research,     run_date=today)
-    _run("brief",        run_briefing,     run_date=today)
     _run("daily-brief",  run_daily_brief,  run_date=today)
     logger.info("=== Daily pipeline complete ===")
 

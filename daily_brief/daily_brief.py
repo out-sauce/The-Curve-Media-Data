@@ -1,6 +1,8 @@
 """
-Daily Brief — synthesises all briefed story clusters into a single
+Daily Brief — synthesises scored story clusters into a single
 flowing HTML summary for the day, saved to content_calendar_items.
+
+Only includes clusters with relevance_score >= score_threshold (default 0.5).
 
 Mirrors the generateDailyDigest action in the admin Next.js app.
 """
@@ -27,14 +29,14 @@ HTML_FORMAT_INSTRUCTION = (
 )
 
 
-def _fetch_briefed_clusters(run_date: str) -> list[dict[str, Any]]:
+def _fetch_scored_clusters(run_date: str, score_threshold: float) -> list[dict[str, Any]]:
     client = get_client()
     resp = (
         client.table(CLUSTERS_TABLE)
-        .select("name, brief")
+        .select("name, description, score_reason")
         .eq("date", run_date)
-        .eq("cluster_status", "briefed")
-        .not_.is_("brief", "null")
+        .eq("cluster_status", "scored")
+        .gte("relevance_score", score_threshold)
         .execute()
     )
     return resp.data or []
@@ -62,21 +64,25 @@ def _upsert_calendar_item(run_date: str, summary: str) -> None:
         }).execute()
 
 
+DEFAULT_SCORE_THRESHOLD = 0.5
+
+
 def run_daily_brief(run_date: str | None = None) -> None:
     target_date = run_date or (date.today() - timedelta(days=1)).isoformat()
     logger.info("Daily brief started for %s", target_date)
 
     settings = get_pipeline_settings()
     daily_brief_prompt = (settings.get("daily_brief_prompt") or "").strip()
+    score_threshold = float(settings.get("score_threshold") or DEFAULT_SCORE_THRESHOLD)
     system_prompt = daily_brief_prompt + HTML_FORMAT_INSTRUCTION
 
-    clusters = _fetch_briefed_clusters(target_date)
+    clusters = _fetch_scored_clusters(target_date, score_threshold)
     if not clusters:
-        logger.info("Daily brief: no briefed clusters found for %s", target_date)
+        logger.info("Daily brief: no scored clusters above %.1f for %s", score_threshold, target_date)
         return
 
     stories_block = "\n\n---\n\n".join(
-        f"{c.get('name') or 'Untitled'}\n{c['brief']}"
+        f"{c.get('name') or 'Untitled'}\n{c.get('description') or c.get('score_reason') or ''}"
         for c in clusters
     )
 

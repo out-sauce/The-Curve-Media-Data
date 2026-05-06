@@ -6,8 +6,7 @@ All cluster summaries are sent together; Claude returns a JSON array
 with a score and reason for each.
 
 Transitions:
-  story_clusters:  pending → accepted  (score >= 0.4)
-                           → rejected  (score <  0.4)
+  story_clusters:  pending → scored  (all stories, regardless of score)
   news_articles:   unchanged (article status is managed independently)
 """
 
@@ -154,13 +153,11 @@ def _call_claude_batch(clusters: list[dict[str, Any]], articles_by_cluster: dict
 
 def run_scoring(run_date: str | None = None) -> None:
     """
-    Stage 4 scoring. Run after clustering, before brief generation.
+    Stage 4 scoring. Run after clustering, before tagging.
 
     Sends all pending clusters for run_date to Claude in a single call.
     Claude returns a score and reason for each; results are written back to the DB.
-
-      score >= 0.4 -> accepted
-      score <  0.4 -> rejected
+    All stories transition to 'scored' regardless of their score.
     """
     from datetime import date, timedelta
     target_date = run_date or (date.today() - timedelta(days=1)).isoformat()
@@ -168,7 +165,6 @@ def run_scoring(run_date: str | None = None) -> None:
 
     pipeline_settings = get_pipeline_settings()
     audience_doc = pipeline_settings["audience_doc"]
-    SCORE_THRESHOLD = float(pipeline_settings["score_threshold"])
 
     clusters = _fetch_pending_clusters(target_date)
     if not clusters:
@@ -183,24 +179,11 @@ def run_scoring(run_date: str | None = None) -> None:
     results = _call_claude_batch(clusters, articles_by_cluster, audience_doc)
 
     supabase = get_client()
-    accepted = 0
-    rejected = 0
-
     for cluster_id, (score, reason) in results.items():
-        if score >= SCORE_THRESHOLD:
-            cluster_status = "accepted"
-            accepted += 1
-        else:
-            cluster_status = "rejected"
-            rejected += 1
-
         supabase.table(CLUSTERS_TABLE).update({
             "relevance_score": score,
-            "score_reason": reason,
-            "cluster_status": cluster_status,
+            "score_reason":    reason,
+            "cluster_status":  "scored",
         }).eq("cluster_id", cluster_id).execute()
 
-    logger.info(
-        "Scoring complete -- %d accepted, %d rejected (threshold=%.1f)",
-        accepted, rejected, SCORE_THRESHOLD,
-    )
+    logger.info("Scoring complete -- %d clusters scored", len(results))
