@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 CLUSTERS_TABLE = "story_clusters"
 ARTICLES_TABLE = "news_articles"
 MODEL = "claude-sonnet-4-6"
-SCORING_MODEL = "claude-haiku-4-5-20251001"
+SCORING_MODEL = "claude-sonnet-4-6"
 
 
 # ── DB helpers ───────────────────────────────────────────────────────────────

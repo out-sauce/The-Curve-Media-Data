@@ -23,7 +23,31 @@ from ingestion.storage import get_client, get_pipeline_settings, TABLE
 logger = logging.getLogger(__name__)
 
 CLUSTERS_TABLE = "story_clusters"
-SCORING_MODEL = "claude-haiku-4-5-20251001"
+SCORING_MODEL = "claude-sonnet-4-6"
+
+# Schema for structured outputs. Note: structured outputs don't support
+# numerical bounds (minimum/maximum), so score is validated as a plain number
+# and clamped to 0.0-1.0 client-side below.
+SCORING_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "scores": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer"},
+                    "score": {"type": "number"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["index", "score", "reason"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["scores"],
+    "additionalProperties": False,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -74,10 +98,9 @@ def _build_batch_prompt(clusters: list[dict[str, Any]], articles_by_cluster: dic
     """
     parts = [
         "Score each of the following story clusters for relevance to the Curve audience.",
-        "Return a JSON array with one object per cluster in the same order.",
-        'Each object must have: "index" (int), "score" (float 0.0-1.0), "reason" (one sentence).',
-        'Example: [{"index": 1, "score": 0.82, "reason": "..."}]',
-        "Return only the JSON array. No preamble or markdown fences.",
+        'Return a JSON object {"scores": [...]} with one entry per cluster in the same order.',
+        'Each entry must have: "index" (int), "score" (float 0.0-1.0), "reason" (one sentence).',
+        'Example: {"scores": [{"index": 1, "score": 0.82, "reason": "..."}]}',
         "",
     ]
 
@@ -111,15 +134,24 @@ def _call_claude_batch(clusters: list[dict[str, Any]], articles_by_cluster: dict
             max_tokens=20000,
             system=audience_doc,
             messages=[{"role": "user", "content": prompt}],
+            # Structured outputs: the API constrains the response to this schema,
+            # so the JSON is guaranteed parseable. Without it we were parsing
+            # Claude's free text, which intermittently produced invalid JSON
+            # (e.g. an unescaped quote in a "reason" string).
+            output_config={
+                "format": {
+                    "type": "json_schema",
+                    "schema": SCORING_SCHEMA,
+                }
+            },
         )
-        raw = message.content[0].text.strip()
-        start = raw.find("[")
-        if start != -1:
-            raw = raw[start:].removesuffix("```").strip()
-        data = json.loads(raw)
+        if message.stop_reason == "refusal":
+            raise ValueError("Scoring request was refused")
 
-        if not isinstance(data, list):
-            raise ValueError(f"Expected JSON array, got {type(data)}")
+        # With output_config.format the first text block is valid JSON matching
+        # SCORING_SCHEMA.
+        raw = next(b.text for b in message.content if b.type == "text")
+        data = json.loads(raw)["scores"]
 
         results: dict[str, tuple[float, str]] = {}
         for item in data:
