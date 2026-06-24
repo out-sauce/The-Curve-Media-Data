@@ -61,6 +61,24 @@ def get_sources(source_type: str | None = None, enabled_only: bool = True) -> li
     return response.data or []
 
 
+def get_social_sources() -> list[dict]:
+    """
+    Return enabled Instagram/TikTok sources for the scan stage.
+    Includes `handle` (the scrape target — username without @); for social
+    sources `url` is the display profile URL, not the scrape target.
+    """
+    client = get_client()
+    response = (
+        client.table("sources")
+        .select("id, name, handle, url, category, source_type, enabled")
+        .eq("enabled", True)
+        .in_("source_type", ["instagram", "tiktok"])
+        .order("name")
+        .execute()
+    )
+    return response.data or []
+
+
 def log_source_run(
     source_name: str,
     source_category: str,

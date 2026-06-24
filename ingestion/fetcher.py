@@ -114,9 +114,10 @@ def fetch_rss_source(source: dict) -> list[dict]:
 
 
 def fetch_all_sources() -> list[dict]:
-    """Fetch from all enabled sources — RSS, NewsAPI, and Finnhub."""
+    """Fetch from all enabled sources — RSS, NewsAPI, Finnhub, and social (IG/TikTok)."""
     from ingestion.newsapi import fetch_newsapi
     from ingestion.finnhub import fetch_finnhub
+    from ingestion.social import fetch_social
 
     all_articles = []
 
@@ -125,6 +126,7 @@ def fetch_all_sources() -> list[dict]:
 
     all_articles.extend(fetch_newsapi())
     all_articles.extend(fetch_finnhub())
+    all_articles.extend(fetch_social())
 
     logger.info("Total articles fetched: %d", len(all_articles))
     return all_articles

@@ -11,5 +11,11 @@ FINNHUB_KEY = os.getenv("FINNHUB_API_KEY", "")
 VOYAGE_API_KEY = os.getenv("VOYAGE_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
+# Apify — scrapes Instagram/TikTok social sources in the scan stage.
+APIFY_TOKEN = os.getenv("APIFY_TOKEN", "")
+# Actor ids use '~' (not '/') in the API path. Overridable in case we switch actors.
+APIFY_INSTAGRAM_ACTOR = os.getenv("APIFY_INSTAGRAM_ACTOR", "apify~instagram-api-scraper")
+APIFY_TIKTOK_ACTOR = os.getenv("APIFY_TIKTOK_ACTOR", "clockworks~tiktok-scraper")
+
 # Maximum articles to keep per source per run (0 = no limit)
 MAX_ARTICLES_PER_SOURCE = int(os.getenv("MAX_ARTICLES_PER_SOURCE", 50))
