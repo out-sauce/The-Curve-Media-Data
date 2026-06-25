@@ -116,10 +116,14 @@ def run_daily_brief_endpoint(background_tasks: BackgroundTasks, date: str | None
 
 
 @app.post("/run/competitors")
-def run_competitors_endpoint(background_tasks: BackgroundTasks, x_api_key: str = Header(default="")):
-    """Run the competitor scrape (follower counts + recent post engagement)."""
+def run_competitors_endpoint(background_tasks: BackgroundTasks, id: str | None = None, x_api_key: str = Header(default="")):
+    """
+    Run the competitor scrape (follower counts + recent post engagement).
+    Pass ?id=<competitor_id> to refresh a single competitor (admin card
+    Refresh); omit it to refresh all (the daily job).
+    """
     _check_key(x_api_key)
-    background_tasks.add_task(run_competitors)
+    background_tasks.add_task(run_competitors, id)
     return {"status": "started"}
 
 

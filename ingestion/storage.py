@@ -79,40 +79,52 @@ def get_social_sources() -> list[dict]:
     return response.data or []
 
 
-def get_competitors() -> list[dict]:
+def get_competitors(competitor_id: str | None = None) -> list[dict]:
     """
-    Return enabled competitors for the competitor run.
-    Includes `handle` (the scrape target — username without @); `url` is the
-    display profile URL, not the scrape target.
+    Return tracked competitors to scrape. The admin app (Curve_Admin_NextJS)
+    seeds each row with (platform, handle, profile_url); this run reads those and
+    writes the stats + posts back in.
+
+    Pass `competitor_id` to scrape a single row (a manual Refresh from the admin
+    card); omit it for the daily job that refreshes everyone. `handle` is the
+    scrape target (username without @).
     """
     client = get_client()
-    response = (
-        client.table("competitors")
-        .select("id, name, handle, url, source_type, enabled")
-        .eq("enabled", True)
-        .order("name")
-        .execute()
+    query = client.table("competitors").select(
+        "id, platform, handle, profile_url, display_name"
     )
+    if competitor_id:
+        query = query.eq("id", competitor_id)
+    response = query.order("created_at").execute()
     return response.data or []
 
 
-def insert_competitor_snapshot(row: dict[str, Any]) -> None:
-    """Append one follower snapshot row (time series — never overwritten)."""
+def update_competitor_stats(competitor_id: str, fields: dict[str, Any]) -> None:
+    """
+    Write scraped profile stats back onto the competitors row (skips None values
+    so a partial scrape never blanks existing data). Callers include
+    refresh_status='idle' + last_refreshed_at on success so the admin card stops
+    polling.
+    """
+    payload = {k: v for k, v in fields.items() if v is not None}
+    if not payload:
+        return
     client = get_client()
-    client.table("competitor_snapshots").insert(row).execute()
+    client.table("competitors").update(payload).eq("id", competitor_id).execute()
 
 
 def upsert_competitor_posts(rows: list[dict[str, Any]]) -> int:
     """
-    Upsert competitor posts keyed by guid ('{platform}:{post_id}'), refreshing
-    engagement counts on each run. Returns number of rows written.
+    Upsert competitor posts keyed by (competitor_id, post_id) — the admin
+    table's unique key — refreshing engagement counts on each run. Returns
+    number of rows written.
     """
     if not rows:
         return 0
     client = get_client()
     response = (
         client.table("competitor_posts")
-        .upsert(rows, on_conflict="guid", ignore_duplicates=False)
+        .upsert(rows, on_conflict="competitor_id,post_id", ignore_duplicates=False)
         .execute()
     )
     return len(response.data) if response.data else 0

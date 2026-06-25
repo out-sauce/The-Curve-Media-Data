@@ -29,7 +29,7 @@ from config import (
 from ingestion.apify import run_actor, parse_ts
 from ingestion.storage import (
     get_competitors,
-    insert_competitor_snapshot,
+    update_competitor_stats,
     upsert_competitor_posts,
     log_source_run,
 )
@@ -73,6 +73,8 @@ def _ig_profile(items: list[dict]) -> dict:
         "follower_count": _to_int(profile.get("followersCount")),
         "following_count": _to_int(profile.get("followsCount")),
         "post_count": _to_int(profile.get("postsCount")),
+        "display_name": (profile.get("fullName") or "").strip() or None,
+        "avatar_url": profile.get("profilePicUrlHD") or profile.get("profilePicUrl") or None,
     }
 
 
@@ -97,6 +99,7 @@ def _ig_normalise_post(item: dict) -> dict | None:
         "like_count": _to_int(item.get("likesCount")),
         "comment_count": _to_int(item.get("commentsCount")),
         "view_count": _to_int(item.get("videoViewCount") or item.get("videoPlayCount")),
+        "thumbnail_url": item.get("displayUrl") or None,
     }
 
 
@@ -110,6 +113,8 @@ def _tt_profile(items: list[dict]) -> dict:
         "follower_count": _to_int(author.get("fans")),
         "following_count": _to_int(author.get("following")),
         "post_count": _to_int(author.get("video")),
+        "display_name": (author.get("nickName") or author.get("name") or "").strip() or None,
+        "avatar_url": author.get("avatar") or None,
     }
 
 
@@ -122,6 +127,11 @@ def _tt_normalise_post(item: dict) -> dict | None:
     url = item.get("webVideoUrl") or item.get("url")
     if not post_id:
         return None
+    video_meta = item.get("videoMeta") or {}
+    covers = item.get("covers")
+    thumbnail = video_meta.get("coverUrl") or video_meta.get("originalCoverUrl")
+    if not thumbnail and isinstance(covers, list) and covers:
+        thumbnail = covers[0]
     return {
         "post_id": str(post_id),
         "caption": (item.get("text") or item.get("caption") or "").strip(),
@@ -130,6 +140,7 @@ def _tt_normalise_post(item: dict) -> dict | None:
         "like_count": _to_int(item.get("diggCount")),
         "comment_count": _to_int(item.get("commentCount")),
         "view_count": _to_int(item.get("playCount")),
+        "thumbnail_url": thumbnail or None,
     }
 
 
@@ -163,9 +174,10 @@ _PLATFORMS = {
 
 def _run_competitor(competitor: dict) -> int:
     """Scrape one competitor. Never raises — logs and returns posts written."""
-    name = competitor["name"]
-    platform = competitor.get("source_type", "")
+    competitor_id = competitor.get("id")
+    platform = competitor.get("platform", "")
     handle = (competitor.get("handle") or "").lstrip("@").strip()
+    name = (competitor.get("display_name") or handle or "competitor").strip()
 
     spec = _PLATFORMS.get(platform)
     if spec is None:
@@ -186,25 +198,18 @@ def _run_competitor(competitor: dict) -> int:
     except Exception as exc:
         logger.warning("Apify %s fetch for competitor '%s' (@%s) failed: %s", platform, name, handle, exc)
         log_source_run(name, _RUN_CATEGORY, "error", 0, str(exc)[:500])
+        # Leave refresh_status='pending' so the daily job retries; the admin
+        # card simply times out its poll rather than showing stale data.
         return 0
 
     now = datetime.now(timezone.utc)
     now_iso = now.isoformat()
     cutoff = now - timedelta(days=COMPETITOR_LOOKBACK_DAYS)
 
-    # 1. Follower snapshot (append-only time series).
     profile = spec["profile"](items)
-    insert_competitor_snapshot({
-        "competitor_id": competitor.get("id"),
-        "handle": handle,
-        "platform": platform,
-        "follower_count": profile.get("follower_count"),
-        "following_count": profile.get("following_count"),
-        "post_count": profile.get("post_count"),
-        "captured_at": now_iso,
-    })
+    follower_count = profile.get("follower_count")
 
-    # 2. Recent posts — normalise, apply 14-day cutoff, sort desc, cap to 10.
+    # Recent posts — normalise, apply 14-day cutoff, sort desc, cap to 10.
     normalised = []
     for raw in spec["posts"](items):
         try:
@@ -220,41 +225,70 @@ def _run_competitor(competitor: dict) -> int:
         normalised.append((published_dt, post))
 
     normalised.sort(key=lambda pair: pair[0], reverse=True)
-    selected = normalised[:COMPETITOR_POST_LIMIT]
+    selected = [post for _, post in normalised[:COMPETITOR_POST_LIMIT]]
 
+    # Build post rows in the admin schema (competitor_posts) and accumulate the
+    # per-post engagement rate = (likes + comments) / follower_count.
     rows = []
-    for _, post in selected:
+    engagements = []
+    for post in selected:
+        likes = post["like_count"]
+        comments = post["comment_count"]
         rows.append({
-            "competitor_id": competitor.get("id"),
-            "guid": f"{platform}:{post['post_id']}",
-            "platform": platform,
+            "competitor_id": competitor_id,
+            "post_id": post["post_id"],
             "post_url": post["url"],
+            "posted_at": post["published_at"],
             "caption": post["caption"],
-            "like_count": post["like_count"],
-            "comment_count": post["comment_count"],
-            "view_count": post["view_count"],
-            "published_at": post["published_at"],
-            "fetched_at": now_iso,
+            "likes": likes,
+            "comments": comments,
+            "views": post["view_count"],
+            "thumbnail_url": post["thumbnail_url"],
         })
+        if follower_count:
+            engagements.append(((likes or 0) + (comments or 0)) / follower_count)
 
     written = upsert_competitor_posts(rows)
+
+    # engagement_rate is a fraction (e.g. 0.043) averaged over the selected
+    # posts; the admin card renders <= 1 as a percentage.
+    engagement_rate = round(sum(engagements) / len(engagements), 6) if engagements else None
+
+    # Write stats back onto the competitors row and mark the refresh complete —
+    # last_refreshed_at is what the admin Refresh card polls for.
+    update_competitor_stats(competitor_id, {
+        "display_name": profile.get("display_name"),
+        "avatar_url": profile.get("avatar_url"),
+        "follower_count": follower_count,
+        "following_count": profile.get("following_count"),
+        "post_count": profile.get("post_count"),
+        "engagement_rate": engagement_rate,
+        "refresh_status": "idle",
+        "last_refreshed_at": now_iso,
+    })
+
     logger.info(
-        "Competitor '%s' (@%s, %s): follower_count=%s / %d posts",
-        name, handle, platform, profile.get("follower_count"), len(rows),
+        "Competitor '%s' (@%s, %s): follower_count=%s / %d posts / engagement=%s",
+        name, handle, platform, follower_count, len(rows), engagement_rate,
     )
     log_source_run(name, _RUN_CATEGORY, "ok", len(rows))
     return written
 
 
-def run_competitors() -> None:
-    """Run the competitor scrape for all enabled competitors via Apify."""
+def run_competitors(competitor_id: str | None = None) -> None:
+    """
+    Run the competitor scrape via Apify. Pass `competitor_id` to refresh a single
+    competitor (a manual Refresh from the admin card); omit it for the daily job
+    that refreshes everyone.
+    """
     if not APIFY_TOKEN:
         logger.warning("APIFY_TOKEN not set — skipping competitor run")
         return
 
-    competitors = get_competitors()
+    competitors = get_competitors(competitor_id)
     if not competitors:
-        logger.info("No enabled competitors configured — skipping competitor run")
+        scope = f" for id={competitor_id}" if competitor_id else ""
+        logger.info("No competitors to scrape%s — skipping competitor run", scope)
         return
 
     total_posts = 0
