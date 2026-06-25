@@ -19,3 +19,18 @@ APIFY_TIKTOK_ACTOR = os.getenv("APIFY_TIKTOK_ACTOR", "clockworks~tiktok-scraper"
 
 # Maximum articles to keep per source per run (0 = no limit)
 MAX_ARTICLES_PER_SOURCE = int(os.getenv("MAX_ARTICLES_PER_SOURCE", 50))
+
+# Browser scraper — research stage renders article pages in a real Chromium tab
+# (Playwright), seeded with a per-domain logged-in storage_state from site_auth,
+# so paywalled/JS-rendered publishers extract their full body. Auth itself is what
+# beats the paywall; extraction stays deterministic (trafilatura over rendered HTML).
+# Engine toggle: false falls back to the static httpx scraper (safe degrade).
+RESEARCH_USE_BROWSER = os.getenv("RESEARCH_USE_BROWSER", "true").lower() == "true"
+# Per-page navigation/extraction timeout in milliseconds.
+BROWSER_PAGE_TIMEOUT = int(os.getenv("BROWSER_PAGE_TIMEOUT", 45000))
+# Hard cap on browser scrapes per run (bounds a runaway run; ~50/day expected).
+MAX_BROWSER_SCRAPES_PER_RUN = int(os.getenv("MAX_BROWSER_SCRAPES_PER_RUN", 100))
+# Optional hosted-Chromium endpoint (Browser Use Cloud / browserless / Steel).
+# When set, connect over CDP instead of launching Chromium locally — no other code
+# change. Safety valve if Railway memory proves tight.
+BROWSER_CDP_URL = os.getenv("BROWSER_CDP_URL", "")
