@@ -22,50 +22,18 @@ Notes on the contract vs. the original handover:
 import logging
 from datetime import datetime, timezone
 
-import httpx
-
 from config import (
     APIFY_TOKEN,
     APIFY_INSTAGRAM_ACTOR,
     APIFY_TIKTOK_ACTOR,
     MAX_ARTICLES_PER_SOURCE,
 )
+from ingestion.apify import run_actor as _run_actor, parse_ts as _parse_ts
 from ingestion.storage import get_social_sources, log_source_run
 
 logger = logging.getLogger(__name__)
 
-APIFY_BASE = "https://api.apify.com/v2/actors"
-# Apify sync runs cap at 300s; a per-account scrape of MAX_ARTICLES_PER_SOURCE posts
-# stays well under that.
-APIFY_TIMEOUT = 300
-
 TITLE_MAX_LEN = 200
-
-
-def _run_actor(actor_id: str, run_input: dict) -> list[dict]:
-    """
-    Run an Apify actor synchronously and return its dataset items.
-    Raises on any non-2xx response so the caller can log an error source_run.
-    """
-    url = f"{APIFY_BASE}/{actor_id}/run-sync-get-dataset-items"
-    resp = httpx.post(
-        url,
-        params={"token": APIFY_TOKEN},
-        json=run_input,
-        timeout=APIFY_TIMEOUT,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    return data if isinstance(data, list) else []
-
-
-def _parse_ts(value) -> str | None:
-    """Normalise a post timestamp to an ISO-8601 string. Accepts unix or ISO."""
-    if value is None or value == "":
-        return None
-    if isinstance(value, (int, float)):
-        return datetime.fromtimestamp(value, tz=timezone.utc).isoformat()
-    return str(value)
 
 
 def _make_title(caption: str, handle: str, platform: str) -> str:

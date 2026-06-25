@@ -17,6 +17,7 @@ from clustering.cluster import run_clustering
 from scoring.score import run_scoring
 from tagging.tag import run_tagging
 from daily_brief.daily_brief import run_daily_brief
+from ingestion.competitors import run_competitors
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,7 @@ def run_daily_pipeline() -> None:
       4. Score pending clusters
       5. Tag scored clusters
       6. Synthesise daily brief from scored stories above score threshold
+      7. Competitor run — follower counts + recent post engagement (after the news run)
     """
     from datetime import date
     today = date.today().isoformat()
@@ -56,6 +58,7 @@ def run_daily_pipeline() -> None:
     _run("score",        run_scoring,      run_date=today)
     _run("tag",          run_tagging,      run_date=today)
     _run("daily-brief",  run_daily_brief,  run_date=today)
+    _run("competitors",  run_competitors)
     logger.info("=== Daily pipeline complete ===")
 
 

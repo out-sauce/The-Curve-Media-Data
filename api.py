@@ -19,6 +19,7 @@ from briefing.brief import run_briefing
 from tagging.tag import run_tagging
 from daily_brief.daily_brief import run_daily_brief
 from research.research import run_research
+from ingestion.competitors import run_competitors
 
 API_KEY = os.environ.get("PIPELINE_API_KEY", "")
 
@@ -111,6 +112,14 @@ def run_research_endpoint(background_tasks: BackgroundTasks, date: str | None = 
 def run_daily_brief_endpoint(background_tasks: BackgroundTasks, date: str | None = None, x_api_key: str = Header(default="")):
     _check_key(x_api_key)
     background_tasks.add_task(run_daily_brief, run_date=date)
+    return {"status": "started"}
+
+
+@app.post("/run/competitors")
+def run_competitors_endpoint(background_tasks: BackgroundTasks, x_api_key: str = Header(default="")):
+    """Run the competitor scrape (follower counts + recent post engagement)."""
+    _check_key(x_api_key)
+    background_tasks.add_task(run_competitors)
     return {"status": "started"}
 
 

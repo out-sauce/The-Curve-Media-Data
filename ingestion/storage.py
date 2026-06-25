@@ -79,6 +79,45 @@ def get_social_sources() -> list[dict]:
     return response.data or []
 
 
+def get_competitors() -> list[dict]:
+    """
+    Return enabled competitors for the competitor run.
+    Includes `handle` (the scrape target — username without @); `url` is the
+    display profile URL, not the scrape target.
+    """
+    client = get_client()
+    response = (
+        client.table("competitors")
+        .select("id, name, handle, url, source_type, enabled")
+        .eq("enabled", True)
+        .order("name")
+        .execute()
+    )
+    return response.data or []
+
+
+def insert_competitor_snapshot(row: dict[str, Any]) -> None:
+    """Append one follower snapshot row (time series — never overwritten)."""
+    client = get_client()
+    client.table("competitor_snapshots").insert(row).execute()
+
+
+def upsert_competitor_posts(rows: list[dict[str, Any]]) -> int:
+    """
+    Upsert competitor posts keyed by guid ('{platform}:{post_id}'), refreshing
+    engagement counts on each run. Returns number of rows written.
+    """
+    if not rows:
+        return 0
+    client = get_client()
+    response = (
+        client.table("competitor_posts")
+        .upsert(rows, on_conflict="guid", ignore_duplicates=False)
+        .execute()
+    )
+    return len(response.data) if response.data else 0
+
+
 def log_source_run(
     source_name: str,
     source_category: str,

@@ -19,3 +19,8 @@ APIFY_TIKTOK_ACTOR = os.getenv("APIFY_TIKTOK_ACTOR", "clockworks~tiktok-scraper"
 
 # Maximum articles to keep per source per run (0 = no limit)
 MAX_ARTICLES_PER_SOURCE = int(os.getenv("MAX_ARTICLES_PER_SOURCE", 50))
+
+# Competitor run — caps the most-recent posts captured per competitor and the
+# lookback window (in days) they must fall within. Reuses the Apify config above.
+COMPETITOR_POST_LIMIT = int(os.getenv("COMPETITOR_POST_LIMIT", 10))
+COMPETITOR_LOOKBACK_DAYS = int(os.getenv("COMPETITOR_LOOKBACK_DAYS", 14))

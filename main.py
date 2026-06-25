@@ -29,14 +29,16 @@ from ingestion.scheduler import (
 from filtering.filter import run_filtering
 from clustering.cluster import run_clustering
 from scoring.score import run_scoring
+from ingestion.competitors import run_competitors
 
 DATE_STAGES = {"filter", "cluster", "score"}
 
 STAGES = {
-    "ingest":  run_ingestion,
-    "filter":  run_filtering,
-    "cluster": run_clustering,
-    "score":   run_scoring,
+    "ingest":       run_ingestion,
+    "filter":       run_filtering,
+    "cluster":      run_clustering,
+    "score":        run_scoring,
+    "competitors":  run_competitors,
 }
 
 
