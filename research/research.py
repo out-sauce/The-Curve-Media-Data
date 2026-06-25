@@ -5,9 +5,19 @@ Runs after tagging. Only processes articles in scored clusters that score
 >= research_score_threshold (default 0.60). Transitions cluster status
 to 'researched' once all articles are processed.
 
+Each article URL is rendered in a real logged-in Chromium tab (Playwright,
+research/browser_scraper.py), seeded with a per-publisher-domain login session
+(site_auth.storage_state, written by the portal). A subscriber session is what
+beats the paywall; extraction stays deterministic (trafilatura over rendered HTML).
+Set RESEARCH_USE_BROWSER=false to fall back to the static httpx scraper.
+
 Results stored directly on news_articles rows:
-  full_text, word_count, scrape_status, scraped_at
+  full_text, word_count, scrape_status, scrape_method, scraped_at
   deep_summary, key_facts, relevance_notes, summarised_at
+
+Stale-auth signal: after each scrape on a domain that had a stored storage_state,
+this app writes site_auth.last_status / last_used_at so the portal can flag a session
+that has gone stale (subscriber sessions expire at ~7 or 30 days) and prompt re-capture.
 
 Idempotent: articles with scrape_status IS NOT NULL are skipped on re-run
 (except 'failed' — those are retried).
@@ -17,14 +27,22 @@ import json
 import logging
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 import anthropic
 
-from config import ANTHROPIC_API_KEY
+from config import (
+    ANTHROPIC_API_KEY,
+    MAX_BROWSER_SCRAPES_PER_RUN,
+    RESEARCH_USE_BROWSER,
+)
 from ingestion.storage import get_client, get_pipeline_settings, TABLE
+from .browser_scraper import scrape_article_with_browser
 from .scraper import scrape_article
 
 logger = logging.getLogger(__name__)
+
+SITE_AUTH_TABLE = "site_auth"
 
 CLUSTERS_TABLE = "story_clusters"
 MODEL = "claude-sonnet-4-6"
@@ -64,19 +82,68 @@ def _fetch_research_articles(run_date: str, score_threshold: float) -> tuple[lis
     return articles, cluster_ids
 
 
-def _fetch_cookies_by_source(source_ids: list[int]) -> dict[int, str]:
-    """Return {source_id: cookie_string} for sources with non-null cookies."""
-    if not source_ids:
+# Multi-part public suffixes we may encounter; keep the last 3 labels so a
+# 'www.bbc.co.uk/news' URL keys on 'bbc.co.uk', not 'co.uk'. Small, hand-maintained
+# list — enough for the handful of UK/AU publishers in scope.
+_TWO_LABEL_TLDS = {
+    "co.uk", "org.uk", "gov.uk", "ac.uk", "co.nz", "com.au", "net.au",
+    "org.au", "co.za", "co.jp", "com.br",
+}
+
+
+def _registrable_domain(url: str) -> str:
+    """
+    Reduce a URL to its registrable domain, e.g.
+    'https://www.ft.com/content/abc' -> 'ft.com',
+    'https://www.bbc.co.uk/news/x'   -> 'bbc.co.uk'.
+    Returns '' if no host can be parsed.
+    """
+    host = (urlparse(url).hostname or "").lower().strip(".")
+    if not host:
+        return ""
+    parts = host.split(".")
+    if len(parts) <= 2:
+        return host
+    last_two = ".".join(parts[-2:])
+    if last_two in _TWO_LABEL_TLDS:
+        return ".".join(parts[-3:])
+    return last_two
+
+
+def _fetch_auth_by_domain(domains: list[str]) -> dict[str, dict]:
+    """Return {domain: storage_state} for domains with a stored site_auth row."""
+    if not domains:
         return {}
     client = get_client()
     resp = (
-        client.table("sources")
-        .select("id, cookies")
-        .in_("id", source_ids)
-        .not_.is_("cookies", "null")
+        client.table(SITE_AUTH_TABLE)
+        .select("domain, storage_state")
+        .in_("domain", domains)
         .execute()
     )
-    return {row["id"]: row["cookies"] for row in (resp.data or [])}
+    return {
+        row["domain"]: row["storage_state"]
+        for row in (resp.data or [])
+        if row.get("storage_state")
+    }
+
+
+def _record_auth_usage(domain: str, status: str, now: str) -> None:
+    """
+    Write the stale-auth freshness signal back to site_auth so the portal can flag
+    a session that has gone stale and prompt re-capture. Best-effort — never aborts
+    the run if the write fails.
+    """
+    client = get_client()
+    try:
+        (
+            client.table(SITE_AUTH_TABLE)
+            .update({"last_status": status, "last_used_at": now, "updated_at": now})
+            .eq("domain", domain)
+            .execute()
+        )
+    except Exception as exc:
+        logger.warning("Could not update site_auth for %s: %s", domain, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -142,23 +209,41 @@ def run_research(run_date: str | None = None) -> None:
         return
     logger.info("Research: processing %d articles", len(articles))
 
-    source_ids = list({a["source_id"] for a in articles if a.get("source_id")})
-    cookies_by_source = _fetch_cookies_by_source(source_ids)
+    # Per-domain login sessions for the browser scraper (replaces per-source cookies).
+    domains = list({_registrable_domain(a["url"]) for a in articles if a.get("url")})
+    auth_by_domain = _fetch_auth_by_domain([d for d in domains if d])
 
     supabase = get_client()
     scraped = paywalled = failed = summarised = 0
+    browser_scrapes = 0
 
     for article in articles:
         article_id   = article["id"]
         url          = article["url"]
-        cookie_str   = cookies_by_source.get(article.get("source_id"))
+        domain       = _registrable_domain(url)
+        storage_state = auth_by_domain.get(domain)
         now          = datetime.now(timezone.utc).isoformat()
 
-        result = scrape_article(url, cookie_string=cookie_str)
+        # Render in a real logged-in browser tab when enabled and under the per-run
+        # cap; otherwise fall back to the static httpx scraper (safe degrade).
+        use_browser = RESEARCH_USE_BROWSER and browser_scrapes < MAX_BROWSER_SCRAPES_PER_RUN
+        if use_browser:
+            browser_scrapes += 1
+            scrape_method = "browser"
+            result = scrape_article_with_browser(url, storage_state=storage_state)
+        else:
+            scrape_method = "static"
+            result = scrape_article(url, cookie_string=None)
+
+        # Stale-auth write-back: any scrape on a domain that *has* a stored session
+        # records its outcome so the portal can flag a stale (7/30-day) session.
+        if storage_state is not None:
+            _record_auth_usage(domain, result.status, now)
 
         if result.status != "scraped":
             supabase.table(TABLE).update({
                 "scrape_status": result.status,
+                "scrape_method": scrape_method,
                 "scraped_at":    now,
             }).eq("id", article_id).execute()
             paywalled += result.status == "paywalled"
@@ -169,6 +254,7 @@ def run_research(run_date: str | None = None) -> None:
         scraped += 1
         supabase.table(TABLE).update({
             "scrape_status": "scraped",
+            "scrape_method": scrape_method,
             "full_text":     result.full_text,
             "word_count":    result.word_count,
             "scraped_at":    now,
@@ -193,6 +279,7 @@ def run_research(run_date: str | None = None) -> None:
         ).eq("cluster_id", cluster_id).execute()
 
     logger.info(
-        "Research complete — %d scraped, %d summarised, %d paywalled, %d failed",
-        scraped, summarised, paywalled, failed,
+        "Research complete — %d scraped, %d summarised, %d paywalled, %d failed "
+        "(%d via browser path)",
+        scraped, summarised, paywalled, failed, browser_scrapes,
     )

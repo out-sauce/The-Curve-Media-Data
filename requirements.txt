@@ -9,3 +9,4 @@ rapidfuzz>=3.0.0
 anthropic>=0.69.0  # structured outputs (output_config.format) used in scoring/score.py
 fastapi>=0.110.0
 uvicorn[standard]>=0.29.0
+playwright>=1.44.0  # research-stage browser scraper (Chromium, installed via Dockerfile)
