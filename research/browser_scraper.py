@@ -74,7 +74,7 @@ def _extract(html: str) -> ScrapeResult:
 
 def _browserbase_connect_url() -> str | None:
     """
-    Create a Browserbase session (UK region/proxy) and return its CDP connect URL, for
+    Create a Browserbase session (EU region, UK proxy) and return its CDP connect URL, for
     the env-toggled Browserbase read path. Returns None (caller falls back) if the SDK
     or credentials are missing — keeps the never-raise contract.
     """
@@ -85,7 +85,10 @@ def _browserbase_connect_url() -> str | None:
         bb = Browserbase(api_key=BROWSERBASE_API_KEY)
         session = bb.sessions.create(
             project_id=BROWSERBASE_PROJECT_ID,
-            region="eu-west-2",
+            # Browserbase only runs in us-west-2 / us-east-1 / eu-central-1 /
+            # ap-southeast-1. eu-central-1 (Frankfurt) is the nearest to the UK;
+            # the UK *IP* is delivered by the GB proxy below, not the region.
+            region="eu-central-1",
             proxies=[{"type": "browserbase", "geolocation": {"country": "GB"}}],
         )
         return session.connect_url
