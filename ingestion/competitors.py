@@ -271,13 +271,17 @@ def _yt_normalise_post(item: dict) -> dict | None:
 # ── Transcript fetch (Instagram + TikTok only) ────────────────────────────────
 # Called once per channel with the selected posts. Returns {post_id: transcript}.
 # Best-effort: any failure logs a warning and returns {}.
-# ⚠️ Input key names ("postUrls" / "videoUrls") and output key ("transcript") are
-# inferred — verify against live actor runs before first production deploy.
+# Input/output keys verified against live actor runs (2026-06-30): the IG actor
+# (apple_yang~instagram-transcripts-scraper) takes a single {"videoUrl": ...} per
+# run and returns the transcript in "text"; the TikTok actor
+# (scrape-creators~best-tiktok-transcripts-scraper) takes {"videos": [...]} and
+# returns it in "transcript". Both echo the source URL back in "url".
 
 def _fetch_transcripts(
     actor_id: str,
     input_builder,          # callable(urls: list[str]) -> dict
     posts: list[dict],
+    batched: bool = True,   # False → one actor run per URL (e.g. the IG actor)
 ) -> dict[str, str]:
     if not actor_id or not posts:
         return {}
@@ -286,20 +290,24 @@ def _fetch_transcripts(
         return {}
     post_id_by_url = {url: pid for pid, url in eligible}
     urls = [url for _, url in eligible]
-    try:
-        items = run_actor(actor_id, input_builder(urls))
-    except Exception as exc:
-        logger.warning("Transcript actor %s failed: %s", actor_id, str(exc)[:200])
-        return {}
+    # The TikTok actor takes the whole list in one run; the IG actor accepts a
+    # single videoUrl per run, so fall back to one run per URL when not batched.
+    batches = [urls] if batched else [[u] for u in urls]
     result: dict[str, str] = {}
-    for item in (items or []):
-        item_url = item.get("url") or item.get("postUrl") or item.get("videoUrl") or ""
-        transcript = (item.get("transcript") or item.get("text") or "").strip()
-        if not transcript:
+    for batch in batches:
+        try:
+            items = run_actor(actor_id, input_builder(batch))
+        except Exception as exc:
+            logger.warning("Transcript actor %s failed: %s", actor_id, str(exc)[:200])
             continue
-        pid = post_id_by_url.get(item_url)
-        if pid:
-            result[pid] = transcript
+        for item in (items or []):
+            item_url = item.get("url") or item.get("postUrl") or item.get("videoUrl") or ""
+            transcript = (item.get("transcript") or item.get("text") or "").strip()
+            if not transcript:
+                continue
+            pid = post_id_by_url.get(item_url)
+            if pid:
+                result[pid] = transcript
     return result
 
 
@@ -316,7 +324,8 @@ _PLATFORMS = {
         "posts": _ig_posts,
         "normalise_post": _ig_normalise_post,
         "transcript_actor": APIFY_INSTAGRAM_TRANSCRIPT_ACTOR,
-        "transcript_input": lambda urls: {"postUrls": urls},
+        "transcript_input": lambda urls: {"videoUrl": urls[0]},
+        "transcript_batched": False,
     },
     "tiktok": {
         "actor": APIFY_TIKTOK_ACTOR,
@@ -332,7 +341,8 @@ _PLATFORMS = {
         "posts": _tt_posts,
         "normalise_post": _tt_normalise_post,
         "transcript_actor": APIFY_TIKTOK_TRANSCRIPT_ACTOR,
-        "transcript_input": lambda urls: {"videoUrls": urls},
+        "transcript_input": lambda urls: {"videos": urls},
+        "transcript_batched": True,
     },
     "linkedin": {
         "actor": APIFY_LINKEDIN_ACTOR,
@@ -491,7 +501,8 @@ def _run_channel(competitor_id, name: str, platform: str, handle: str, is_self: 
     transcripts: dict[str, str] = {}
     if spec.get("transcript_actor"):
         transcripts = _fetch_transcripts(
-            spec["transcript_actor"], spec["transcript_input"], selected
+            spec["transcript_actor"], spec["transcript_input"], selected,
+            batched=spec.get("transcript_batched", True),
         )
 
     # Persist the avatar; omit the field on failure so skip-None preserves the prior value.

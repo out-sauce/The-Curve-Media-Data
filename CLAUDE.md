@@ -60,8 +60,12 @@ triggers stages over HTTP.
   `APIFY_YOUTUBE_ACTOR`, `APIFY_YOUTUBE_SHORTS_ACTOR`, `APIFY_INSTAGRAM_TRANSCRIPT_ACTOR`,
   `APIFY_TIKTOK_TRANSCRIPT_ACTOR` (all env-overridable). Migration
   `026_add_linkedin_youtube_transcript.sql` adds the `linkedin_*`/`youtube_*` columns plus
-  `transcript` (idempotent; applied manually). ⚠️ The LinkedIn/YouTube/transcript actor field
-  names are best-guess and must be verified against live runs before production.
+  `transcript` (idempotent; applied manually). ⚠️ The LinkedIn/YouTube actor field names are
+  still best-guess and must be verified against live runs before production. The IG/TikTok
+  transcript actors WERE verified live (2026-06-30) and corrected: the IG actor takes a single
+  `{"videoUrl": ...}` per run (one run per post, `transcript_batched=False`) and returns text in
+  `text`; the TikTok actor takes `{"videos": [...]}` and returns it in `transcript`. The earlier
+  `postUrls`/`videoUrls` guesses were wrong and fetched nothing.
 
 - **Competitor multi-channel reshape + The Curve → content_stats.** `ingestion/competitors.py`
   now treats each competitor as one brand row with up to two channels: it resolves the
