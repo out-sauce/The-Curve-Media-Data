@@ -46,6 +46,23 @@ triggers stages over HTTP.
 
 ## Recent changes
 
+- **Competitor multi-channel reshape + The Curve → content_stats.** `ingestion/competitors.py`
+  now treats each competitor as one brand row with up to two channels: it resolves the
+  `instagram`/`tiktok` handle (from `*_handle`, falling back to parsing `*_url`), scrapes
+  each channel, and writes the per-platform `{instagram,tiktok}_{avatar_url,follower_count,engagement_rate,post_count}`
+  columns plus `competitor_posts.platform` (legacy single columns are left to the Admin's
+  backfill). Avatars and post thumbnails are downloaded and re-uploaded to the public
+  `competitor-thumbnails` Storage bucket (deterministic paths, overwrite on re-run) so the
+  stored public URL never expires; a failed image fetch preserves the prior value (new
+  posts fall through to `null`). The single `is_self` ("The Curve") row additionally upserts
+  its posts into `content_stats`, deduped on `(platform, post_id)` via lookup-then-update-else-insert
+  (only scraped fields touched, so `shares`/`saves`/`reach` etc. survive), over a wider
+  90-day window (`SELF_CONTENT_STATS_LOOKBACK_DAYS` / `SELF_CONTENT_STATS_LIMIT`) decoupled
+  from the 14-day/10-post `competitor_posts` cap. Per-channel `try/except` keeps one bad
+  channel from blanking the other. New `config.py` keys: `COMPETITOR_THUMBNAILS_BUCKET`,
+  `SELF_CONTENT_STATS_LOOKBACK_DAYS`, `SELF_CONTENT_STATS_LIMIT`. All schema already exists
+  on the live DB (shipped by the Admin app); no migration is applied here.
+
 - **Site-auth login capture (write half).** Added `research/site_auth.py`: a Browserbase
   headful remote-login flow. `POST /site-auth/login/start?domain=&label=` returns
   `{session_id, live_url}` (Browserbase fullscreen debugger URL) and schedules a

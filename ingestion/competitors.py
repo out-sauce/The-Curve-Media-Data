@@ -2,22 +2,30 @@
 Competitor run — a parallel Apify flow (separate from the news social fetch) that
 tracks competitors' follower counts and recent post engagement.
 
-For each enabled competitor (Instagram or TikTok) it:
-  1. captures the current follower count (append-only snapshot → growth time series),
+A competitor is ONE brand row that may carry an Instagram channel, a TikTok channel,
+or both. For each channel present on the row it:
+  1. captures the current follower count and per-platform stats,
   2. captures the <= COMPETITOR_POST_LIMIT most recent posts within the last
-     COMPETITOR_LOOKBACK_DAYS, with likes / comments / views / caption,
-  3. upserts both into the competitor tables (snapshots append, posts re-upsert on
-     guid so engagement counts refresh as posts mature).
+     COMPETITOR_LOOKBACK_DAYS (with likes / comments / views / caption / thumbnail),
+     tagging each post with its channel (competitor_posts.platform),
+  3. persists each avatar/thumbnail into the public `competitor-thumbnails` Storage
+     bucket and writes the stable public URL back (CDN URLs expire within a day),
+  4. writes the per-platform stat columns back onto the competitors row.
+
+The single is_self ("The Curve") competitor additionally has its posts upserted into
+content_stats (deduped on (platform, post_id)) over a wider window.
 
 Reuses the existing Apify plumbing (ingestion/apify.run_actor) and APIFY_TOKEN /
 actor-id config — it does NOT touch the news flow or news_articles.
 
-Resilience: an Apify failure for one competitor logs an 'error' source_runs row
-(category 'competitor') for that account and continues — it never aborts the run.
+Resilience: an Apify failure for one channel logs an 'error' source_runs row
+(category 'competitor') for that channel and continues — it never aborts the run,
+and a failed/absent channel never blanks the other channel's columns.
 """
 
 import logging
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 
 from config import (
     APIFY_TOKEN,
@@ -25,12 +33,17 @@ from config import (
     APIFY_TIKTOK_ACTOR,
     COMPETITOR_POST_LIMIT,
     COMPETITOR_LOOKBACK_DAYS,
+    SELF_CONTENT_STATS_LOOKBACK_DAYS,
+    SELF_CONTENT_STATS_LIMIT,
 )
 from ingestion.apify import run_actor, parse_ts
 from ingestion.storage import (
     get_competitors,
     update_competitor_stats,
     upsert_competitor_posts,
+    upsert_self_content_stats,
+    store_competitor_image,
+    get_existing_post_thumbnails,
     log_source_run,
 )
 
@@ -172,44 +185,35 @@ _PLATFORMS = {
 }
 
 
-def _run_competitor(competitor: dict) -> int:
-    """Scrape one competitor. Never raises — logs and returns posts written."""
-    competitor_id = competitor.get("id")
-    platform = competitor.get("platform", "")
-    handle = (competitor.get("handle") or "").lstrip("@").strip()
-    name = (competitor.get("display_name") or handle or "competitor").strip()
-
-    spec = _PLATFORMS.get(platform)
-    if spec is None:
-        logger.warning("Unknown competitor platform '%s' for '%s'", platform, name)
-        log_source_run(name, _RUN_CATEGORY, "error", 0, f"Unknown platform '{platform}'")
-        return 0
-
-    if not handle:
-        logger.warning("Competitor '%s' has no handle — skipping", name)
-        log_source_run(name, _RUN_CATEGORY, "error", 0, "No handle configured")
-        return 0
-
-    # Fetch a generous window of posts; the 14-day / 10-post cap is applied below.
-    fetch_limit = max(COMPETITOR_POST_LIMIT * 5, 50)
-
+def _handle_from_url(url: str | None) -> str | None:
+    """Parse a username off an IG/TikTok profile URL (e.g. .../@thecurve → thecurve)."""
+    if not url:
+        return None
     try:
-        items = run_actor(spec["actor"], spec["input"](handle, fetch_limit))
-    except Exception as exc:
-        logger.warning("Apify %s fetch for competitor '%s' (@%s) failed: %s", platform, name, handle, exc)
-        log_source_run(name, _RUN_CATEGORY, "error", 0, str(exc)[:500])
-        # Leave refresh_status='pending' so the daily job retries; the admin
-        # card simply times out its poll rather than showing stale data.
-        return 0
+        path = urlparse(url).path
+    except (TypeError, ValueError):
+        return None
+    segment = next((part for part in path.split("/") if part), "")
+    return segment.lstrip("@").strip() or None
 
-    now = datetime.now(timezone.utc)
-    now_iso = now.isoformat()
-    cutoff = now - timedelta(days=COMPETITOR_LOOKBACK_DAYS)
 
-    profile = spec["profile"](items)
-    follower_count = profile.get("follower_count")
+def _resolve_channels(competitor: dict) -> list[dict]:
+    """
+    Resolve the channels present on a competitor row to a list of
+    {"platform", "handle"} — instagram if it carries an instagram handle/url,
+    tiktok likewise. The handle comes from *_handle, falling back to parsing *_url.
+    """
+    channels = []
+    for platform in ("instagram", "tiktok"):
+        raw_handle = (competitor.get(f"{platform}_handle") or "").lstrip("@").strip()
+        handle = raw_handle or _handle_from_url(competitor.get(f"{platform}_url"))
+        if handle:
+            channels.append({"platform": platform, "handle": handle})
+    return channels
 
-    # Recent posts — normalise, apply 14-day cutoff, sort desc, cap to 10.
+
+def _normalise_posts(spec: dict, items: list[dict], name: str, platform: str) -> list[tuple]:
+    """Normalise + parse-date all posts from an actor run → [(published_dt, post)]."""
     normalised = []
     for raw in spec["posts"](items):
         try:
@@ -220,58 +224,158 @@ def _run_competitor(competitor: dict) -> int:
         if not post:
             continue
         published_dt = _parse_dt(post["published_at"])
-        if published_dt is None or published_dt < cutoff:
+        if published_dt is None:
             continue
         normalised.append((published_dt, post))
-
     normalised.sort(key=lambda pair: pair[0], reverse=True)
-    selected = [post for _, post in normalised[:COMPETITOR_POST_LIMIT]]
+    return normalised
 
-    # Build post rows in the admin schema (competitor_posts) and accumulate the
-    # per-post engagement rate = (likes + comments) / follower_count.
+
+def _run_channel(competitor_id, name: str, platform: str, handle: str, is_self: bool,
+                 stats: dict, content_stats_rows: list) -> int:
+    """
+    Scrape one channel (instagram or tiktok) of a competitor. Accumulates the
+    per-platform stat columns into `stats` and, for the is_self row, appends the
+    wider content_stats post set into `content_stats_rows`. Returns the number of
+    competitor_posts rows written. Raises on actor failure so the caller can log an
+    error source_run for just this channel.
+    """
+    spec = _PLATFORMS[platform]
+
+    # Fetch a generous window; the 14-day / 10-post cap is applied below. The
+    # is_self row fetches more so its wider content_stats window has posts to draw on.
+    fetch_limit = SELF_CONTENT_STATS_LIMIT if is_self else max(COMPETITOR_POST_LIMIT * 5, 50)
+
+    items = run_actor(spec["actor"], spec["input"](handle, fetch_limit))
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=COMPETITOR_LOOKBACK_DAYS)
+
+    profile = spec["profile"](items)
+    follower_count = profile.get("follower_count")
+
+    normalised = _normalise_posts(spec, items, name, platform)
+
+    # competitor_posts: 14-day cutoff, cap to COMPETITOR_POST_LIMIT.
+    selected = [post for dt, post in normalised if dt >= cutoff][:COMPETITOR_POST_LIMIT]
+
+    # Persist the avatar; omit the field on failure so skip-None preserves the prior value.
+    avatar_url = store_competitor_image(
+        profile.get("avatar_url"), f"avatars/{competitor_id}_{platform}.jpg"
+    )
+
+    # Preserve already-stored thumbnails when a re-fetch of an existing post fails.
+    existing_thumbs = get_existing_post_thumbnails(
+        competitor_id, [post["post_id"] for post in selected]
+    )
+
     rows = []
     engagements = []
     for post in selected:
         likes = post["like_count"]
         comments = post["comment_count"]
+        post_id = post["post_id"]
+        thumbnail_url = store_competitor_image(
+            post["thumbnail_url"], f"posts/{platform}_{post_id}.jpg"
+        )
+        if thumbnail_url is None:
+            # Failed (or absent) fetch: keep an existing post's prior thumbnail; a
+            # brand-new post falls through to null.
+            thumbnail_url = existing_thumbs.get(post_id)
         rows.append({
             "competitor_id": competitor_id,
-            "post_id": post["post_id"],
+            "platform": platform,
+            "post_id": post_id,
             "post_url": post["url"],
             "posted_at": post["published_at"],
             "caption": post["caption"],
             "likes": likes,
             "comments": comments,
             "views": post["view_count"],
-            "thumbnail_url": post["thumbnail_url"],
+            "thumbnail_url": thumbnail_url,
         })
         if follower_count:
             engagements.append(((likes or 0) + (comments or 0)) / follower_count)
 
     written = upsert_competitor_posts(rows)
 
-    # engagement_rate is a fraction (e.g. 0.043) averaged over the selected
-    # posts; the admin card renders <= 1 as a percentage.
+    # engagement_rate — fraction (e.g. 0.043) averaged over the selected posts.
     engagement_rate = round(sum(engagements) / len(engagements), 6) if engagements else None
 
-    # Write stats back onto the competitors row and mark the refresh complete —
-    # last_refreshed_at is what the admin Refresh card polls for.
-    update_competitor_stats(competitor_id, {
-        "display_name": profile.get("display_name"),
-        "avatar_url": profile.get("avatar_url"),
-        "follower_count": follower_count,
-        "following_count": profile.get("following_count"),
-        "post_count": profile.get("post_count"),
-        "engagement_rate": engagement_rate,
-        "refresh_status": "idle",
-        "last_refreshed_at": now_iso,
-    })
+    # Accumulate per-platform columns only (skip-None preserves the other channel).
+    stats[f"{platform}_avatar_url"] = avatar_url
+    stats[f"{platform}_follower_count"] = follower_count
+    stats[f"{platform}_engagement_rate"] = engagement_rate
+    stats[f"{platform}_post_count"] = profile.get("post_count")
+
+    # is_self → content_stats over a wider window (decoupled from the card cap).
+    if is_self:
+        self_cutoff = now - timedelta(days=SELF_CONTENT_STATS_LOOKBACK_DAYS)
+        for dt, post in normalised:
+            if dt < self_cutoff:
+                continue
+            content_stats_rows.append({
+                "platform": platform,
+                "post_id": post["post_id"],
+                "post_url": post["url"],
+                "views": post["view_count"],
+                "likes": post["like_count"],
+                "comments": post["comment_count"],
+            })
 
     logger.info(
         "Competitor '%s' (@%s, %s): follower_count=%s / %d posts / engagement=%s",
         name, handle, platform, follower_count, len(rows), engagement_rate,
     )
     log_source_run(name, _RUN_CATEGORY, "ok", len(rows))
+    return written
+
+
+def _run_competitor(competitor: dict) -> int:
+    """Scrape one competitor (up to two channels). Never raises — logs and returns
+    the total competitor_posts written across its channels."""
+    competitor_id = competitor.get("id")
+    is_self = bool(competitor.get("is_self"))
+    base_name = (competitor.get("display_name") or "competitor").strip()
+
+    channels = _resolve_channels(competitor)
+    if not channels:
+        logger.warning("Competitor '%s' has no instagram/tiktok channel — skipping", base_name)
+        log_source_run(base_name, _RUN_CATEGORY, "error", 0, "No channel configured")
+        return 0
+
+    stats: dict = {}
+    content_stats_rows: list = []
+    written = 0
+
+    for channel in channels:
+        platform = channel["platform"]
+        handle = channel["handle"]
+        name = f"{base_name} ({platform})"
+        try:
+            written += _run_channel(
+                competitor_id, name, platform, handle, is_self, stats, content_stats_rows
+            )
+        except Exception as exc:
+            logger.warning(
+                "Apify %s fetch for competitor '%s' (@%s) failed: %s",
+                platform, base_name, handle, exc,
+            )
+            log_source_run(name, _RUN_CATEGORY, "error", 0, str(exc)[:500])
+            # Continue to the other channel; skip-None preserves this channel's columns.
+
+    # Single stats write — mark the refresh complete (last_refreshed_at is what the
+    # admin Refresh card polls for). Per-platform columns only; skip-None means an
+    # absent/failed channel never blanks the other's data.
+    update_competitor_stats(competitor_id, {
+        **stats,
+        "refresh_status": "idle",
+        "last_refreshed_at": datetime.now(timezone.utc).isoformat(),
+    })
+
+    if is_self and content_stats_rows:
+        upsert_self_content_stats(content_stats_rows)
+
     return written
 
 
