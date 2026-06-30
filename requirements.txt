@@ -10,3 +10,4 @@ anthropic>=0.69.0  # structured outputs (output_config.format) used in scoring/s
 fastapi>=0.110.0
 uvicorn[standard]>=0.29.0
 playwright>=1.44.0  # research-stage browser scraper (Chromium, installed via Dockerfile)
+browserbase>=1.0.0  # headful remote browser for site-auth login capture (research/site_auth.py)

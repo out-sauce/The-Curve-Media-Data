@@ -27,7 +27,6 @@ import json
 import logging
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import urlparse
 
 import anthropic
 
@@ -38,6 +37,7 @@ from config import (
 )
 from ingestion.storage import get_client, get_pipeline_settings, TABLE
 from .browser_scraper import scrape_article_with_browser
+from .domains import _TWO_LABEL_TLDS, registrable_domain as _registrable_domain
 from .scraper import scrape_article
 
 logger = logging.getLogger(__name__)
@@ -82,32 +82,9 @@ def _fetch_research_articles(run_date: str, score_threshold: float) -> tuple[lis
     return articles, cluster_ids
 
 
-# Multi-part public suffixes we may encounter; keep the last 3 labels so a
-# 'www.bbc.co.uk/news' URL keys on 'bbc.co.uk', not 'co.uk'. Small, hand-maintained
-# list — enough for the handful of UK/AU publishers in scope.
-_TWO_LABEL_TLDS = {
-    "co.uk", "org.uk", "gov.uk", "ac.uk", "co.nz", "com.au", "net.au",
-    "org.au", "co.za", "co.jp", "com.br",
-}
-
-
-def _registrable_domain(url: str) -> str:
-    """
-    Reduce a URL to its registrable domain, e.g.
-    'https://www.ft.com/content/abc' -> 'ft.com',
-    'https://www.bbc.co.uk/news/x'   -> 'bbc.co.uk'.
-    Returns '' if no host can be parsed.
-    """
-    host = (urlparse(url).hostname or "").lower().strip(".")
-    if not host:
-        return ""
-    parts = host.split(".")
-    if len(parts) <= 2:
-        return host
-    last_two = ".".join(parts[-2:])
-    if last_two in _TWO_LABEL_TLDS:
-        return ".".join(parts[-3:])
-    return last_two
+# Registrable-domain helpers (_registrable_domain, _TWO_LABEL_TLDS) now live in
+# research/domains.py — the single source of truth shared with the site_auth capture
+# path, so the write key and this read key cannot drift. Imported above.
 
 
 def _fetch_auth_by_domain(domains: list[str]) -> dict[str, dict]:

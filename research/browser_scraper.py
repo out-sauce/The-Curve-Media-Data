@@ -22,7 +22,13 @@ import logging
 
 import trafilatura
 
-from config import BROWSER_CDP_URL, BROWSER_PAGE_TIMEOUT
+from config import (
+    BROWSER_CDP_URL,
+    BROWSER_PAGE_TIMEOUT,
+    BROWSERBASE_API_KEY,
+    BROWSERBASE_PROJECT_ID,
+    RESEARCH_USE_BROWSERBASE,
+)
 from .scraper import MIN_WORD_COUNT, ScrapeResult
 
 logger = logging.getLogger(__name__)
@@ -66,11 +72,41 @@ def _extract(html: str) -> ScrapeResult:
     )
 
 
+def _browserbase_connect_url() -> str | None:
+    """
+    Create a Browserbase session (UK region/proxy) and return its CDP connect URL, for
+    the env-toggled Browserbase read path. Returns None (caller falls back) if the SDK
+    or credentials are missing — keeps the never-raise contract.
+    """
+    if not (BROWSERBASE_API_KEY and BROWSERBASE_PROJECT_ID):
+        return None
+    try:
+        from browserbase import Browserbase
+        bb = Browserbase(api_key=BROWSERBASE_API_KEY)
+        session = bb.sessions.create(
+            project_id=BROWSERBASE_PROJECT_ID,
+            region="eu-west-2",
+            proxies=[{"type": "browserbase", "geolocation": {"country": "GB"}}],
+        )
+        return session.connect_url
+    except Exception as exc:
+        logger.warning("Browserbase read-path session unavailable, using local Chromium: %s", exc)
+        return None
+
+
 async def _scrape(url: str, storage_state: dict | None) -> ScrapeResult:
     from playwright.async_api import async_playwright
 
     async with async_playwright() as pw:
-        if BROWSER_CDP_URL:
+        # Read-path engine selection (in priority order):
+        #   RESEARCH_USE_BROWSERBASE → managed UK-IP browser over CDP (opt-in);
+        #   BROWSER_CDP_URL          → generic hosted Chromium over CDP;
+        #   else                     → local headless Chromium (default).
+        bb_url = _browserbase_connect_url() if RESEARCH_USE_BROWSERBASE else None
+        if bb_url:
+            browser = await pw.chromium.connect_over_cdp(bb_url)
+            owns_browser = True
+        elif BROWSER_CDP_URL:
             browser = await pw.chromium.connect_over_cdp(BROWSER_CDP_URL)
             owns_browser = True
         else:

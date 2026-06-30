@@ -35,6 +35,26 @@ MAX_BROWSER_SCRAPES_PER_RUN = int(os.getenv("MAX_BROWSER_SCRAPES_PER_RUN", 100))
 # change. Safety valve if Railway memory proves tight.
 BROWSER_CDP_URL = os.getenv("BROWSER_CDP_URL", "")
 
+# Site-auth capture (research/site_auth.py) — launches a headful, human-driven remote
+# browser via Browserbase so an operator can complete a real publisher login; on login
+# completion the captured Playwright storage_state() is upserted into site_auth (the
+# write half of the per-domain auth the research scraper reads). Needs a Browserbase
+# account/project with UK-proxy entitlement provisioned.
+BROWSERBASE_API_KEY = os.getenv("BROWSERBASE_API_KEY", "")
+BROWSERBASE_PROJECT_ID = os.getenv("BROWSERBASE_PROJECT_ID", "")
+# Hard timeout (seconds) bounding a login session before teardown + final capture.
+SITE_AUTH_SESSION_TIMEOUT = int(os.getenv("SITE_AUTH_SESSION_TIMEOUT", 600))
+# How often (seconds) the capture task polls the live context's cookies.
+SITE_AUTH_POLL_INTERVAL = int(os.getenv("SITE_AUTH_POLL_INTERVAL", 5))
+# Debounce: the publisher's auth cookie(s) must be present across this many seconds
+# of consecutive polls before the upsert fires (guards against a premature capture
+# that would close the admin modal mid-login).
+SITE_AUTH_DEBOUNCE_SECONDS = int(os.getenv("SITE_AUTH_DEBOUNCE_SECONDS", 10))
+# Read-path toggle: when true the research scraper routes through Browserbase (UK IP)
+# instead of local headless Chromium. Default off — local headless stays the default,
+# Browserbase is opt-in.
+RESEARCH_USE_BROWSERBASE = os.getenv("RESEARCH_USE_BROWSERBASE", "false").lower() == "true"
+
 # Competitor run — caps the most-recent posts captured per competitor and the
 # lookback window (in days) they must fall within. Reuses the Apify config above.
 COMPETITOR_POST_LIMIT = int(os.getenv("COMPETITOR_POST_LIMIT", 10))
