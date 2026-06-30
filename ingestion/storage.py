@@ -218,8 +218,9 @@ def upsert_competitor_posts(rows: list[dict[str, Any]]) -> int:
 # dropped, and None values are skipped on update, so a scrape that lacks a field
 # never clobbers what the admin/analytics populated (reach/downloads/watch time/…).
 _CONTENT_STATS_FIELDS = (
-    "post_url", "views", "likes", "comments", "shares", "saves",
-    "caption", "hashtags", "duration_sec", "engagement_rate",
+    "post_url", "posted_at", "views", "likes", "comments", "shares", "saves",
+    "caption", "hashtags", "duration_sec",
+    "engagement_rate", "engagement_reach", "engagement_audience",
     "transcript",
 )
 

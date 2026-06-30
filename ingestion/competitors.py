@@ -558,14 +558,17 @@ def _run_channel(competitor_id, name: str, platform: str, handle: str, is_self: 
             shares = post["share_count"]
             saves = post["save_count"]
             views = post["view_count"]
-            # Engagement-by-reach proxy: true reach/unique-views needs the platform
-            # owner analytics API; with the public scrape we divide by views.
             interactions = (likes or 0) + (comments or 0) + (shares or 0) + (saves or 0)
-            engagement_rate = round(interactions / views, 6) if views else None
+            # engagement_reach = interactions / views (a proxy — true reach/unique-views
+            # needs owner analytics). engagement_audience = interactions / followers-at-time.
+            # Both stored as fractions (e.g. 0.043 = 4.3%).
+            engagement_reach = round(interactions / views, 6) if views else None
+            engagement_audience = round(interactions / follower_count, 6) if follower_count else None
             content_stats_rows.append({
                 "platform": platform,
                 "post_id": post["post_id"],
                 "post_url": post["url"],
+                "posted_at": post["published_at"],
                 "views": views,
                 "likes": likes,
                 "comments": comments,
@@ -574,7 +577,9 @@ def _run_channel(competitor_id, name: str, platform: str, handle: str, is_self: 
                 "caption": post["caption"] or None,
                 "hashtags": post["hashtags"] or None,
                 "duration_sec": post["duration_sec"],
-                "engagement_rate": engagement_rate,
+                "engagement_rate": engagement_reach,
+                "engagement_reach": engagement_reach,
+                "engagement_audience": engagement_audience,
                 "transcript": transcripts.get(post["post_id"]),
             })
 
