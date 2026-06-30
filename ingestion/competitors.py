@@ -31,6 +31,11 @@ from config import (
     APIFY_TOKEN,
     APIFY_INSTAGRAM_ACTOR,
     APIFY_TIKTOK_ACTOR,
+    APIFY_LINKEDIN_ACTOR,
+    APIFY_YOUTUBE_ACTOR,
+    APIFY_YOUTUBE_SHORTS_ACTOR,
+    APIFY_INSTAGRAM_TRANSCRIPT_ACTOR,
+    APIFY_TIKTOK_TRANSCRIPT_ACTOR,
     COMPETITOR_POST_LIMIT,
     COMPETITOR_LOOKBACK_DAYS,
     SELF_CONTENT_STATS_LOOKBACK_DAYS,
@@ -174,9 +179,134 @@ def _tt_normalise_post(item: dict) -> dict | None:
     }
 
 
+# ── LinkedIn (harvestapi~linkedin-profile-posts) ──────────────────────────────
+# ⚠️ Field names below are best-guess from the actor README; verify against a
+# live run before deploying (see Verification §9).
+
+def _li_profile(items: list[dict]) -> dict:
+    author = (items[0].get("author") or {}) if items else {}
+    return {
+        "follower_count": _to_int(author.get("followersCount")),
+        "following_count": None,
+        "post_count": None,
+        "display_name": (author.get("name") or "").strip() or None,
+        "avatar_url": author.get("profilePicture") or None,
+    }
+
+
+def _li_posts(items: list[dict]) -> list[dict]:
+    return items or []
+
+
+def _li_normalise_post(item: dict) -> dict | None:
+    post_id = item.get("id") or item.get("urn")
+    url = item.get("url") or item.get("shareUrl")
+    if not post_id:
+        return None
+    images = item.get("images") or []
+    thumbnail = images[0].get("url") if images else None
+    return {
+        "post_id": str(post_id),
+        "caption": (item.get("text") or item.get("commentary") or "").strip(),
+        "url": url,
+        "published_at": parse_ts(item.get("postedAt") or item.get("publishedAt")),
+        "like_count": _to_int(item.get("likesCount") or item.get("numLikes")),
+        "comment_count": _to_int(item.get("commentsCount") or item.get("numComments")),
+        "view_count": _to_int(item.get("viewsCount") or item.get("impressionCount")),
+        "share_count": None,
+        "save_count": None,
+        "hashtags": [],
+        "duration_sec": None,
+        "thumbnail_url": thumbnail,
+    }
+
+
+# ── YouTube / YouTube Shorts (streamers~youtube-scraper / ~youtube-shorts-scraper)
+# ⚠️ Field names are inferred; verify against a live run (see Verification §9).
+
+def _yt_profile(items: list[dict]) -> dict:
+    # The channel actor may emit a leading "channel" item or embed channelData.
+    channel = next((i for i in items if i.get("type") == "channel"), None)
+    if channel is None and items:
+        channel = items[0].get("channelData") or items[0]
+    channel = channel or {}
+    return {
+        "follower_count": _to_int(
+            channel.get("subscriberCount") or channel.get("numberOfSubscribers")
+        ),
+        "following_count": None,
+        "post_count": _to_int(channel.get("videoCount") or channel.get("numberOfVideos")),
+        "display_name": (channel.get("channelName") or channel.get("name") or "").strip() or None,
+        "avatar_url": channel.get("channelThumbnailUrl") or channel.get("avatarUrl") or None,
+    }
+
+
+def _yt_posts(items: list[dict]) -> list[dict]:
+    return [i for i in (items or []) if i.get("type") != "channel"]
+
+
+def _yt_normalise_post(item: dict) -> dict | None:
+    post_id = item.get("id") or item.get("videoId")
+    url = item.get("url") or item.get("videoUrl") or (
+        f"https://www.youtube.com/watch?v={post_id}" if post_id else None
+    )
+    if not post_id:
+        return None
+    return {
+        "post_id": str(post_id),
+        "caption": (item.get("title") or "").strip(),
+        "url": url,
+        "published_at": parse_ts(item.get("date") or item.get("uploadDate")),
+        "like_count": _to_int(item.get("likes") or item.get("likeCount")),
+        "comment_count": _to_int(item.get("commentsCount") or item.get("commentCount")),
+        "view_count": _to_int(item.get("viewCount") or item.get("views")),
+        "share_count": None,
+        "save_count": None,
+        "hashtags": [],
+        "duration_sec": None,
+        "thumbnail_url": item.get("thumbnailUrl") or None,
+    }
+
+
+# ── Transcript fetch (Instagram + TikTok only) ────────────────────────────────
+# Called once per channel with the selected posts. Returns {post_id: transcript}.
+# Best-effort: any failure logs a warning and returns {}.
+# ⚠️ Input key names ("postUrls" / "videoUrls") and output key ("transcript") are
+# inferred — verify against live actor runs before first production deploy.
+
+def _fetch_transcripts(
+    actor_id: str,
+    input_builder,          # callable(urls: list[str]) -> dict
+    posts: list[dict],
+) -> dict[str, str]:
+    if not actor_id or not posts:
+        return {}
+    eligible = [(p["post_id"], p["url"]) for p in posts if p.get("url")]
+    if not eligible:
+        return {}
+    post_id_by_url = {url: pid for pid, url in eligible}
+    urls = [url for _, url in eligible]
+    try:
+        items = run_actor(actor_id, input_builder(urls))
+    except Exception as exc:
+        logger.warning("Transcript actor %s failed: %s", actor_id, str(exc)[:200])
+        return {}
+    result: dict[str, str] = {}
+    for item in (items or []):
+        item_url = item.get("url") or item.get("postUrl") or item.get("videoUrl") or ""
+        transcript = (item.get("transcript") or item.get("text") or "").strip()
+        if not transcript:
+            continue
+        pid = post_id_by_url.get(item_url)
+        if pid:
+            result[pid] = transcript
+    return result
+
+
 _PLATFORMS = {
     "instagram": {
         "actor": APIFY_INSTAGRAM_ACTOR,
+        "stats_key": "instagram",
         "input": lambda handle, limit: {
             "directUrls": [f"https://www.instagram.com/{handle}/"],
             "resultsType": "details",
@@ -185,9 +315,12 @@ _PLATFORMS = {
         "profile": _ig_profile,
         "posts": _ig_posts,
         "normalise_post": _ig_normalise_post,
+        "transcript_actor": APIFY_INSTAGRAM_TRANSCRIPT_ACTOR,
+        "transcript_input": lambda urls: {"postUrls": urls},
     },
     "tiktok": {
         "actor": APIFY_TIKTOK_ACTOR,
+        "stats_key": "tiktok",
         "input": lambda handle, limit: {
             "profiles": [handle],
             "resultsPerPage": limit,
@@ -198,6 +331,39 @@ _PLATFORMS = {
         "profile": _tt_profile,
         "posts": _tt_posts,
         "normalise_post": _tt_normalise_post,
+        "transcript_actor": APIFY_TIKTOK_TRANSCRIPT_ACTOR,
+        "transcript_input": lambda urls: {"videoUrls": urls},
+    },
+    "linkedin": {
+        "actor": APIFY_LINKEDIN_ACTOR,
+        "stats_key": "linkedin",
+        # handle is the full profile URL for LinkedIn
+        "input": lambda handle, limit: {"profileUrl": handle, "resultsLimit": limit},
+        "profile": _li_profile,
+        "posts": _li_posts,
+        "normalise_post": _li_normalise_post,
+    },
+    "youtube": {
+        "actor": APIFY_YOUTUBE_ACTOR,
+        "stats_key": "youtube",
+        "input": lambda handle, limit: {
+            "startUrls": [{"url": f"https://www.youtube.com/@{handle}"}],
+            "maxResults": limit,
+        },
+        "profile": _yt_profile,
+        "posts": _yt_posts,
+        "normalise_post": _yt_normalise_post,
+    },
+    "youtube_shorts": {
+        "actor": APIFY_YOUTUBE_SHORTS_ACTOR,
+        "stats_key": "youtube",          # shares youtube_* columns on competitors
+        "input": lambda handle, limit: {
+            "startUrls": [{"url": f"https://www.youtube.com/@{handle}"}],
+            "maxResults": limit,
+        },
+        "profile": _yt_profile,
+        "posts": _yt_posts,
+        "normalise_post": _yt_normalise_post,
     },
 }
 
@@ -221,11 +387,28 @@ def _resolve_channels(competitor: dict) -> list[dict]:
     tiktok likewise. The handle comes from *_handle, falling back to parsing *_url.
     """
     channels = []
+    # Instagram + TikTok (unchanged)
     for platform in ("instagram", "tiktok"):
         raw_handle = (competitor.get(f"{platform}_handle") or "").lstrip("@").strip()
         handle = raw_handle or _handle_from_url(competitor.get(f"{platform}_url"))
         if handle:
             channels.append({"platform": platform, "handle": handle})
+    # LinkedIn: actor expects a full profile URL as the scrape target.
+    li_url = (competitor.get("linkedin_url") or "").strip()
+    li_handle = (competitor.get("linkedin_handle") or "").lstrip("@").strip()
+    li_target = li_url or (
+        f"https://www.linkedin.com/in/{li_handle}" if li_handle else None
+    )
+    if li_target:
+        channels.append({"platform": "linkedin", "handle": li_target})
+    # YouTube: one handle → two channels (regular + Shorts). Both share youtube_* stat
+    # columns on the competitors row (stats_key="youtube" in _PLATFORMS).
+    yt_handle = (competitor.get("youtube_handle") or "").lstrip("@").strip()
+    if not yt_handle:
+        yt_handle = _handle_from_url(competitor.get("youtube_url"))
+    if yt_handle:
+        channels.append({"platform": "youtube",        "handle": yt_handle})
+        channels.append({"platform": "youtube_shorts", "handle": yt_handle})
     return channels
 
 
@@ -277,13 +460,15 @@ def _snapshot_self_follower(platform: str, follower_count) -> None:
 def _run_channel(competitor_id, name: str, platform: str, handle: str, is_self: bool,
                  stats: dict, content_stats_rows: list) -> int:
     """
-    Scrape one channel (instagram or tiktok) of a competitor. Accumulates the
+    Scrape one channel (instagram, tiktok, linkedin, youtube or youtube_shorts) of a
+    competitor. Accumulates the
     per-platform stat columns into `stats` and, for the is_self row, appends the
     wider content_stats post set into `content_stats_rows`. Returns the number of
     competitor_posts rows written. Raises on actor failure so the caller can log an
     error source_run for just this channel.
     """
     spec = _PLATFORMS[platform]
+    stats_key = spec.get("stats_key", platform)
 
     # Fetch a generous window; the 14-day / 10-post cap is applied below. The
     # is_self row fetches more so its wider content_stats window has posts to draw on.
@@ -301,6 +486,13 @@ def _run_channel(competitor_id, name: str, platform: str, handle: str, is_self: 
 
     # competitor_posts: 14-day cutoff, cap to COMPETITOR_POST_LIMIT.
     selected = [post for dt, post in normalised if dt >= cutoff][:COMPETITOR_POST_LIMIT]
+
+    # Fetch transcripts (Instagram + TikTok only). One batched call, best-effort.
+    transcripts: dict[str, str] = {}
+    if spec.get("transcript_actor"):
+        transcripts = _fetch_transcripts(
+            spec["transcript_actor"], spec["transcript_input"], selected
+        )
 
     # Persist the avatar; omit the field on failure so skip-None preserves the prior value.
     avatar_url = store_competitor_image(
@@ -336,6 +528,7 @@ def _run_channel(competitor_id, name: str, platform: str, handle: str, is_self: 
             "comments": comments,
             "views": post["view_count"],
             "thumbnail_url": thumbnail_url,
+            "transcript": transcripts.get(post_id),
         })
         if follower_count:
             engagements.append(((likes or 0) + (comments or 0)) / follower_count)
@@ -346,15 +539,16 @@ def _run_channel(competitor_id, name: str, platform: str, handle: str, is_self: 
     engagement_rate = round(sum(engagements) / len(engagements), 6) if engagements else None
 
     # Accumulate per-platform columns only (skip-None preserves the other channel).
-    stats[f"{platform}_avatar_url"] = avatar_url
-    stats[f"{platform}_follower_count"] = follower_count
-    stats[f"{platform}_engagement_rate"] = engagement_rate
-    stats[f"{platform}_post_count"] = profile.get("post_count")
+    # stats_key folds youtube_shorts into the shared youtube_* columns.
+    stats[f"{stats_key}_avatar_url"] = avatar_url
+    stats[f"{stats_key}_follower_count"] = follower_count
+    stats[f"{stats_key}_engagement_rate"] = engagement_rate
+    stats[f"{stats_key}_post_count"] = profile.get("post_count")
 
     # is_self → record a follower snapshot for this channel and accumulate
     # content_stats over a wider window (decoupled from the card cap).
     if is_self:
-        _snapshot_self_follower(platform, follower_count)
+        _snapshot_self_follower(stats_key, follower_count)
         self_cutoff = now - timedelta(days=SELF_CONTENT_STATS_LOOKBACK_DAYS)
         for dt, post in normalised:
             if dt < self_cutoff:
@@ -381,6 +575,7 @@ def _run_channel(competitor_id, name: str, platform: str, handle: str, is_self: 
                 "hashtags": post["hashtags"] or None,
                 "duration_sec": post["duration_sec"],
                 "engagement_rate": engagement_rate,
+                "transcript": transcripts.get(post["post_id"]),
             })
 
     logger.info(
@@ -400,7 +595,7 @@ def _run_competitor(competitor: dict) -> int:
 
     channels = _resolve_channels(competitor)
     if not channels:
-        logger.warning("Competitor '%s' has no instagram/tiktok channel — skipping", base_name)
+        logger.warning("Competitor '%s' has no channel configured — skipping", base_name)
         log_source_run(base_name, _RUN_CATEGORY, "error", 0, "No channel configured")
         return 0
 

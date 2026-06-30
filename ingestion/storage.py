@@ -98,8 +98,10 @@ def get_competitors(competitor_id: str | None = None) -> list[dict]:
     """
     client = get_client()
     query = client.table("competitors").select(
-        "id, is_self, instagram_url, tiktok_url, "
-        "instagram_handle, tiktok_handle, display_name"
+        "id, is_self, display_name, "
+        "instagram_url, tiktok_url, instagram_handle, tiktok_handle, "
+        "linkedin_url, linkedin_handle, "
+        "youtube_url, youtube_handle"
     )
     if competitor_id:
         query = query.eq("id", competitor_id)
@@ -218,6 +220,7 @@ def upsert_competitor_posts(rows: list[dict[str, Any]]) -> int:
 _CONTENT_STATS_FIELDS = (
     "post_url", "views", "likes", "comments", "shares", "saves",
     "caption", "hashtags", "duration_sec", "engagement_rate",
+    "transcript",
 )
 
 _content_stats_columns: set[str] | None = None
@@ -304,12 +307,12 @@ def upsert_self_content_stats(rows: list[dict[str, Any]]) -> int:
 # and append/refresh a daily snapshot so the admin app can chart follower growth.
 
 def get_self_social_accounts() -> dict[str, str]:
-    """Return {platform: social_account_id} for The Curve's own IG/TikTok rows."""
+    """Return {platform: social_account_id} for The Curve's own IG/TikTok/LinkedIn/YouTube rows."""
     client = get_client()
     response = (
         client.table("social_accounts")
         .select("id, platform")
-        .in_("platform", ["instagram", "tiktok"])
+        .in_("platform", ["instagram", "tiktok", "linkedin", "youtube"])
         .execute()
     )
     accounts: dict[str, str] = {}

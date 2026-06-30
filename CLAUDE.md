@@ -46,6 +46,23 @@ triggers stages over HTTP.
 
 ## Recent changes
 
+- **LinkedIn + YouTube competitor channels & post transcripts.** `ingestion/competitors.py`
+  now resolves up to five channels per competitor: Instagram, TikTok, LinkedIn, YouTube
+  and YouTube Shorts. LinkedIn scrapes via `harvestapi~linkedin-profile-posts` (handle is
+  the full profile URL); YouTube + Shorts share one handle and one set of `youtube_*` stat
+  columns on `competitors` (`stats_key="youtube"` folds Shorts in), while
+  `competitor_posts.platform` keeps `"youtube"`/`"youtube_shorts"` distinct. Each post is
+  written to `competitor_posts` and, for the `is_self` ("The Curve") row, to `content_stats`
+  / `follower_snapshots` exactly as the existing IG/TikTok flow does. Instagram + TikTok
+  posts additionally get a best-effort `transcript` (one batched Apify call per channel over
+  the selected posts) written to `competitor_posts.transcript` and `content_stats.transcript`;
+  LinkedIn/YouTube have no transcript for now. New `config.py` actor ids: `APIFY_LINKEDIN_ACTOR`,
+  `APIFY_YOUTUBE_ACTOR`, `APIFY_YOUTUBE_SHORTS_ACTOR`, `APIFY_INSTAGRAM_TRANSCRIPT_ACTOR`,
+  `APIFY_TIKTOK_TRANSCRIPT_ACTOR` (all env-overridable). Migration
+  `026_add_linkedin_youtube_transcript.sql` adds the `linkedin_*`/`youtube_*` columns plus
+  `transcript` (idempotent; applied manually). ⚠️ The LinkedIn/YouTube/transcript actor field
+  names are best-guess and must be verified against live runs before production.
+
 - **Competitor multi-channel reshape + The Curve → content_stats.** `ingestion/competitors.py`
   now treats each competitor as one brand row with up to two channels: it resolves the
   `instagram`/`tiktok` handle (from `*_handle`, falling back to parsing `*_url`), scrapes

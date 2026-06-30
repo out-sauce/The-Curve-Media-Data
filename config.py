@@ -16,6 +16,13 @@ APIFY_TOKEN = os.getenv("APIFY_TOKEN", "")
 # Actor ids use '~' (not '/') in the API path. Overridable in case we switch actors.
 APIFY_INSTAGRAM_ACTOR = os.getenv("APIFY_INSTAGRAM_ACTOR", "apify~instagram-api-scraper")
 APIFY_TIKTOK_ACTOR = os.getenv("APIFY_TIKTOK_ACTOR", "clockworks~tiktok-scraper")
+# LinkedIn + YouTube (regular & Shorts) competitor actors, plus the IG/TikTok
+# transcript actors. Actor ids use '~' (not '/') in the API path; all overridable.
+APIFY_LINKEDIN_ACTOR             = os.getenv("APIFY_LINKEDIN_ACTOR",             "harvestapi~linkedin-profile-posts")
+APIFY_YOUTUBE_ACTOR              = os.getenv("APIFY_YOUTUBE_ACTOR",              "streamers~youtube-scraper")
+APIFY_YOUTUBE_SHORTS_ACTOR       = os.getenv("APIFY_YOUTUBE_SHORTS_ACTOR",       "streamers~youtube-shorts-scraper")
+APIFY_INSTAGRAM_TRANSCRIPT_ACTOR = os.getenv("APIFY_INSTAGRAM_TRANSCRIPT_ACTOR", "apple_yang~instagram-transcripts-scraper")
+APIFY_TIKTOK_TRANSCRIPT_ACTOR    = os.getenv("APIFY_TIKTOK_TRANSCRIPT_ACTOR",    "scrape-creators~best-tiktok-transcripts-scraper")
 
 # Maximum articles to keep per source per run (0 = no limit)
 MAX_ARTICLES_PER_SOURCE = int(os.getenv("MAX_ARTICLES_PER_SOURCE", 50))
