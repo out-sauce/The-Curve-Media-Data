@@ -59,3 +59,16 @@ RESEARCH_USE_BROWSERBASE = os.getenv("RESEARCH_USE_BROWSERBASE", "false").lower(
 # lookback window (in days) they must fall within. Reuses the Apify config above.
 COMPETITOR_POST_LIMIT = int(os.getenv("COMPETITOR_POST_LIMIT", 10))
 COMPETITOR_LOOKBACK_DAYS = int(os.getenv("COMPETITOR_LOOKBACK_DAYS", 14))
+
+# Public Storage bucket where competitor avatars + post thumbnails are persisted.
+# IG/TikTok CDN URLs expire within a day or two, so the pipeline downloads each
+# image and re-uploads it here under a deterministic path, writing the stable
+# public URL back into the *_avatar_url / thumbnail_url columns.
+COMPETITOR_THUMBNAILS_BUCKET = os.getenv("COMPETITOR_THUMBNAILS_BUCKET", "competitor-thumbnails")
+
+# The is_self ("The Curve") competitor additionally feeds content_stats. That feed
+# uses a wider window than the competitor card: a larger per-channel fetch and a
+# separate (longer) lookback applied only to the content_stats post set. The
+# competitor_posts card still uses COMPETITOR_POST_LIMIT / COMPETITOR_LOOKBACK_DAYS.
+SELF_CONTENT_STATS_LOOKBACK_DAYS = int(os.getenv("SELF_CONTENT_STATS_LOOKBACK_DAYS", 90))
+SELF_CONTENT_STATS_LIMIT = int(os.getenv("SELF_CONTENT_STATS_LIMIT", 100))

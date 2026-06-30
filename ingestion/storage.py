@@ -6,9 +6,14 @@ so re-runs never create duplicates.
 import logging
 from typing import Any
 
+import httpx
 from supabase import create_client, Client
 
-from config import SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
+from config import (
+    SUPABASE_URL,
+    SUPABASE_SERVICE_ROLE_KEY,
+    COMPETITOR_THUMBNAILS_BUCKET,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -81,22 +86,97 @@ def get_social_sources() -> list[dict]:
 
 def get_competitors(competitor_id: str | None = None) -> list[dict]:
     """
-    Return tracked competitors to scrape. The admin app (Curve_Admin_NextJS)
-    seeds each row with (platform, handle, profile_url); this run reads those and
-    writes the stats + posts back in.
+    Return tracked competitors to scrape. Each competitor is ONE brand row that may
+    carry an Instagram channel, a TikTok channel, or both. The admin app seeds the
+    per-channel handles/urls plus the is_self ("The Curve") flag; this run reads
+    those and writes the per-platform stats + posts back in.
 
     Pass `competitor_id` to scrape a single row (a manual Refresh from the admin
-    card); omit it for the daily job that refreshes everyone. `handle` is the
-    scrape target (username without @).
+    card); omit it for the daily job that refreshes everyone. The per-channel
+    handle is the scrape target (username without @); when absent it is parsed off
+    the matching *_url.
     """
     client = get_client()
     query = client.table("competitors").select(
-        "id, platform, handle, profile_url, display_name"
+        "id, is_self, instagram_url, tiktok_url, "
+        "instagram_handle, tiktok_handle, display_name"
     )
     if competitor_id:
         query = query.eq("id", competitor_id)
     response = query.order("created_at").execute()
     return response.data or []
+
+
+# Browser-like headers — IG/TikTok cover CDNs commonly 403 a bare client.
+_IMAGE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Referer": "https://www.google.com/",
+    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+}
+
+
+def store_competitor_image(url: str | None, path: str) -> str | None:
+    """
+    Download a competitor avatar/thumbnail from its (expiring) CDN URL and re-upload
+    it to the public `competitor-thumbnails` bucket under a deterministic `path`, so
+    re-runs overwrite the same object (no expiry, no dupes). Returns the stable
+    public URL, or None on any failure (best-effort — never raises).
+    """
+    if not url:
+        return None
+    try:
+        resp = httpx.get(url, headers=_IMAGE_HEADERS, timeout=30, follow_redirects=True)
+        resp.raise_for_status()
+        data = resp.content
+        if not data:
+            return None
+        content_type = (resp.headers.get("content-type") or "image/jpeg").split(";")[0].strip()
+        if not content_type.startswith("image/"):
+            content_type = "image/jpeg"
+    except Exception as exc:
+        logger.warning("Could not download competitor image %s: %s", url, str(exc)[:200])
+        return None
+
+    try:
+        client = get_client()
+        client.storage.from_(COMPETITOR_THUMBNAILS_BUCKET).upload(
+            path,
+            data,
+            {"content-type": content_type, "upsert": "true"},
+        )
+        public_url = client.storage.from_(COMPETITOR_THUMBNAILS_BUCKET).get_public_url(path)
+        return public_url or None
+    except Exception as exc:
+        logger.warning("Could not upload competitor image to %s: %s", path, str(exc)[:200])
+        return None
+
+
+def get_existing_post_thumbnails(
+    competitor_id: str, post_ids: list[str]
+) -> dict[str, str | None]:
+    """
+    Return {post_id: thumbnail_url} for already-stored competitor_posts, so a failed
+    re-fetch of an existing post can preserve its prior (persisted) thumbnail.
+    Brand-new posts are simply absent from the map.
+    """
+    if not post_ids:
+        return {}
+    client = get_client()
+    try:
+        response = (
+            client.table("competitor_posts")
+            .select("post_id, thumbnail_url")
+            .eq("competitor_id", competitor_id)
+            .in_("post_id", post_ids)
+            .execute()
+        )
+    except Exception as exc:
+        logger.warning("Could not read existing post thumbnails: %s", str(exc)[:200])
+        return {}
+    return {row["post_id"]: row.get("thumbnail_url") for row in (response.data or [])}
 
 
 def update_competitor_stats(competitor_id: str, fields: dict[str, Any]) -> None:
@@ -128,6 +208,65 @@ def upsert_competitor_posts(rows: list[dict[str, Any]]) -> int:
         .execute()
     )
     return len(response.data) if response.data else 0
+
+
+# Only the fields the Apify scrape actually returns — so an update never clobbers
+# columns content_stats carries but Apify doesn't (shares/saves/reach/downloads/…).
+_CONTENT_STATS_FIELDS = ("post_url", "views", "likes", "comments")
+
+
+def upsert_self_content_stats(rows: list[dict[str, Any]]) -> int:
+    """
+    Upsert the is_self ("The Curve") competitor's posts into content_stats, deduped
+    on (platform, post_id) with no source tag. Mirrors the admin's canonical
+    lookup-then-update-else-insert: find the existing row by (platform, post_id) and
+    update only the scraped fields (so shares/saves/reach/downloads etc. are
+    preserved), otherwise insert a fresh row (calendar_item_id=null). Returns the
+    number of rows written. Best-effort per row — one failure never aborts the rest.
+
+    Each input row must carry: platform, post_id, post_url, views, likes, comments.
+    """
+    if not rows:
+        return 0
+    from datetime import datetime, timezone
+    now_iso = datetime.now(timezone.utc).isoformat()
+    client = get_client()
+    written = 0
+    for row in rows:
+        platform = row.get("platform")
+        post_id = row.get("post_id")
+        if not platform or not post_id:
+            continue
+        scraped = {k: row.get(k) for k in _CONTENT_STATS_FIELDS}
+        try:
+            existing = (
+                client.table("content_stats")
+                .select("id")
+                .eq("platform", platform)
+                .eq("post_id", post_id)
+                .limit(1)
+                .execute()
+            )
+            if existing.data:
+                client.table("content_stats").update(
+                    {**scraped, "stats_synced_at": now_iso, "updated_at": now_iso}
+                ).eq("id", existing.data[0]["id"]).execute()
+            else:
+                client.table("content_stats").insert({
+                    "platform": platform,
+                    "post_id": post_id,
+                    "calendar_item_id": None,
+                    "stats_synced_at": now_iso,
+                    **scraped,
+                }).execute()
+            written += 1
+        except Exception as exc:
+            logger.warning(
+                "Could not upsert content_stats row (%s/%s): %s",
+                platform, post_id, str(exc)[:200],
+            )
+    logger.info("Upserted %d is_self posts into content_stats", written)
+    return written
 
 
 def log_source_run(
