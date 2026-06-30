@@ -181,6 +181,35 @@ def get_existing_post_thumbnails(
     return {row["post_id"]: row.get("thumbnail_url") for row in (response.data or [])}
 
 
+def get_existing_post_transcripts(
+    competitor_id: str, post_ids: list[str]
+) -> dict[str, str]:
+    """
+    Return {post_id: transcript} for already-stored competitor_posts that have a
+    non-empty transcript, so we can skip re-fetching them and preserve the prior
+    value if a re-fetch fails. Posts without a stored transcript are absent.
+    """
+    if not post_ids:
+        return {}
+    client = get_client()
+    try:
+        response = (
+            client.table("competitor_posts")
+            .select("post_id, transcript")
+            .eq("competitor_id", competitor_id)
+            .in_("post_id", post_ids)
+            .execute()
+        )
+    except Exception as exc:
+        logger.warning("Could not read existing post transcripts: %s", str(exc)[:200])
+        return {}
+    return {
+        row["post_id"]: row["transcript"]
+        for row in (response.data or [])
+        if (row.get("transcript") or "").strip()
+    }
+
+
 def update_competitor_stats(competitor_id: str, fields: dict[str, Any]) -> None:
     """
     Write scraped profile stats back onto the competitors row (skips None values

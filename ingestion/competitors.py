@@ -49,6 +49,7 @@ from ingestion.storage import (
     upsert_self_content_stats,
     store_competitor_image,
     get_existing_post_thumbnails,
+    get_existing_post_transcripts,
     log_source_run,
     get_self_social_accounts,
     upsert_follower_snapshot,
@@ -497,13 +498,21 @@ def _run_channel(competitor_id, name: str, platform: str, handle: str, is_self: 
     # competitor_posts: 14-day cutoff, cap to COMPETITOR_POST_LIMIT.
     selected = [post for dt, post in normalised if dt >= cutoff][:COMPETITOR_POST_LIMIT]
 
-    # Fetch transcripts (Instagram + TikTok only). One batched call, best-effort.
+    # Fetch transcripts (Instagram + TikTok only); best-effort. Skip posts that
+    # already have a stored transcript so we don't re-spend Apify credits or risk
+    # blanking a prior transcript when a re-fetch fails or returns empty.
     transcripts: dict[str, str] = {}
     if spec.get("transcript_actor"):
-        transcripts = _fetch_transcripts(
-            spec["transcript_actor"], spec["transcript_input"], selected,
+        existing_transcripts = get_existing_post_transcripts(
+            competitor_id, [post["post_id"] for post in selected]
+        )
+        to_fetch = [p for p in selected if p["post_id"] not in existing_transcripts]
+        fetched = _fetch_transcripts(
+            spec["transcript_actor"], spec["transcript_input"], to_fetch,
             batched=spec.get("transcript_batched", True),
         )
+        # Prior transcripts win on conflict (we never re-fetched them).
+        transcripts = {**existing_transcripts, **fetched}
 
     # Persist the avatar; omit the field on failure so skip-None preserves the prior value.
     avatar_url = store_competitor_image(
