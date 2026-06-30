@@ -51,9 +51,11 @@ logger = logging.getLogger(__name__)
 
 SITE_AUTH_TABLE = "site_auth"
 
-# Browserbase London region for a UK egress IP (paired with a UK proxy + geolocation),
-# matching the scraper's en-GB locale and the UK/AU publishers in scope.
-_BROWSERBASE_REGION = "eu-west-2"
+# Browserbase only runs in us-west-2 / us-east-1 / eu-central-1 / ap-southeast-1.
+# eu-central-1 (Frankfurt) is the nearest to the UK; the UK egress IP is delivered by
+# the paired GB proxy + geolocation, not the region. Matches the scraper's en-GB
+# locale and the UK/AU publishers in scope.
+_BROWSERBASE_REGION = "eu-central-1"
 
 # Per-publisher cookie allowlist: base domain -> the named auth cookie(s) whose
 # presence (stable across the debounce window) means a genuine logged-in session.
