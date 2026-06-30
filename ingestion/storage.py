@@ -210,9 +210,35 @@ def upsert_competitor_posts(rows: list[dict[str, Any]]) -> int:
     return len(response.data) if response.data else 0
 
 
-# Only the fields the Apify scrape actually returns — so an update never clobbers
-# columns content_stats carries but Apify doesn't (shares/saves/reach/downloads/…).
-_CONTENT_STATS_FIELDS = ("post_url", "views", "likes", "comments")
+# Fields the Apify scrape can fill on content_stats. shares/saves come from TikTok
+# only (Instagram's public scrape omits them); caption/hashtags/duration_sec/
+# engagement_rate need migration 025's columns. Keys absent from the live table are
+# dropped, and None values are skipped on update, so a scrape that lacks a field
+# never clobbers what the admin/analytics populated (reach/downloads/watch time/…).
+_CONTENT_STATS_FIELDS = (
+    "post_url", "views", "likes", "comments", "shares", "saves",
+    "caption", "hashtags", "duration_sec", "engagement_rate",
+)
+
+_content_stats_columns: set[str] | None = None
+
+
+def _content_stats_column_set() -> set[str]:
+    """Discover content_stats columns once (cached) so we only write keys that exist."""
+    global _content_stats_columns
+    if _content_stats_columns is None:
+        client = get_client()
+        sample = client.table("content_stats").select("*").limit(1).execute()
+        if sample.data:
+            _content_stats_columns = set(sample.data[0].keys())
+        else:
+            # Empty table — fall back to base columns (no enrichment until migrated).
+            _content_stats_columns = {
+                "platform", "post_id", "post_url", "views", "likes", "comments",
+                "shares", "saves", "downloads", "reach", "opens", "clicks",
+                "calendar_item_id", "stats_synced_at",
+            }
+    return _content_stats_columns
 
 
 def upsert_self_content_stats(rows: list[dict[str, Any]]) -> int:
@@ -220,24 +246,25 @@ def upsert_self_content_stats(rows: list[dict[str, Any]]) -> int:
     Upsert the is_self ("The Curve") competitor's posts into content_stats, deduped
     on (platform, post_id) with no source tag. Mirrors the admin's canonical
     lookup-then-update-else-insert: find the existing row by (platform, post_id) and
-    update only the scraped fields (so shares/saves/reach/downloads etc. are
-    preserved), otherwise insert a fresh row (calendar_item_id=null). Returns the
-    number of rows written. Best-effort per row — one failure never aborts the rest.
-
-    Each input row must carry: platform, post_id, post_url, views, likes, comments.
+    update only the scraped fields, otherwise insert a fresh row (calendar_item_id=
+    null). On update, None values are skipped so an absent field (e.g. Instagram
+    shares/saves) never clobbers an existing value. Returns the number of rows
+    written. Best-effort per row — one failure never aborts the rest.
     """
     if not rows:
         return 0
     from datetime import datetime, timezone
     now_iso = datetime.now(timezone.utc).isoformat()
     client = get_client()
+    columns = _content_stats_column_set()
+    allowed = [f for f in _CONTENT_STATS_FIELDS if f in columns]
     written = 0
     for row in rows:
         platform = row.get("platform")
         post_id = row.get("post_id")
         if not platform or not post_id:
             continue
-        scraped = {k: row.get(k) for k in _CONTENT_STATS_FIELDS}
+        scraped = {k: row.get(k) for k in allowed}
         try:
             existing = (
                 client.table("content_stats")
@@ -248,8 +275,10 @@ def upsert_self_content_stats(rows: list[dict[str, Any]]) -> int:
                 .execute()
             )
             if existing.data:
+                # Skip None so a missing field never blanks an existing value.
+                changed = {k: v for k, v in scraped.items() if v is not None}
                 client.table("content_stats").update(
-                    {**scraped, "stats_synced_at": now_iso, "updated_at": now_iso}
+                    {**changed, "stats_synced_at": now_iso, "updated_at": now_iso}
                 ).eq("id", existing.data[0]["id"]).execute()
             else:
                 client.table("content_stats").insert({
@@ -267,6 +296,70 @@ def upsert_self_content_stats(rows: list[dict[str, Any]]) -> int:
             )
     logger.info("Upserted %d is_self posts into content_stats", written)
     return written
+
+
+# ── The Curve's own channels (is_self) → follower_snapshots time series ────────
+# follower_snapshots.social_account_id is an FK to social_accounts (The Curve's own
+# channels), NOT competitors. We map the scraped platform → that social_accounts row
+# and append/refresh a daily snapshot so the admin app can chart follower growth.
+
+def get_self_social_accounts() -> dict[str, str]:
+    """Return {platform: social_account_id} for The Curve's own IG/TikTok rows."""
+    client = get_client()
+    response = (
+        client.table("social_accounts")
+        .select("id, platform")
+        .in_("platform", ["instagram", "tiktok"])
+        .execute()
+    )
+    accounts: dict[str, str] = {}
+    for row in response.data or []:
+        accounts.setdefault(row["platform"], row["id"])
+    return accounts
+
+
+def upsert_follower_snapshot(
+    social_account_id: str, platform: str, follower_count: int
+) -> None:
+    """
+    Record one follower snapshot for a self channel, one row per UTC day: update
+    today's row in place if present, else insert. Builds a clean daily growth series
+    across re-runs (manual refreshes won't create duplicate same-day rows).
+    """
+    from datetime import datetime, timezone
+    client = get_client()
+    now = datetime.now(timezone.utc)
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    existing = (
+        client.table("follower_snapshots")
+        .select("id")
+        .eq("social_account_id", social_account_id)
+        .eq("platform", platform)
+        .gte("recorded_at", day_start.isoformat())
+        .limit(1)
+        .execute()
+    )
+    if existing.data:
+        client.table("follower_snapshots").update(
+            {"follower_count": follower_count, "recorded_at": now.isoformat()}
+        ).eq("id", existing.data[0]["id"]).execute()
+    else:
+        client.table("follower_snapshots").insert({
+            "social_account_id": social_account_id,
+            "platform": platform,
+            "follower_count": follower_count,
+            "recorded_at": now.isoformat(),
+        }).execute()
+
+
+def update_social_account_follower_count(
+    social_account_id: str, follower_count: int
+) -> None:
+    """Refresh the 'current' follower_count on a social_accounts row."""
+    client = get_client()
+    client.table("social_accounts").update(
+        {"follower_count": follower_count}
+    ).eq("id", social_account_id).execute()
 
 
 def log_source_run(

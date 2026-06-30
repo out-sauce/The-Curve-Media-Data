@@ -45,6 +45,9 @@ from ingestion.storage import (
     store_competitor_image,
     get_existing_post_thumbnails,
     log_source_run,
+    get_self_social_accounts,
+    upsert_follower_snapshot,
+    update_social_account_follower_count,
 )
 
 logger = logging.getLogger(__name__)
@@ -104,6 +107,7 @@ def _ig_normalise_post(item: dict) -> dict | None:
     )
     if not post_id:
         return None
+    hashtags = [h for h in (item.get("hashtags") or []) if isinstance(h, str)]
     return {
         "post_id": str(post_id),
         "caption": (item.get("caption") or "").strip(),
@@ -112,6 +116,11 @@ def _ig_normalise_post(item: dict) -> dict | None:
         "like_count": _to_int(item.get("likesCount")),
         "comment_count": _to_int(item.get("commentsCount")),
         "view_count": _to_int(item.get("videoViewCount") or item.get("videoPlayCount")),
+        # Instagram's public scrape does not expose shares/saves (owner-only insights).
+        "share_count": None,
+        "save_count": None,
+        "hashtags": hashtags,
+        "duration_sec": _to_int(item.get("videoDuration")),
         "thumbnail_url": item.get("displayUrl") or None,
     }
 
@@ -145,6 +154,10 @@ def _tt_normalise_post(item: dict) -> dict | None:
     thumbnail = video_meta.get("coverUrl") or video_meta.get("originalCoverUrl")
     if not thumbnail and isinstance(covers, list) and covers:
         thumbnail = covers[0]
+    hashtags = [
+        h.get("name") for h in (item.get("hashtags") or [])
+        if isinstance(h, dict) and h.get("name")
+    ]
     return {
         "post_id": str(post_id),
         "caption": (item.get("text") or item.get("caption") or "").strip(),
@@ -153,6 +166,10 @@ def _tt_normalise_post(item: dict) -> dict | None:
         "like_count": _to_int(item.get("diggCount")),
         "comment_count": _to_int(item.get("commentCount")),
         "view_count": _to_int(item.get("playCount")),
+        "share_count": _to_int(item.get("shareCount")),
+        "save_count": _to_int(item.get("collectCount")),
+        "hashtags": hashtags,
+        "duration_sec": _to_int(video_meta.get("duration")),
         "thumbnail_url": thumbnail or None,
     }
 
@@ -229,6 +246,32 @@ def _normalise_posts(spec: dict, items: list[dict], name: str, platform: str) ->
         normalised.append((published_dt, post))
     normalised.sort(key=lambda pair: pair[0], reverse=True)
     return normalised
+
+
+_self_social_accounts: dict[str, str] | None = None
+
+
+def _snapshot_self_follower(platform: str, follower_count) -> None:
+    """
+    Append a daily follower snapshot for The Curve's own channel and refresh the
+    current count on its social_accounts row. follower_snapshots links to
+    social_accounts (not competitors). Best-effort — never aborts the run.
+    """
+    if follower_count is None:
+        return
+    global _self_social_accounts
+    try:
+        if _self_social_accounts is None:
+            _self_social_accounts = get_self_social_accounts()
+        social_account_id = _self_social_accounts.get(platform)
+        if not social_account_id:
+            logger.warning("No social_accounts row for self %s — skipping follower snapshot", platform)
+            return
+        upsert_follower_snapshot(social_account_id, platform, follower_count)
+        update_social_account_follower_count(social_account_id, follower_count)
+        logger.info("Self %s follower snapshot: %s", platform, follower_count)
+    except Exception as exc:
+        logger.warning("Self %s follower snapshot failed: %s", platform, str(exc)[:200])
 
 
 def _run_channel(competitor_id, name: str, platform: str, handle: str, is_self: bool,
@@ -308,19 +351,36 @@ def _run_channel(competitor_id, name: str, platform: str, handle: str, is_self: 
     stats[f"{platform}_engagement_rate"] = engagement_rate
     stats[f"{platform}_post_count"] = profile.get("post_count")
 
-    # is_self → content_stats over a wider window (decoupled from the card cap).
+    # is_self → record a follower snapshot for this channel and accumulate
+    # content_stats over a wider window (decoupled from the card cap).
     if is_self:
+        _snapshot_self_follower(platform, follower_count)
         self_cutoff = now - timedelta(days=SELF_CONTENT_STATS_LOOKBACK_DAYS)
         for dt, post in normalised:
             if dt < self_cutoff:
                 continue
+            likes = post["like_count"]
+            comments = post["comment_count"]
+            shares = post["share_count"]
+            saves = post["save_count"]
+            views = post["view_count"]
+            # Engagement-by-reach proxy: true reach/unique-views needs the platform
+            # owner analytics API; with the public scrape we divide by views.
+            interactions = (likes or 0) + (comments or 0) + (shares or 0) + (saves or 0)
+            engagement_rate = round(interactions / views, 6) if views else None
             content_stats_rows.append({
                 "platform": platform,
                 "post_id": post["post_id"],
                 "post_url": post["url"],
-                "views": post["view_count"],
-                "likes": post["like_count"],
-                "comments": post["comment_count"],
+                "views": views,
+                "likes": likes,
+                "comments": comments,
+                "shares": shares,
+                "saves": saves,
+                "caption": post["caption"] or None,
+                "hashtags": post["hashtags"] or None,
+                "duration_sec": post["duration_sec"],
+                "engagement_rate": engagement_rate,
             })
 
     logger.info(
