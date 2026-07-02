@@ -24,6 +24,7 @@ and a failed/absent channel never blanks the other channel's columns.
 """
 
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
@@ -181,17 +182,39 @@ def _tt_normalise_post(item: dict) -> dict | None:
 
 
 # ── LinkedIn (harvestapi~linkedin-profile-posts) ──────────────────────────────
-# ⚠️ Field names below are best-guess from the actor README; verify against a
-# live run before deploying (see Verification §9).
+# Field names verified against a live run (2026-07-02, company/thecurveplatform):
+# each item carries author{}, engagement{}, content (text), postedAt{}, linkedinUrl,
+# postImages[]. The follower count only appears as a string in author.info
+# ("89,092 followers"). NOTE: this actor also returns REPOSTS, whose `author` is the
+# ORIGINAL poster — so follower_count is taken from a native (non-repost) post to
+# avoid reporting another brand's follower count.
+
+def _li_follower_count(info: str | None) -> int | None:
+    """Parse '89,092 followers' → 89092 from author.info."""
+    if not info:
+        return None
+    match = re.search(r"([\d,]+)\s+follower", info)
+    return _to_int(match.group(1).replace(",", "")) if match else None
+
+
+def _li_is_repost(item: dict) -> bool:
+    header = item.get("header") or {}
+    return "repost" in (header.get("text") or "").lower()
+
 
 def _li_profile(items: list[dict]) -> dict:
-    author = (items[0].get("author") or {}) if items else {}
+    # Prefer a native post's author; reposts carry the original poster as `author`.
+    author = next(
+        (i["author"] for i in items if i.get("author") and not _li_is_repost(i)),
+        (items[0].get("author") or {}) if items else {},
+    )
+    avatar = author.get("avatar") or {}
     return {
-        "follower_count": _to_int(author.get("followersCount")),
+        "follower_count": _li_follower_count(author.get("info")),
         "following_count": None,
         "post_count": None,
         "display_name": (author.get("name") or "").strip() or None,
-        "avatar_url": author.get("profilePicture") or None,
+        "avatar_url": avatar.get("url") or None,
     }
 
 
@@ -200,21 +223,24 @@ def _li_posts(items: list[dict]) -> list[dict]:
 
 
 def _li_normalise_post(item: dict) -> dict | None:
-    post_id = item.get("id") or item.get("urn")
-    url = item.get("url") or item.get("shareUrl")
+    post_id = item.get("id") or item.get("entityId") or item.get("shareUrn")
+    url = item.get("linkedinUrl") or (item.get("socialContent") or {}).get("shareUrl")
     if not post_id:
         return None
-    images = item.get("images") or []
-    thumbnail = images[0].get("url") if images else None
+    engagement = item.get("engagement") or {}
+    posted = item.get("postedAt") or {}
+    images = item.get("postImages") or []
+    thumbnail = images[0].get("url") if images and isinstance(images[0], dict) else None
     return {
         "post_id": str(post_id),
-        "caption": (item.get("text") or item.get("commentary") or "").strip(),
+        "caption": (item.get("content") or "").strip(),
         "url": url,
-        "published_at": parse_ts(item.get("postedAt") or item.get("publishedAt")),
-        "like_count": _to_int(item.get("likesCount") or item.get("numLikes")),
-        "comment_count": _to_int(item.get("commentsCount") or item.get("numComments")),
-        "view_count": _to_int(item.get("viewsCount") or item.get("impressionCount")),
-        "share_count": None,
+        # Prefer the ISO `date`; the raw `timestamp` is milliseconds (parse_ts expects seconds).
+        "published_at": parse_ts(posted.get("date")),
+        "like_count": _to_int(engagement.get("likes")),
+        "comment_count": _to_int(engagement.get("comments")),
+        "view_count": None,
+        "share_count": _to_int(engagement.get("shares")),
         "save_count": None,
         "hashtags": [],
         "duration_sec": None,
@@ -223,22 +249,25 @@ def _li_normalise_post(item: dict) -> dict | None:
 
 
 # ── YouTube / YouTube Shorts (streamers~youtube-scraper / ~youtube-shorts-scraper)
-# ⚠️ Field names are inferred; verify against a live run (see Verification §9).
+# Field names verified against a live run (2026-07-02, channel/UCFT_HdjhtoRIwPTmQy2TNLw):
+# the actor emits one item per VIDEO (no standalone "channel" item); each video carries
+# the channel's numberOfSubscribers / channelTotalVideos / channelName / channelAvatarUrl.
 
 def _yt_profile(items: list[dict]) -> dict:
-    # The channel actor may emit a leading "channel" item or embed channelData.
+    # Channel stats ride on every video item; take them from the first one. (Older
+    # fallbacks kept in case a future channel item / channelData wrapper appears.)
     channel = next((i for i in items if i.get("type") == "channel"), None)
     if channel is None and items:
         channel = items[0].get("channelData") or items[0]
     channel = channel or {}
     return {
         "follower_count": _to_int(
-            channel.get("subscriberCount") or channel.get("numberOfSubscribers")
+            channel.get("numberOfSubscribers") or channel.get("subscriberCount")
         ),
         "following_count": None,
-        "post_count": _to_int(channel.get("videoCount") or channel.get("numberOfVideos")),
+        "post_count": _to_int(channel.get("channelTotalVideos") or channel.get("videoCount")),
         "display_name": (channel.get("channelName") or channel.get("name") or "").strip() or None,
-        "avatar_url": channel.get("channelThumbnailUrl") or channel.get("avatarUrl") or None,
+        "avatar_url": channel.get("channelAvatarUrl") or channel.get("channelThumbnailUrl") or None,
     }
 
 
@@ -348,8 +377,10 @@ _PLATFORMS = {
     "linkedin": {
         "actor": APIFY_LINKEDIN_ACTOR,
         "stats_key": "linkedin",
-        # handle is the full profile URL for LinkedIn
-        "input": lambda handle, limit: {"profileUrl": handle, "resultsLimit": limit},
+        # handle is the full profile/company URL. Verified live: the actor takes the
+        # target(s) in `targetUrls` (a list) and caps with `maxPosts`; `profileUrl`
+        # is silently ignored and returns zero items.
+        "input": lambda handle, limit: {"targetUrls": [handle], "maxPosts": limit},
         "profile": _li_profile,
         "posts": _li_posts,
         "normalise_post": _li_normalise_post,
@@ -357,8 +388,9 @@ _PLATFORMS = {
     "youtube": {
         "actor": APIFY_YOUTUBE_ACTOR,
         "stats_key": "youtube",
+        # handle is a ready-made channel URL (see _resolve_channels) — pass it as-is.
         "input": lambda handle, limit: {
-            "startUrls": [{"url": f"https://www.youtube.com/@{handle}"}],
+            "startUrls": [{"url": handle}],
             "maxResults": limit,
         },
         "profile": _yt_profile,
@@ -368,9 +400,12 @@ _PLATFORMS = {
     "youtube_shorts": {
         "actor": APIFY_YOUTUBE_SHORTS_ACTOR,
         "stats_key": "youtube",          # shares youtube_* columns on competitors
+        # The Shorts actor has a DIFFERENT input shape from the channel actor: it takes
+        # `channels` (a string list, accepts the channel URL) + `maxResultsShorts`, NOT
+        # startUrls/maxResults (which 400s). Output field names match the channel actor.
         "input": lambda handle, limit: {
-            "startUrls": [{"url": f"https://www.youtube.com/@{handle}"}],
-            "maxResults": limit,
+            "channels": [handle],
+            "maxResultsShorts": limit,
         },
         "profile": _yt_profile,
         "posts": _yt_posts,
@@ -389,6 +424,26 @@ def _handle_from_url(url: str | None) -> str | None:
         return None
     segment = next((part for part in path.split("/") if part), "")
     return segment.lstrip("@").strip() or None
+
+
+def _youtube_target_url(url: str | None, handle: str | None) -> str | None:
+    """
+    Build a canonical YouTube channel URL. Prefer the stored full URL; otherwise
+    map a handle to the right URL shape — a channel-ID / custom / user path is used
+    verbatim, a bare handle becomes an @handle. (Blindly prepending '@' to a
+    'channel/UC…' id produces youtube.com/@channel/UC… → CHANNEL_DOES_NOT_EXIST.)
+    """
+    url = (url or "").strip()
+    if url:
+        return url
+    handle = (handle or "").strip()
+    if not handle:
+        return None
+    if handle.startswith(("http://", "https://")):
+        return handle
+    if handle.startswith(("channel/", "c/", "user/", "@")):
+        return f"https://www.youtube.com/{handle.lstrip('/')}"
+    return f"https://www.youtube.com/@{handle}"
 
 
 def _resolve_channels(competitor: dict) -> list[dict]:
@@ -412,14 +467,15 @@ def _resolve_channels(competitor: dict) -> list[dict]:
     )
     if li_target:
         channels.append({"platform": "linkedin", "handle": li_target})
-    # YouTube: one handle → two channels (regular + Shorts). Both share youtube_* stat
-    # columns on the competitors row (stats_key="youtube" in _PLATFORMS).
-    yt_handle = (competitor.get("youtube_handle") or "").lstrip("@").strip()
-    if not yt_handle:
-        yt_handle = _handle_from_url(competitor.get("youtube_url"))
-    if yt_handle:
-        channels.append({"platform": "youtube",        "handle": yt_handle})
-        channels.append({"platform": "youtube_shorts", "handle": yt_handle})
+    # YouTube: one target → two channels (regular + Shorts). Both share youtube_* stat
+    # columns on the competitors row (stats_key="youtube" in _PLATFORMS). The handle is
+    # a ready-made channel URL — prefer youtube_url, else map youtube_handle to a URL.
+    yt_target = _youtube_target_url(
+        competitor.get("youtube_url"), competitor.get("youtube_handle")
+    )
+    if yt_target:
+        channels.append({"platform": "youtube",        "handle": yt_target})
+        channels.append({"platform": "youtube_shorts", "handle": yt_target})
     return channels
 
 
@@ -487,6 +543,16 @@ def _run_channel(competitor_id, name: str, platform: str, handle: str, is_self: 
 
     items = run_actor(spec["actor"], spec["input"](handle, fetch_limit))
 
+    # These actors do NOT return a non-2xx on a bad target — they hand back a data
+    # item carrying an `error` key (e.g. YouTube's CHANNEL_DOES_NOT_EXIST). Surface
+    # it as a failure so it logs an error source_run instead of silently writing nulls.
+    error_item = next((i for i in items if isinstance(i, dict) and i.get("error")), None)
+    if error_item:
+        raise RuntimeError(
+            f"{platform} actor error for '{handle}': "
+            f"{error_item.get('error')} {error_item.get('note') or ''}".strip()
+        )
+
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=COMPETITOR_LOOKBACK_DAYS)
 
@@ -494,6 +560,15 @@ def _run_channel(competitor_id, name: str, platform: str, handle: str, is_self: 
     follower_count = profile.get("follower_count")
 
     normalised = _normalise_posts(spec, items, name, platform)
+
+    # A live channel always yields at least a follower count. No follower count AND
+    # no posts means the scrape found nothing (wrong handle / unrecognised input) —
+    # surface it rather than record an empty-but-"ok" run.
+    if follower_count is None and not normalised:
+        raise RuntimeError(
+            f"{platform} actor returned no usable data for '{handle}' "
+            f"(0 posts, no follower count)"
+        )
 
     # competitor_posts: 14-day cutoff, cap to COMPETITOR_POST_LIMIT.
     selected = [post for dt, post in normalised if dt >= cutoff][:COMPETITOR_POST_LIMIT]
@@ -559,11 +634,17 @@ def _run_channel(competitor_id, name: str, platform: str, handle: str, is_self: 
     engagement_rate = round(sum(engagements) / len(engagements), 6) if engagements else None
 
     # Accumulate per-platform columns only (skip-None preserves the other channel).
-    # stats_key folds youtube_shorts into the shared youtube_* columns.
-    stats[f"{stats_key}_avatar_url"] = avatar_url
-    stats[f"{stats_key}_follower_count"] = follower_count
-    stats[f"{stats_key}_engagement_rate"] = engagement_rate
-    stats[f"{stats_key}_post_count"] = profile.get("post_count")
+    # stats_key folds youtube_shorts into the shared youtube_* columns; when two
+    # channels share a key, don't let a later channel's None clobber a value the
+    # earlier one already set (e.g. Shorts with 0 posts nulling YouTube's engagement).
+    def _accumulate(key: str, value) -> None:
+        if value is not None or key not in stats:
+            stats[key] = value
+
+    _accumulate(f"{stats_key}_avatar_url", avatar_url)
+    _accumulate(f"{stats_key}_follower_count", follower_count)
+    _accumulate(f"{stats_key}_engagement_rate", engagement_rate)
+    _accumulate(f"{stats_key}_post_count", profile.get("post_count"))
 
     # is_self → record a follower snapshot for this channel and accumulate
     # content_stats over a wider window (decoupled from the card cap).

@@ -60,12 +60,26 @@ triggers stages over HTTP.
   `APIFY_YOUTUBE_ACTOR`, `APIFY_YOUTUBE_SHORTS_ACTOR`, `APIFY_INSTAGRAM_TRANSCRIPT_ACTOR`,
   `APIFY_TIKTOK_TRANSCRIPT_ACTOR` (all env-overridable). Migration
   `026_add_linkedin_youtube_transcript.sql` adds the `linkedin_*`/`youtube_*` columns plus
-  `transcript` (idempotent; applied manually). ⚠️ The LinkedIn/YouTube actor field names are
-  still best-guess and must be verified against live runs before production. The IG/TikTok
-  transcript actors WERE verified live (2026-06-30) and corrected: the IG actor takes a single
-  `{"videoUrl": ...}` per run (one run per post, `transcript_batched=False`) and returns text in
-  `text`; the TikTok actor takes `{"videos": [...]}` and returns it in `transcript`. The earlier
-  `postUrls`/`videoUrls` guesses were wrong and fetched nothing.
+  `transcript` (idempotent; applied manually). The LinkedIn/YouTube actor inputs+outputs were
+  verified live (2026-07-02) and corrected — the earlier best-guesses were all wrong and
+  fetched nothing/nulls: **LinkedIn** (`harvestapi~linkedin-profile-posts`) takes
+  `{"targetUrls": [profile_or_company_url], "maxPosts": n}` (NOT `profileUrl`/`resultsLimit`);
+  each item exposes `author{}` (follower count is a *string* in `author.info`, e.g.
+  "1,811 followers"; avatar at `author.avatar.url`), `content` (text), `engagement.{likes,comments,shares}`,
+  `postedAt.date`, `linkedinUrl`, `postImages[]`. It also returns **reposts** whose `author` is
+  the original poster, so `_li_profile` reads the follower count from a native (non-repost) post.
+  **YouTube** (`streamers~youtube-scraper`) takes a ready-made channel URL in
+  `startUrls` — pass `youtube_url` verbatim; never rebuild as `@{handle}` (a `channel/UC…` id
+  becomes `@channel/UC…` → CHANNEL_DOES_NOT_EXIST). Channel IDs are case-sensitive. There is no
+  standalone `type:"channel"` item — every video item carries `numberOfSubscribers`,
+  `channelTotalVideos`, `channelName`, `channelAvatarUrl`; posts use `id`/`title`/`url`/`date`/
+  `viewCount`/`likes`/`commentsCount`/`thumbnailUrl`. LinkedIn/YouTube have no transcript for now.
+  Actors return a bad target as a data item with an `error` key (not a non-2xx), so `_run_channel`
+  raises on an `error` item or on a no-follower-count-and-no-posts result → logs an error
+  `source_run` instead of silently writing nulls. The IG/TikTok transcript actors were verified
+  live (2026-06-30): the IG actor takes a single `{"videoUrl": ...}` per run (one run per post,
+  `transcript_batched=False`) and returns text in `text`; the TikTok actor takes
+  `{"videos": [...]}` and returns it in `transcript`.
 
 - **Competitor multi-channel reshape + The Curve → content_stats.** `ingestion/competitors.py`
   now treats each competitor as one brand row with up to two channels: it resolves the
