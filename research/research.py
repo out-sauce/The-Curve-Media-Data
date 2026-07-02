@@ -163,6 +163,74 @@ def _call_claude(article: dict[str, Any], full_text: str, audience_doc: str) -> 
 
 
 # ---------------------------------------------------------------------------
+# Per-article processing
+# ---------------------------------------------------------------------------
+
+def _process_article(
+    article: dict[str, Any],
+    storage_state: dict | None,
+    audience_doc: str,
+    use_browser: bool,
+    supabase,
+) -> tuple[str, bool]:
+    """
+    Scrape + deep-summarise a single article, writing results to its news_articles row.
+
+    Returns (scrape_status, summarised) where scrape_status is one of
+    'scraped' | 'paywalled' | 'failed' and summarised is True when a Claude
+    deep summary was written. Records the stale-auth freshness signal when the
+    domain has a stored session. Never raises on scrape failure — those come
+    back as a 'failed' status.
+    """
+    article_id = article["id"]
+    url        = article["url"]
+    domain     = _registrable_domain(url)
+    now        = datetime.now(timezone.utc).isoformat()
+
+    if use_browser:
+        scrape_method = "browser"
+        result = scrape_article_with_browser(url, storage_state=storage_state)
+    else:
+        scrape_method = "static"
+        result = scrape_article(url, cookie_string=None)
+
+    # Stale-auth write-back: any scrape on a domain that *has* a stored session
+    # records its outcome so the portal can flag a stale (7/30-day) session.
+    if storage_state is not None:
+        _record_auth_usage(domain, result.status, now)
+
+    if result.status != "scraped":
+        supabase.table(TABLE).update({
+            "scrape_status": result.status,
+            "scrape_method": scrape_method,
+            "scraped_at":    now,
+        }).eq("id", article_id).execute()
+        logger.debug("Article %s: %s — %s", article_id, result.status, result.error)
+        return result.status, False
+
+    supabase.table(TABLE).update({
+        "scrape_status": "scraped",
+        "scrape_method": scrape_method,
+        "full_text":     result.full_text,
+        "word_count":    result.word_count,
+        "scraped_at":    now,
+    }).eq("id", article_id).execute()
+
+    claude_result = _call_claude(article, result.full_text, audience_doc)
+    if claude_result is None:
+        return "scraped", False
+
+    supabase.table(TABLE).update({
+        "deep_summary":    claude_result["deep_summary"],
+        "key_facts":       claude_result["key_facts"],
+        "relevance_notes": claude_result["relevance_notes"],
+        "summarised_at":   datetime.now(timezone.utc).isoformat(),
+    }).eq("id", article_id).execute()
+    logger.debug("Article %s researched (%d words)", article_id, result.word_count)
+    return "scraped", True
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -195,60 +263,22 @@ def run_research(run_date: str | None = None) -> None:
     browser_scrapes = 0
 
     for article in articles:
-        article_id   = article["id"]
-        url          = article["url"]
-        domain       = _registrable_domain(url)
+        domain        = _registrable_domain(article["url"])
         storage_state = auth_by_domain.get(domain)
-        now          = datetime.now(timezone.utc).isoformat()
 
         # Render in a real logged-in browser tab when enabled and under the per-run
         # cap; otherwise fall back to the static httpx scraper (safe degrade).
         use_browser = RESEARCH_USE_BROWSER and browser_scrapes < MAX_BROWSER_SCRAPES_PER_RUN
         if use_browser:
             browser_scrapes += 1
-            scrape_method = "browser"
-            result = scrape_article_with_browser(url, storage_state=storage_state)
-        else:
-            scrape_method = "static"
-            result = scrape_article(url, cookie_string=None)
 
-        # Stale-auth write-back: any scrape on a domain that *has* a stored session
-        # records its outcome so the portal can flag a stale (7/30-day) session.
-        if storage_state is not None:
-            _record_auth_usage(domain, result.status, now)
-
-        if result.status != "scraped":
-            supabase.table(TABLE).update({
-                "scrape_status": result.status,
-                "scrape_method": scrape_method,
-                "scraped_at":    now,
-            }).eq("id", article_id).execute()
-            paywalled += result.status == "paywalled"
-            failed    += result.status == "failed"
-            logger.debug("Article %s: %s — %s", article_id, result.status, result.error)
-            continue
-
-        scraped += 1
-        supabase.table(TABLE).update({
-            "scrape_status": "scraped",
-            "scrape_method": scrape_method,
-            "full_text":     result.full_text,
-            "word_count":    result.word_count,
-            "scraped_at":    now,
-        }).eq("id", article_id).execute()
-
-        claude_result = _call_claude(article, result.full_text, audience_doc)
-        if claude_result is None:
-            continue
-
-        supabase.table(TABLE).update({
-            "deep_summary":    claude_result["deep_summary"],
-            "key_facts":       claude_result["key_facts"],
-            "relevance_notes": claude_result["relevance_notes"],
-            "summarised_at":   datetime.now(timezone.utc).isoformat(),
-        }).eq("id", article_id).execute()
-        summarised += 1
-        logger.debug("Article %s researched (%d words)", article_id, result.word_count)
+        status, did_summarise = _process_article(
+            article, storage_state, audience_doc, use_browser, supabase
+        )
+        scraped    += status == "scraped"
+        paywalled  += status == "paywalled"
+        failed     += status == "failed"
+        summarised += did_summarise
 
     for cluster_id in research_cluster_ids:
         supabase.table(CLUSTERS_TABLE).update(
@@ -259,4 +289,46 @@ def run_research(run_date: str | None = None) -> None:
         "Research complete — %d scraped, %d summarised, %d paywalled, %d failed "
         "(%d via browser path)",
         scraped, summarised, paywalled, failed, browser_scrapes,
+    )
+
+
+def run_research_article(article_id: str) -> None:
+    """
+    Research a single article on demand, regardless of its cluster's score or
+    prior scrape_status (an explicit request overrides the batch's skip/threshold
+    rules). Scrapes full text + writes a deep summary onto the news_articles row,
+    exactly as the batch path does. Does not touch cluster_status — one article
+    does not mean the whole cluster is researched.
+    """
+    logger.info("Research (single) started for article %s", article_id)
+
+    client = get_client()
+    resp = (
+        client.table(TABLE)
+        .select("id, url, title, summary, source_id, scrape_status")
+        .eq("id", article_id)
+        .limit(1)
+        .execute()
+    )
+    rows = resp.data or []
+    if not rows:
+        logger.warning("Research (single): article %s not found", article_id)
+        return
+    article = rows[0]
+    if not article.get("url"):
+        logger.warning("Research (single): article %s has no url", article_id)
+        return
+
+    settings     = get_pipeline_settings()
+    audience_doc = settings.get("audience_doc") or ""
+
+    domain        = _registrable_domain(article["url"])
+    storage_state = _fetch_auth_by_domain([domain] if domain else []).get(domain)
+
+    status, summarised = _process_article(
+        article, storage_state, audience_doc, RESEARCH_USE_BROWSER, client
+    )
+    logger.info(
+        "Research (single) complete — article %s: %s (summarised=%s)",
+        article_id, status, summarised,
     )

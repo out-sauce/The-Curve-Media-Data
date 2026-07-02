@@ -18,7 +18,7 @@ from scoring.score import run_scoring
 from briefing.brief import run_briefing
 from tagging.tag import run_tagging
 from daily_brief.daily_brief import run_daily_brief
-from research.research import run_research
+from research.research import run_research, run_research_article
 from research.site_auth import (
     SiteAuthUnavailable,
     force_capture,
@@ -126,9 +126,17 @@ def run_brief(background_tasks: BackgroundTasks, date: str | None = None, x_api_
 
 
 @app.post("/run/research")
-def run_research_endpoint(background_tasks: BackgroundTasks, date: str | None = None, x_api_key: str = Header(default="")):
+def run_research_endpoint(background_tasks: BackgroundTasks, date: str | None = None, id: str | None = None, x_api_key: str = Header(default="")):
+    """
+    Run the research stage. Pass ?id=<article_id> to research a single article
+    on demand (ignores cluster score + prior scrape_status); omit it to run the
+    batch over scored clusters for ?date (the daily job).
+    """
     _check_key(x_api_key)
-    background_tasks.add_task(run_research, run_date=date)
+    if id:
+        background_tasks.add_task(run_research_article, id)
+    else:
+        background_tasks.add_task(run_research, run_date=date)
     return {"status": "started"}
 
 
