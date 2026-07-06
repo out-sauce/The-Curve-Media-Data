@@ -1,8 +1,10 @@
 """
 Stage 5 — Brief Generation.
 
-Generates an editorial brief for each accepted story cluster.
-One Claude call per cluster, using CurveTOV.md as the system prompt.
+Generates an editorial brief for each researched story cluster that actually
+produced a deep summary. One Claude call per cluster, using CurveTOV.md as the
+system prompt. Clusters research marked 'researched' but for which no article
+got a deep summary (all scrapes failed/paywalled, or Claude failed) are skipped.
 
 Input:
   - Anchor article (title + summary) as the lead source
@@ -33,12 +35,12 @@ BRIEFING_MODEL = "claude-sonnet-4-6"
 # DB helpers
 # ---------------------------------------------------------------------------
 
-def _fetch_accepted_clusters(run_date: str) -> list[dict[str, Any]]:
+def _fetch_briefable_clusters(run_date: str) -> list[dict[str, Any]]:
     client = get_client()
     response = (
         client.table(CLUSTERS_TABLE)
         .select("id, cluster_id")
-        .eq("cluster_status", "accepted")
+        .eq("cluster_status", "researched")
         .eq("date", run_date)
         .execute()
     )
@@ -120,13 +122,15 @@ def _generate_brief(articles: list[dict[str, Any]], tov_doc: str, brief_instruct
 
 def run_briefing(run_date: str | None = None) -> None:
     """
-    Stage 5 brief generation. Run after scoring.
+    Stage 5 brief generation. Run after research.
 
-    For each accepted cluster:
+    For each researched cluster that has at least one article with a deep
+    summary:
       1. Fetch all cluster articles
-      2. Generate brief via Claude (tov_doc as system prompt)
-      3. Write name + brief to story_clusters
-      4. Set cluster_status = briefed, briefed_at = now
+      2. Skip the cluster if no article has a non-empty deep_summary
+      3. Generate brief via Claude (tov_doc as system prompt)
+      4. Write name + brief to story_clusters
+      5. Set cluster_status = briefed, briefed_at = now
     """
     from datetime import date, timedelta
     target_date = run_date or (date.today() - timedelta(days=1)).isoformat()
@@ -136,9 +140,9 @@ def run_briefing(run_date: str | None = None) -> None:
     _CURVE_TOV = _settings.get("tov_doc", "")
     _BRIEF_INSTRUCTIONS = _settings.get("brief_instructions", "")
 
-    clusters = _fetch_accepted_clusters(target_date)
+    clusters = _fetch_briefable_clusters(target_date)
     if not clusters:
-        logger.info("Briefing: no accepted clusters to process")
+        logger.info("Briefing: no researched clusters to process")
         return
 
     logger.info("Generating briefs for %d clusters", len(clusters))
@@ -146,6 +150,7 @@ def run_briefing(run_date: str | None = None) -> None:
     supabase = get_client()
     briefed = 0
     failed = 0
+    skipped = 0
 
     for cluster in clusters:
         cluster_id = cluster["cluster_id"]
@@ -153,6 +158,15 @@ def run_briefing(run_date: str | None = None) -> None:
         articles = _fetch_cluster_articles(cluster_id)
         if not articles:
             logger.warning("Cluster %s has no articles — skipping", cluster_id)
+            continue
+
+        # Only brief stories the research stage actually summarised: require at
+        # least one article with a non-empty deep_summary. Clusters marked
+        # 'researched' but with no deep summary (all scrapes failed/paywalled,
+        # or Claude failed) are left untouched for a later re-run.
+        if not any((a.get("deep_summary") or "").strip() for a in articles):
+            skipped += 1
+            logger.info("Cluster %s has no deep summary — skipping brief", cluster_id)
             continue
 
         # Prefer deep_summary (from research stage) over RSS summary where available
@@ -177,6 +191,6 @@ def run_briefing(run_date: str | None = None) -> None:
         logger.debug("Cluster %s — brief generated (%d chars)", cluster_id, len(brief))
 
     logger.info(
-        "Briefing complete — %d briefed, %d failed",
-        briefed, failed,
+        "Briefing complete — %d briefed, %d skipped (no deep summary), %d failed",
+        briefed, skipped, failed,
     )

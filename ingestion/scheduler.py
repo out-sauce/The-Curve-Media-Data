@@ -2,7 +2,7 @@
 Scheduler — runs the full daily pipeline at 5am UTC.
 
 Single job:
-  05:00 UTC daily → ingest → filter → cluster → score → tag → research
+  05:00 UTC daily → ingest → filter → cluster → score → tag → research → brief
 """
 
 import logging
@@ -17,6 +17,7 @@ from clustering.cluster import run_clustering
 from scoring.score import run_scoring
 from tagging.tag import run_tagging
 from research.research import run_research
+from briefing.brief import run_briefing
 from ingestion.competitors import run_competitors
 
 logger = logging.getLogger(__name__)
@@ -41,7 +42,9 @@ def run_daily_pipeline() -> None:
       5. Tag scored clusters
       6. Research — scrape full text + deep summaries for clusters above the
          research score threshold, transitioning them to 'researched'
-      7. Competitor run — follower counts + recent post engagement (after the news run)
+      7. Brief — editorial name + brief for researched clusters that produced a
+         deep summary, transitioning them to 'briefed'
+      8. Competitor run — follower counts + recent post engagement (after the news run)
     """
     from datetime import date
     today = date.today().isoformat()
@@ -59,6 +62,7 @@ def run_daily_pipeline() -> None:
     _run("score",        run_scoring,      run_date=today)
     _run("tag",          run_tagging,      run_date=today)
     _run("research",     run_research,     run_date=today)
+    _run("brief",        run_briefing,     run_date=today)
     _run("competitors",  run_competitors)
     logger.info("=== Daily pipeline complete ===")
 
