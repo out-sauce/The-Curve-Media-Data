@@ -19,6 +19,13 @@ logger = logging.getLogger(__name__)
 CLUSTERS_TABLE = "story_clusters"
 TAGGING_MODEL = "claude-haiku-4-5-20251001"
 
+# Tag clusters in bounded batches. A single Claude call over every cluster of the
+# day overflowed max_tokens (the JSON array was truncated mid-string, so json.loads
+# failed and *all* clusters were left untagged — see the daily run logs). Batching
+# caps the response size so it can't truncate, and isolates a bad batch from the rest.
+TAG_BATCH_SIZE = 40
+TAG_MAX_TOKENS = 8192
+
 
 def _fetch_scored_clusters(run_date: str) -> list[dict[str, Any]]:
     client = get_client()
@@ -79,7 +86,7 @@ def _call_claude(clusters: list[dict], articles_by_cluster: dict,
     try:
         message = client.messages.create(
             model=TAGGING_MODEL,
-            max_tokens=4096,
+            max_tokens=TAG_MAX_TOKENS,
             messages=[{"role": "user", "content": prompt}],
         )
         raw = message.content[0].text.strip()
@@ -133,7 +140,19 @@ def run_tagging(run_date: str | None = None) -> None:
     cluster_ids = [c["cluster_id"] for c in clusters]
     articles_by_cluster = _fetch_articles_for_clusters(cluster_ids)
 
-    results = _call_claude(clusters, articles_by_cluster, available_tags, available_geo_tags)
+    # One Claude call per batch so the JSON response can't overflow max_tokens.
+    # Each batch is independent — a batch that fails to parse only loses its own
+    # tags, not the whole day's.
+    results: dict[str, tuple[list, list]] = {}
+    for i in range(0, len(clusters), TAG_BATCH_SIZE):
+        batch = clusters[i: i + TAG_BATCH_SIZE]
+        batch_results = _call_claude(batch, articles_by_cluster, available_tags, available_geo_tags)
+        if not batch_results:
+            logger.warning(
+                "Tagging: batch %d–%d returned no results — those clusters left untagged",
+                i, i + len(batch),
+            )
+        results.update(batch_results)
 
     if not results:
         logger.warning("Tagging: no results returned — clusters left untagged")
