@@ -29,7 +29,7 @@ from config import (
     BROWSERBASE_PROJECT_ID,
     RESEARCH_USE_BROWSERBASE,
 )
-from .scraper import MIN_WORD_COUNT, ScrapeResult
+from .scraper import ScrapeResult, classify_text
 
 logger = logging.getLogger(__name__)
 
@@ -57,19 +57,7 @@ def _extract(html: str) -> ScrapeResult:
         include_tables=False,
         no_fallback=False,
     )
-    if not text or len(text.split()) < MIN_WORD_COUNT:
-        return ScrapeResult(
-            status="paywalled",
-            full_text=None,
-            word_count=0,
-            error="Content below minimum threshold — likely paywalled or login wall",
-        )
-    return ScrapeResult(
-        status="scraped",
-        full_text=text,
-        word_count=len(text.split()),
-        error=None,
-    )
+    return classify_text(text)
 
 
 def _browserbase_connect_url() -> str | None:
