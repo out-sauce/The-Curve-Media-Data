@@ -5,9 +5,23 @@ Exposes HTTP endpoints so the admin app can trigger pipeline stages.
 The APScheduler daily job starts in a background thread on startup.
 """
 
+import logging
 import os
+import sys
 import threading
 from contextlib import asynccontextmanager
+
+# Configure root logging for the uvicorn/Railway entrypoint. main.py does this for the
+# CLI, but api.py never did — so under uvicorn the app loggers had no handler and Python
+# emitted only WARNING+, silently dropping every INFO line (scrape statuses, "Research
+# complete", "site_auth captured"). Mirror main.py's setup so those are visible in
+# Railway logs. LOG_LEVEL env overrides (default INFO).
+logging.basicConfig(
+    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
+    format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout,
+)
 
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException
 from pydantic import BaseModel
@@ -28,8 +42,6 @@ from research.site_auth import (
     start_login,
 )
 from ingestion.competitors import run_competitors
-
-import logging
 
 logger = logging.getLogger(__name__)
 
