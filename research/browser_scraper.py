@@ -67,6 +67,39 @@ def _proxy_config() -> dict | None:
     return proxy
 
 
+# Substrings that distinguish *why* a page yielded no article, matched case-insensitively
+# against the rendered HTML. Bot walls vs. paywalls vs. JS shells need different fixes.
+_DIAGNOSTIC_MARKERS = (
+    "unusual activity",
+    "are you a robot",
+    "press & hold",
+    "press and hold",
+    "verify you are human",
+    "captcha",
+    "px-captcha",
+    "access to this page has been denied",
+    "subscribe to continue",
+    "sign in to continue",
+    "become a subscriber",
+    "enable javascript",
+)
+
+
+async def _log_non_article(page, url: str, html: str, status: str) -> None:
+    """Log the page title, final URL, size and any known challenge/paywall markers when a
+    render produced no article. Diagnostic only — wrapped so it never perturbs the scrape."""
+    try:
+        title = await page.title()
+    except Exception:
+        title = ""
+    lowered = html.lower()
+    markers = [m for m in _DIAGNOSTIC_MARKERS if m in lowered]
+    logger.info(
+        "Non-article render: status=%s url=%s final_url=%s title=%r html_len=%d markers=%s",
+        status, url, getattr(page, "url", url), title, len(html), markers,
+    )
+
+
 def _extract(html: str) -> ScrapeResult:
     """Run rendered HTML through trafilatura and apply the paywall/word-count check."""
     text = trafilatura.extract(
@@ -147,7 +180,13 @@ async def _scrape(url: str, storage_state: dict | None) -> ScrapeResult:
                 pass
 
             html = await page.content()
-            return _extract(html)
+            result = _extract(html)
+            if result.status != "scraped":
+                # No article extracted — log what the page actually was so we can tell a
+                # bot wall from a real paywall from a blank JS shell (the raw HTML is not
+                # persisted anywhere). Best-effort; never affects the returned result.
+                await _log_non_article(page, url, html, result.status)
+            return result
         finally:
             if context is not None:
                 try:
