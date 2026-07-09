@@ -105,11 +105,15 @@ def upsert_site_auth(
     row = {
         "domain": domain,
         "storage_state": storage_state,
-        "label": label,
         "captured_at": now,
         "last_status": "captured",
         "updated_at": now,
     }
+    # Only write `label` when supplied. On an upsert conflict a column absent from the
+    # payload is left out of the UPDATE SET clause, so an import (which sends no label)
+    # preserves the Admin-set label rather than nulling it; a fresh row just defaults it.
+    if label is not None:
+        row["label"] = label
     try:
         get_client().table(SITE_AUTH_TABLE).upsert(row, on_conflict="domain").execute()
         logger.info("site_auth captured for %s (label=%s)", domain, label)
