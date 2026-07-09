@@ -57,6 +57,23 @@ SITE_AUTH_POLL_INTERVAL = int(os.getenv("SITE_AUTH_POLL_INTERVAL", 5))
 # of consecutive polls before the upsert fires (guards against a premature capture
 # that would close the admin modal mid-login).
 SITE_AUTH_DEBOUNCE_SECONDS = int(os.getenv("SITE_AUTH_DEBOUNCE_SECONDS", 10))
+# keepAlive (Browserbase Startup plan+): keeps the session alive after the Playwright
+# CDP connection disconnects. When true, the capture task DETACHES during the login for
+# any non-allowlisted domain — navigate, disconnect, let the human log in with zero
+# automation attached (no `Runtime.enable` for anti-bot scripts to detect), then
+# reconnect briefly only to grab storage_state. Default off: without keepAlive a
+# disconnect would end the session, so the connection is held open for the whole login
+# as before. Does NOT mask the operator's live DevTools view — that needs Advanced Stealth.
+SITE_AUTH_KEEP_ALIVE = os.getenv("SITE_AUTH_KEEP_ALIVE", "false").lower() == "true"
+# Per-domain residential-proxy allowlist (comma-separated registrable base domains, e.g.
+# "wsj.com,nytimes.com"). These sessions use Browserbase residential egress (better IP
+# reputation vs. PerimeterX/DataDome) instead of the default datacenter-leaning pool.
+# Residential is metered per-GB, so scope it to the hostile publishers only.
+SITE_AUTH_RESIDENTIAL_DOMAINS = {
+    d.strip().lower()
+    for d in os.getenv("SITE_AUTH_RESIDENTIAL_DOMAINS", "wsj.com").split(",")
+    if d.strip()
+}
 # Read-path toggle: when true the research scraper routes through Browserbase (UK IP)
 # instead of local headless Chromium. Default off — local headless stays the default,
 # Browserbase is opt-in.

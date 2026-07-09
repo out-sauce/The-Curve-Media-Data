@@ -10,6 +10,7 @@ import threading
 from contextlib import asynccontextmanager
 
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException
+from pydantic import BaseModel
 
 from ingestion.scheduler import run_ingestion, start_scheduler, run_daily_pipeline
 from filtering.filter import run_filtering
@@ -22,6 +23,7 @@ from research.research import run_research, run_research_article
 from research.site_auth import (
     SiteAuthUnavailable,
     force_capture,
+    import_storage_state,
     run_capture_session,
     start_login,
 )
@@ -193,6 +195,38 @@ def site_auth_login_start(
         raise HTTPException(status_code=400, detail=str(exc))
     background_tasks.add_task(run_capture_session, result["session_id"])
     return result
+
+
+class SiteAuthImport(BaseModel):
+    domain: str
+    cookies: list[dict]
+    origins: list[dict] | None = None
+    label: str | None = None
+
+
+@app.post("/site-auth/import")
+def site_auth_import(payload: SiteAuthImport, x_api_key: str = Header(default="")):
+    """
+    Import a login session captured in a real, human browser — the Curve Auth Chrome
+    extension or a Cookie-Editor JSON export — instead of a remote Browserbase login.
+    Converts the browser cookie list (+ optional localStorage origins) into a Playwright
+    storage_state and upserts site_auth, keyed by the registrable base of `domain` (the
+    exact row the research scraper reads). No automation touches the publisher, so there
+    is nothing to detect — use it for sites hostile to remote browsers (WSJ, AFR).
+
+    Returns {status, domain, cookies, origins} counts on success. 400 on bad input,
+    500 if the DB write fails (unlike the fire-and-forget capture task, the interactive
+    caller must see a real result).
+    """
+    _check_key(x_api_key)
+    try:
+        return import_storage_state(
+            payload.domain, payload.cookies, payload.origins, payload.label
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Import failed: {exc}")
 
 
 @app.post("/site-auth/login/finish")

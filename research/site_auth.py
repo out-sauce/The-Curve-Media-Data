@@ -41,7 +41,9 @@ from config import (
     BROWSERBASE_API_KEY,
     BROWSERBASE_PROJECT_ID,
     SITE_AUTH_DEBOUNCE_SECONDS,
+    SITE_AUTH_KEEP_ALIVE,
     SITE_AUTH_POLL_INTERVAL,
+    SITE_AUTH_RESIDENTIAL_DOMAINS,
     SITE_AUTH_SESSION_TIMEOUT,
 )
 from ingestion.storage import get_client
@@ -61,12 +63,18 @@ _BROWSERBASE_REGION = "eu-central-1"
 # presence (stable across the debounce window) means a genuine logged-in session.
 # Gates the periodic-snapshot upsert so the Admin modal never closes mid-login.
 #
-# FT is the only entry at launch. 'FTSession_s' is the FT subscriber/session cookie;
-# confirm the exact name empirically in the Browserbase debugger during build (FT also
-# sets 'FTSession'). BBC is intentionally absent — it has no auth paywall, so it falls
-# back to timeout final-capture only.
+# 'FTSession_s' is the FT subscriber/session cookie; confirm the exact name empirically
+# in the Browserbase debugger during build (FT also sets 'FTSession'). BBC is
+# intentionally absent — it has no auth paywall, so it falls back to timeout
+# final-capture only.
+#
+# wsj.com: Dow Jones sets the persistent auto-login token 'djcs_auto' and the session
+# cookie 'djcs_session' on a genuine WSJ login — best-guess names to VERIFY in the
+# debugger (like FT was). Until confirmed, a wrong name simply means WSJ falls back to
+# timeout final-capture (same as no entry), so this is safe to ship unverified.
 _AUTH_COOKIE_ALLOWLIST: dict[str, list[str]] = {
     "ft.com": ["FTSession_s", "FTSession"],
+    "wsj.com": ["djcs_auto", "djcs_session"],
 }
 
 # In-process registry: session_id -> session metadata. Single-replica only.
@@ -82,12 +90,16 @@ class SiteAuthUnavailable(Exception):
 # DB write
 # ---------------------------------------------------------------------------
 
-def upsert_site_auth(domain: str, storage_state: dict, label: str | None) -> None:
+def upsert_site_auth(
+    domain: str, storage_state: dict, label: str | None, raise_on_error: bool = False
+) -> None:
     """
     Upsert the captured session into site_auth keyed by the registrable base domain —
     the exact row write the Admin poll awaits. Complementary to research.py's
-    _record_auth_usage (which only touches last_status/last_used_at). Best-effort:
-    logs and swallows on failure so a provider/DB hiccup never crashes the API.
+    _record_auth_usage (which only touches last_status/last_used_at). Best-effort by
+    default: logs and swallows on failure so a provider/DB hiccup never crashes the
+    background capture task. The interactive import path passes raise_on_error=True so
+    the HTTP caller gets a real success/failure instead of a false OK.
     """
     now = datetime.now(timezone.utc).isoformat()
     row = {
@@ -103,6 +115,109 @@ def upsert_site_auth(domain: str, storage_state: dict, label: str | None) -> Non
         logger.info("site_auth captured for %s (label=%s)", domain, label)
     except Exception as exc:
         logger.warning("Could not upsert site_auth for %s: %s", domain, exc)
+        if raise_on_error:
+            raise
+
+
+# ---------------------------------------------------------------------------
+# Manual import — cookies lifted from a real, human browser (no remote browser)
+# ---------------------------------------------------------------------------
+
+# Browser cookie stores (chrome.cookies / Cookie-Editor exports) spell sameSite
+# differently from Playwright's storage_state, which only accepts Strict/Lax/None.
+_SAME_SITE_MAP = {
+    "no_restriction": "None",
+    "none": "None",
+    "lax": "Lax",
+    "unspecified": "Lax",
+    "": "Lax",
+    "strict": "Strict",
+}
+
+
+def _normalise_cookie(c: dict) -> dict | None:
+    """Map one browser/Cookie-Editor cookie dict to a Playwright storage_state cookie.
+    Returns None for a cookie missing the fields Playwright requires."""
+    name = c.get("name")
+    domain = c.get("domain")
+    if not name or not domain:
+        return None
+
+    # Session cookies have no expiry; Playwright encodes that as -1.
+    raw_exp = c.get("expires", c.get("expirationDate"))
+    if c.get("session"):
+        expires = -1.0
+    else:
+        try:
+            expires = float(raw_exp)
+        except (TypeError, ValueError):
+            expires = -1.0
+
+    same_site = _SAME_SITE_MAP.get(str(c.get("sameSite") or "").lower(), "Lax")
+    return {
+        "name": name,
+        "value": c.get("value") or "",
+        "domain": domain,
+        "path": c.get("path") or "/",
+        "expires": expires,
+        "httpOnly": bool(c.get("httpOnly")),
+        "secure": bool(c.get("secure")),
+        "sameSite": same_site,
+    }
+
+
+def _build_origins(origins_in: list | None) -> list[dict]:
+    """Normalise localStorage payloads into Playwright storage_state `origins`. Accepts
+    each origin's localStorage as either a {key: value} object or a [{name, value}] list."""
+    out: list[dict] = []
+    for o in origins_in or []:
+        origin = o.get("origin") if isinstance(o, dict) else None
+        if not origin:
+            continue
+        ls = o.get("localStorage")
+        items: list[dict] = []
+        if isinstance(ls, dict):
+            items = [{"name": str(k), "value": str(v)} for k, v in ls.items()]
+        elif isinstance(ls, list):
+            items = [
+                {"name": it["name"], "value": str(it.get("value", ""))}
+                for it in ls
+                if isinstance(it, dict) and it.get("name")
+            ]
+        out.append({"origin": origin, "localStorage": items})
+    return out
+
+
+def import_storage_state(
+    domain: str,
+    cookies: list[dict],
+    origins: list[dict] | None = None,
+    label: str | None = None,
+) -> dict:
+    """
+    Build a Playwright storage_state from cookies (and optional localStorage) captured in
+    a real human browser — the Chrome extension or a Cookie-Editor JSON export — and
+    upsert it into site_auth, keyed by the registrable base of `domain` (the exact key
+    the research scraper reads). No automation ever touches the publisher, so there is
+    nothing for an anti-bot system to detect. Raises ValueError on bad input and
+    propagates a DB failure so the HTTP caller sees a real result.
+    """
+    base = registrable_domain(domain)
+    if not base:
+        raise ValueError(f"Could not derive a registrable domain from {domain!r}")
+
+    normalised = [nc for c in (cookies or []) if (nc := _normalise_cookie(c))]
+    if not normalised:
+        raise ValueError("No valid cookies supplied (need at least name + domain)")
+
+    storage_state = {"cookies": normalised, "origins": _build_origins(origins)}
+    upsert_site_auth(base, storage_state, label, raise_on_error=True)
+    return {
+        "status": "imported",
+        "domain": base,
+        "cookies": len(normalised),
+        "origins": len(storage_state["origins"]),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -137,12 +252,26 @@ def start_login(domain: str, label: str | None = None) -> dict[str, str]:
     bb = _browserbase_client()
 
     # UK proxy + geolocation so the publisher sees a UK visitor, matching en-GB scrapes.
-    session = bb.sessions.create(
-        project_id=BROWSERBASE_PROJECT_ID,
-        region=_BROWSERBASE_REGION,
-        timeout=SITE_AUTH_SESSION_TIMEOUT,
-        proxies=[{"type": "browserbase", "geolocation": {"country": "GB"}}],
-    )
+    # Hostile publishers (SITE_AUTH_RESIDENTIAL_DOMAINS, e.g. wsj.com) egress via
+    # residential IPs — far better reputation against PerimeterX/DataDome IP scoring
+    # than the default datacenter-leaning pool; residential is metered per-GB so it's
+    # scoped per-domain rather than global.
+    proxy = {"type": "browserbase", "geolocation": {"country": "GB"}}
+    if base in SITE_AUTH_RESIDENTIAL_DOMAINS:
+        proxy["residential"] = True
+
+    # keepAlive lets the capture task detach during login for non-allowlisted domains
+    # (see run_capture_session); harmless when the detach path is unused. Requires a
+    # Browserbase plan that supports it — gated behind SITE_AUTH_KEEP_ALIVE (default off).
+    create_kwargs: dict[str, Any] = {
+        "project_id": BROWSERBASE_PROJECT_ID,
+        "region": _BROWSERBASE_REGION,
+        "timeout": SITE_AUTH_SESSION_TIMEOUT,
+        "proxies": [proxy],
+    }
+    if SITE_AUTH_KEEP_ALIVE:
+        create_kwargs["keep_alive"] = True
+    session = bb.sessions.create(**create_kwargs)
 
     # Fullscreen debugger URL is the human-drivable live view returned to Admin.
     debug = bb.sessions.debug(session.id)
@@ -209,13 +338,117 @@ async def _capture_and_upsert(context, meta: dict) -> None:
         logger.warning("storage_state capture failed for %s: %s", meta.get("domain"), exc)
 
 
+async def _navigate(context, domain: str) -> None:
+    """Land the human on the publisher page. Best-effort — they can navigate themselves."""
+    page = context.pages[0] if context.pages else await context.new_page()
+    try:
+        await page.goto(f"https://{domain}/", wait_until="domcontentloaded")
+    except Exception as exc:
+        logger.debug("Initial navigation to %s failed (human can navigate): %s", domain, exc)
+
+
+async def _run_attached(pw, connect_url: str, domain: str, meta: dict, deadline: float) -> None:
+    """
+    Hold the Browserbase session's single long-lived CDP connection for its lifetime:
+    navigate, poll cookies, upsert once the allowlisted auth cookie is stable across the
+    debounce window (or immediately on a manual finish), and on the hard timeout take a
+    FINAL snapshot before teardown. This is the default path — required for allowlisted
+    domains (gating on the auth cookie needs live polling) and whenever keepAlive is off
+    (a disconnect would end the session). Automation stays attached the whole login, so
+    `Runtime.enable` is visible to anti-bot scripts; mask it with Advanced Stealth.
+    """
+    cookie_seen_since: float | None = None
+    browser = await pw.chromium.connect_over_cdp(connect_url)
+    try:
+        context = browser.contexts[0] if browser.contexts else await browser.new_context()
+        await _navigate(context, domain)
+
+        while time.monotonic() < deadline:
+            await asyncio.sleep(SITE_AUTH_POLL_INTERVAL)
+
+            # Manual backstop — capture now regardless of the allowlist.
+            if meta.get("force_capture"):
+                meta["force_capture"] = False
+                await _capture_and_upsert(context, meta)
+                continue
+
+            if meta.get("captured"):
+                # Already captured once; keep the session open for the human until
+                # timeout, but don't re-upsert and advance captured_at.
+                continue
+
+            try:
+                cookies = await context.cookies()
+            except Exception:
+                cookies = []
+
+            if _auth_cookies_present(cookies, domain):
+                if cookie_seen_since is None:
+                    cookie_seen_since = time.monotonic()
+                elif time.monotonic() - cookie_seen_since >= SITE_AUTH_DEBOUNCE_SECONDS:
+                    await _capture_and_upsert(context, meta)
+            else:
+                cookie_seen_since = None  # cookie gone — reset the debounce
+
+        # Hard timeout: final snapshot so a late/non-allowlisted login survives.
+        await _capture_and_upsert(context, meta)
+    finally:
+        try:
+            await browser.close()
+        except Exception:
+            pass
+
+
+async def _run_detached(pw, connect_url: str, domain: str, meta: dict, deadline: float) -> None:
+    """
+    keepAlive-only path: attach ONLY to navigate, then disconnect so the human logs in
+    with zero automation attached — no `Runtime.enable` for PerimeterX/DataDome to flag
+    during the sensitive login window. Reconnect briefly only to snapshot the session on
+    a manual finish or the hard timeout. Because we can't poll cookies while detached
+    there's no allowlist gating here: capture is finish- or timeout-driven (as it already
+    was for non-allowlisted domains). Requires keepAlive so the session survives the
+    disconnect; guarded so a keepAlive-unavailable plan just fails safely into teardown.
+
+    NOTE: does NOT mask the operator's live Browserbase debugger view, which is itself
+    DevTools attached to the page — that "developer tools detected" signal needs Advanced
+    Stealth. Verify the keepAlive reconnect end-to-end in the debugger before relying on it.
+    """
+    # 1) Brief attach purely to land the human on the publisher page, then disconnect.
+    browser = await pw.chromium.connect_over_cdp(connect_url)
+    try:
+        context = browser.contexts[0] if browser.contexts else await browser.new_context()
+        await _navigate(context, domain)
+    finally:
+        try:
+            await browser.close()
+        except Exception:
+            pass
+
+    # 2) Wait with NO connection open for a manual finish or the hard timeout.
+    while time.monotonic() < deadline:
+        await asyncio.sleep(SITE_AUTH_POLL_INTERVAL)
+        if meta.get("force_capture"):
+            break
+
+    # 3) Reconnect briefly only to snapshot the now-logged-in session.
+    meta["force_capture"] = False
+    browser = await pw.chromium.connect_over_cdp(connect_url)
+    try:
+        context = browser.contexts[0] if browser.contexts else await browser.new_context()
+        await _capture_and_upsert(context, meta)
+    finally:
+        try:
+            await browser.close()
+        except Exception:
+            pass
+
+
 async def run_capture_session(session_id: str) -> None:
     """
-    Own the Browserbase session's single long-lived CDP connection for its lifetime:
-    navigate to the publisher, poll cookies, upsert once the allowlisted auth cookie is
-    stable across the debounce window (or immediately on a manual finish), and on the
-    hard timeout take a FINAL snapshot before teardown — so a late or non-allowlisted
-    login is never lost. Scheduled via FastAPI BackgroundTasks. Never raises.
+    Own the Browserbase session for its lifetime and capture the logged-in storage_state.
+    Dispatches to the attached path (default; gates allowlisted domains, keeps the session
+    alive when keepAlive is off) or the detached path (keepAlive + non-allowlisted domain:
+    no automation attached during login). Scheduled via FastAPI BackgroundTasks. Never raises.
     """
     meta = _SESSIONS.get(session_id)
     if not meta:
@@ -223,56 +456,21 @@ async def run_capture_session(session_id: str) -> None:
 
     domain = meta["domain"]
     connect_url = meta["connect_url"]
-    cookie_seen_since: float | None = None
+    deadline = meta["started_at"] + SITE_AUTH_SESSION_TIMEOUT
+    # Detach only when keepAlive can preserve the session across the disconnect AND we
+    # aren't gating on an auth cookie (which needs live polling). Allowlisted domains
+    # (FT, WSJ) therefore stay on the attached path — the gating-vs-clean-login tradeoff:
+    # to detach WSJ instead, drop it from _AUTH_COOKIE_ALLOWLIST and it becomes eligible.
+    detach = SITE_AUTH_KEEP_ALIVE and domain not in _AUTH_COOKIE_ALLOWLIST
 
     try:
         from playwright.async_api import async_playwright
 
         async with async_playwright() as pw:
-            browser = await pw.chromium.connect_over_cdp(connect_url)
-            try:
-                context = browser.contexts[0] if browser.contexts else await browser.new_context()
-                page = context.pages[0] if context.pages else await context.new_page()
-                try:
-                    await page.goto(f"https://{domain}/", wait_until="domcontentloaded")
-                except Exception as exc:
-                    logger.debug("Initial navigation to %s failed (human can navigate): %s", domain, exc)
-
-                deadline = meta["started_at"] + SITE_AUTH_SESSION_TIMEOUT
-                while time.monotonic() < deadline:
-                    await asyncio.sleep(SITE_AUTH_POLL_INTERVAL)
-
-                    # Manual backstop — capture now regardless of the allowlist.
-                    if meta.get("force_capture"):
-                        meta["force_capture"] = False
-                        await _capture_and_upsert(context, meta)
-                        continue
-
-                    if meta.get("captured"):
-                        # Already captured once; keep the session open for the human
-                        # until timeout, but don't re-upsert and advance captured_at.
-                        continue
-
-                    try:
-                        cookies = await context.cookies()
-                    except Exception:
-                        cookies = []
-
-                    if _auth_cookies_present(cookies, domain):
-                        if cookie_seen_since is None:
-                            cookie_seen_since = time.monotonic()
-                        elif time.monotonic() - cookie_seen_since >= SITE_AUTH_DEBOUNCE_SECONDS:
-                            await _capture_and_upsert(context, meta)
-                    else:
-                        cookie_seen_since = None  # cookie gone — reset the debounce
-
-                # Hard timeout: final snapshot so a late/non-allowlisted login survives.
-                await _capture_and_upsert(context, meta)
-            finally:
-                try:
-                    await browser.close()
-                except Exception:
-                    pass
+            if detach:
+                await _run_detached(pw, connect_url, domain, meta, deadline)
+            else:
+                await _run_attached(pw, connect_url, domain, meta, deadline)
     except Exception as exc:
         logger.warning("Capture session %s for %s ended on error: %s", session_id, domain, exc)
     finally:

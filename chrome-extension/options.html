@@ -1,0 +1,31 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Curve Auth Capture — Settings</title>
+    <style>
+      body { font: 14px/1.5 system-ui, sans-serif; margin: 24px; max-width: 460px; color: #111; }
+      h1 { font-size: 16px; }
+      label { display: block; margin: 16px 0 4px; font-weight: 600; }
+      input { width: 100%; padding: 8px; box-sizing: border-box; font: inherit; }
+      button { margin-top: 16px; padding: 8px 16px; font: inherit; cursor: pointer; }
+      .hint { color: #666; font-size: 12px; margin-top: 4px; }
+      #status { margin-top: 12px; font-weight: 600; }
+    </style>
+  </head>
+  <body>
+    <h1>Curve Auth Capture — Settings</h1>
+    <label for="apiBase">Pipeline base URL</label>
+    <input id="apiBase" type="url" placeholder="https://the-curve-media-data.up.railway.app" />
+    <div class="hint">No trailing slash. The endpoint POSTed is <code>&lt;base&gt;/site-auth/import</code>.</div>
+
+    <label for="apiKey">Pipeline API key</label>
+    <input id="apiKey" type="password" placeholder="PIPELINE_API_KEY" />
+    <div class="hint">Sent as the <code>x-api-key</code> header. Stored only in this browser.</div>
+
+    <button id="save">Save</button>
+    <div id="status"></div>
+
+    <script src="options.js"></script>
+  </body>
+</html>

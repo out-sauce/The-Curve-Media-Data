@@ -1,0 +1,31 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      body { font: 14px/1.4 system-ui, sans-serif; width: 320px; margin: 14px; color: #111; }
+      h1 { font-size: 15px; margin: 0 0 10px; }
+      .domain { font-weight: 700; word-break: break-all; }
+      label { display: block; margin: 12px 0 4px; font-size: 12px; color: #555; }
+      input { width: 100%; padding: 6px; box-sizing: border-box; font: inherit; }
+      button { margin-top: 14px; width: 100%; padding: 10px; font: inherit; font-weight: 600; cursor: pointer; }
+      button:disabled { opacity: 0.5; cursor: default; }
+      #status { margin-top: 12px; font-size: 13px; white-space: pre-wrap; }
+      .ok { color: #137333; }
+      .err { color: #c5221f; }
+      a { color: #1a73e8; cursor: pointer; }
+    </style>
+  </head>
+  <body>
+    <h1>Capture auth for The Curve</h1>
+    <div>Site: <span class="domain" id="domain">…</span></div>
+
+    <label for="label">Label (optional)</label>
+    <input id="label" type="text" placeholder="e.g. AFR (Luke)" />
+
+    <button id="capture" disabled>Capture &amp; send</button>
+    <div id="status"></div>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
