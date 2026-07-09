@@ -42,6 +42,17 @@ MAX_BROWSER_SCRAPES_PER_RUN = int(os.getenv("MAX_BROWSER_SCRAPES_PER_RUN", 100))
 # change. Safety valve if Railway memory proves tight.
 BROWSER_CDP_URL = os.getenv("BROWSER_CDP_URL", "")
 
+# Optional egress proxy for the LOCAL-Chromium read path — gives the scraper a UK
+# (or any) IP without a managed-browser vendor. Point it at any proxy you control: an
+# Oracle Cloud Free / cheap-VPS London box running gost/Dante, a Tailscale exit node's
+# SOCKS proxy, or a residential-proxy endpoint. Format: "http://host:port" or
+# "socks5://host:port". Only applied when launching Chromium locally (the CDP/Browserbase
+# paths carry their own egress). Empty = direct (Railway's own IP). NB: Chromium does not
+# support SOCKS5 with username/password — use an http(s) proxy if you need proxy auth.
+RESEARCH_PROXY_SERVER = os.getenv("RESEARCH_PROXY_SERVER", "")
+RESEARCH_PROXY_USERNAME = os.getenv("RESEARCH_PROXY_USERNAME", "")
+RESEARCH_PROXY_PASSWORD = os.getenv("RESEARCH_PROXY_PASSWORD", "")
+
 # Site-auth capture (research/site_auth.py) — launches a headful, human-driven remote
 # browser via Browserbase so an operator can complete a real publisher login; on login
 # completion the captured Playwright storage_state() is upserted into site_auth (the

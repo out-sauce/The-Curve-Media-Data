@@ -27,6 +27,9 @@ from config import (
     BROWSER_PAGE_TIMEOUT,
     BROWSERBASE_API_KEY,
     BROWSERBASE_PROJECT_ID,
+    RESEARCH_PROXY_PASSWORD,
+    RESEARCH_PROXY_SERVER,
+    RESEARCH_PROXY_USERNAME,
     RESEARCH_USE_BROWSERBASE,
 )
 from .scraper import ScrapeResult, classify_text
@@ -47,6 +50,21 @@ _USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
+
+
+def _proxy_config() -> dict | None:
+    """Playwright proxy dict for the local-Chromium egress, or None for a direct
+    connection. Lets the scraper render from a UK (or any) IP via any proxy you
+    control — no managed-browser vendor required. Auth fields are only attached when
+    set (Chromium ignores user/pass for SOCKS)."""
+    if not RESEARCH_PROXY_SERVER:
+        return None
+    proxy: dict = {"server": RESEARCH_PROXY_SERVER}
+    if RESEARCH_PROXY_USERNAME:
+        proxy["username"] = RESEARCH_PROXY_USERNAME
+    if RESEARCH_PROXY_PASSWORD:
+        proxy["password"] = RESEARCH_PROXY_PASSWORD
+    return proxy
 
 
 def _extract(html: str) -> ScrapeResult:
@@ -101,7 +119,11 @@ async def _scrape(url: str, storage_state: dict | None) -> ScrapeResult:
             browser = await pw.chromium.connect_over_cdp(BROWSER_CDP_URL)
             owns_browser = True
         else:
-            browser = await pw.chromium.launch(headless=True, args=_LAUNCH_ARGS)
+            # Local Chromium. A proxy set here (RESEARCH_PROXY_SERVER) gives the render a
+            # UK/other IP; it must be applied at launch for Chromium to honour it.
+            browser = await pw.chromium.launch(
+                headless=True, args=_LAUNCH_ARGS, proxy=_proxy_config()
+            )
             owns_browser = True
 
         context = None
