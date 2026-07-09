@@ -15,8 +15,8 @@ Browserbase remote-login flow for sites hostile to remote browsers (WSJ, AFR, �
 2. **Load unpacked** → select this `chrome-extension/` folder.
 3. Click the extension → it opens **Settings** the first time (or right-click →
    Options). Enter:
-   - **Pipeline base URL** — e.g. `https://the-curve-media-data.up.railway.app` (no
-     trailing slash).
+   - **Pipeline base URL** — `https://the-curve-media-data-production.up.railway.app`
+     (include `https://`, no trailing slash).
    - **Pipeline API key** — the `PIPELINE_API_KEY` value. Stored only in this browser.
 
 ## Use
