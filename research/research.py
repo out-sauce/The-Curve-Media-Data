@@ -522,6 +522,42 @@ def enqueue_article(article_id) -> dict:
     return {"status": "queued", "queue_id": qid, "article_id": article_id}
 
 
+def resolve_article_by_url(url: str) -> tuple[int, int | None]:
+    """
+    Map a browser URL to a pipeline article for the popup's "Send article content"
+    button, which knows only the page it is on. Matches the stored url exactly first,
+    then retries with query/fragment stripped (tracking params differ between what the
+    feed stored and what the browser shows), then as a prefix match. Returns
+    (article_id, outstanding_queue_id) — the queue id of any pending/claimed request for
+    the article, so a popup-initiated import also closes the queued one instead of
+    leaving the background lane to re-fetch it. Raises ValueError when nothing matches.
+    """
+    client = get_client()
+    stripped = url.split("#", 1)[0].split("?", 1)[0].rstrip("/")
+
+    rows = client.table(TABLE).select("id").eq("url", url).limit(1).execute().data or []
+    if not rows and stripped and stripped != url:
+        rows = client.table(TABLE).select("id").eq("url", stripped).limit(1).execute().data or []
+    if not rows and stripped:
+        # LIKE special chars in URLs (%-encoding, _) must not act as wildcards.
+        pattern = stripped.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        rows = client.table(TABLE).select("id").like("url", f"{pattern}%").limit(1).execute().data or []
+    if not rows:
+        raise ValueError(f"no article matches url {url}")
+    article_id = rows[0]["id"]
+
+    outstanding = (
+        client.table(QUEUE_TABLE)
+        .select("id")
+        .eq("article_id", article_id)
+        .in_("status", ["pending", "claimed"])
+        .limit(1)
+        .execute()
+        .data
+    ) or []
+    return article_id, (outstanding[0]["id"] if outstanding else None)
+
+
 def claim_pending(limit: int = 10) -> list[dict]:
     """
     Return up to `limit` pending queue items and mark them 'claimed' so a subsequent poll

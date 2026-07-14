@@ -38,6 +38,7 @@ from research.research import (
     claim_pending,
     complete_from_html,
     enqueue_article,
+    resolve_article_by_url,
     run_research,
     run_research_article,
 )
@@ -226,8 +227,9 @@ class SiteAuthImport(BaseModel):
 
 
 class ResearchImport(BaseModel):
-    article_id: int
     html: str
+    article_id: int | None = None   # queue lane: known from the claimed item
+    url: str | None = None          # popup lane: only the page URL is known
     queue_id: int | None = None
 
 
@@ -330,8 +332,19 @@ def research_import(payload: ResearchImport, x_api_key: str = Header(default="")
     Ingest article HTML captured by the extension in a logged-in browser: extract text,
     write full_text + deep summary, and close the queue row. Returns the resulting
     scrape status so the extension can surface success/failure.
+
+    Identify the article by `article_id` (queue lane) or by `url` (popup "Send article
+    content" — resolved to the matching news_articles row, 404 if none matches).
     """
     _check_key(x_api_key)
     if not payload.html:
         raise HTTPException(status_code=400, detail="html is required")
-    return complete_from_html(payload.queue_id, payload.article_id, payload.html)
+    article_id, queue_id = payload.article_id, payload.queue_id
+    if article_id is None:
+        if not payload.url:
+            raise HTTPException(status_code=400, detail="article_id or url is required")
+        try:
+            article_id, queue_id = resolve_article_by_url(payload.url)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+    return complete_from_html(queue_id, article_id, payload.html)

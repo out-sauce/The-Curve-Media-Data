@@ -45,6 +45,14 @@ Enable it on the Settings page ("Enable auto-research", on by default once the U
 are set). **Keep this browser open and logged into the publishers you cover** — the lane
 only runs while the browser is running. Turn the toggle off to stop polling.
 
+### Send the article you're reading (popup button)
+
+Already on the article page? Click the extension → **Send article content**. It posts the
+current tab's rendered HTML straight to `/research/import`, keyed by the page URL — the
+server matches it to the pipeline article (you'll get an error if the page isn't one),
+runs the same extract + summarise path, and closes any outstanding queue request for that
+article. No Admin round-trip, no background tab.
+
 ## Notes / limits
 
 - **Re-run when it expires.** Subscriber sessions lapse (~7–30 days); just capture again.

@@ -69,7 +69,11 @@ triggers stages over HTTP.
   → `research_from_html` runs the same trafilatura extract + Claude summary via the shared
   `_persist_result` (`scrape_method="extension"`). No server-side fetch, so nothing for a
   bot detector to flag. Only runs while the operator's Chrome is open with auto-research
-  enabled (options toggle). Browserbase is no longer used for auth capture (the extension
+  enabled (options toggle). The popup also has a **Send article content** button: it posts
+  the current tab's rendered HTML to `/research/import` with `url` instead of `article_id`
+  (`resolve_article_by_url` matches exact → query/fragment-stripped → prefix, 404 if the
+  page isn't a pipeline article, and closes any outstanding `research_queue` row) — no
+  Admin round-trip needed when the operator is already on the article. Browserbase is no longer used for auth capture (the extension
   replaced it) and the read-path toggle `RESEARCH_USE_BROWSERBASE` should be off. Migrations
   029 (`domain_scrape_settings` + CHECK) and 030 (`research_queue`) applied manually; both
   tables have RLS enabled with no policies (service-role access only), matching
