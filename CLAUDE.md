@@ -46,6 +46,20 @@ triggers stages over HTTP.
 
 ## Recent changes
 
+- **Cluster-level on-demand research + brief redo.** Admin's story **Research** button now
+  makes one call — `POST /run/research?cluster_id=` → `run_research_cluster` — instead of
+  fanning out per article. It never re-scrapes articles that already have a `deep_summary`;
+  the rest are routed by domain scrape mode (`manual` → extension queue via
+  `enqueue_article`, `auto` → inline `_process_article`), and the cluster brief is then
+  **regenerated unconditionally** via `briefing.brief.rebrief_cluster(cluster_id)`
+  (overwrites `name`/`brief`/`briefed_at`; still requires ≥1 deep summary; ignores the
+  run_briefing "already briefed" skip). A successful extension import
+  (`complete_from_html`) also re-briefs the article's cluster, but only when the cluster
+  already has a brief — so briefs refresh as late extension grabs land without preempting
+  the briefing stage. `run_research_article` (`?id=`) keeps its always-rescrape override.
+  Admin's `runResearchForTodaysTopArticles` bulk action now skips `scrape_status='scraped'`
+  articles too.
+
 - **Account-safe research: per-domain auto/manual scrape mode + `bot_wall` + extension
   content-grab lane.** The daily batch used to send subscriber logins to every domain from
   a datacenter IP; PerimeterX/DataDome publishers (Bloomberg confirmed) bot-wall those

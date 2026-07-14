@@ -41,6 +41,7 @@ from research.research import (
     resolve_article_by_url,
     run_research,
     run_research_article,
+    run_research_cluster,
 )
 from research.site_auth import (
     SiteAuthUnavailable,
@@ -150,15 +151,20 @@ def run_brief(background_tasks: BackgroundTasks, date: str | None = None, x_api_
 
 
 @app.post("/run/research")
-def run_research_endpoint(background_tasks: BackgroundTasks, date: str | None = None, id: str | None = None, x_api_key: str = Header(default="")):
+def run_research_endpoint(background_tasks: BackgroundTasks, date: str | None = None, id: str | None = None, cluster_id: str | None = None, x_api_key: str = Header(default="")):
     """
     Run the research stage. Pass ?id=<article_id> to research a single article
-    on demand (ignores cluster score + prior scrape_status); omit it to run the
-    batch over scored clusters for ?date (the daily job).
+    on demand (ignores cluster score + prior scrape_status), or
+    ?cluster_id=<cluster_id> to research a whole story on demand (skips articles
+    that already have a deep summary, routes manual domains to the extension
+    queue, then regenerates the cluster brief); omit both to run the batch over
+    scored clusters for ?date (the daily job).
     """
     _check_key(x_api_key)
     if id:
         background_tasks.add_task(run_research_article, id)
+    elif cluster_id:
+        background_tasks.add_task(run_research_cluster, cluster_id)
     else:
         background_tasks.add_task(run_research, run_date=date)
     return {"status": "started"}

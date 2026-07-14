@@ -117,6 +117,45 @@ def _generate_brief(articles: list[dict[str, Any]], tov_doc: str, brief_instruct
         return None
 
 
+def rebrief_cluster(cluster_id: str) -> bool:
+    """
+    Regenerate the name + brief for a single cluster, overwriting any existing brief.
+    This is the explicit "redo" used after on-demand research (the Admin story-level
+    Research button, or a late-arriving extension import) — unlike run_briefing it
+    ignores date/status and does not skip clusters that already have a brief. Still
+    requires at least one article with a deep summary. Returns True when a brief was
+    written. Never raises.
+    """
+    try:
+        settings = get_pipeline_settings()
+        tov_doc = settings.get("tov_doc", "")
+        brief_instructions = settings.get("brief_instructions", "")
+
+        articles = _fetch_cluster_articles(cluster_id)
+        if not any((a.get("deep_summary") or "").strip() for a in articles):
+            logger.info("Re-brief: cluster %s has no deep summaries — skipping", cluster_id)
+            return False
+
+        for article in articles:
+            article["summary"] = article.get("deep_summary") or article["summary"]
+
+        result = _generate_brief(articles, tov_doc, brief_instructions)
+        if result is None:
+            return False
+
+        name, brief = result
+        get_client().table(CLUSTERS_TABLE).update({
+            "name": name,
+            "brief": brief,
+            "briefed_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("cluster_id", cluster_id).execute()
+        logger.info("Re-brief: cluster %s brief regenerated (%d chars)", cluster_id, len(brief))
+        return True
+    except Exception as exc:
+        logger.warning("Re-brief: cluster %s failed: %s", cluster_id, exc)
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------

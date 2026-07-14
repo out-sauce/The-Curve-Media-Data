@@ -440,6 +440,75 @@ def run_research_article(article_id: str) -> None:
     )
 
 
+def run_research_cluster(cluster_id: str) -> None:
+    """
+    Research a cluster on demand (the Admin story-level Research button), then
+    regenerate its brief. Articles that already have a deep summary are never
+    re-scraped — only the rest are processed, routed by domain scrape mode:
+    'manual' domains are enqueued for the extension lane (no server-side fetch),
+    everything else is scraped here. The brief is redone at the end from whatever
+    deep summaries now exist (overwriting any prior brief); articles still waiting
+    on the extension refresh it again as each import lands. Does not touch
+    cluster_status.
+    """
+    logger.info("Research (cluster) started for %s", cluster_id)
+
+    client = get_client()
+    rows = (
+        client.table(TABLE)
+        .select("id, url, title, summary, source_id, scrape_status, deep_summary")
+        .eq("cluster_id", cluster_id)
+        .execute()
+        .data
+    ) or []
+    if not rows:
+        logger.warning("Research (cluster): no articles for %s", cluster_id)
+        return
+
+    pending = [
+        a for a in rows
+        if not (a.get("deep_summary") or "").strip() and a.get("url")
+    ]
+    already = len(rows) - len(pending)
+
+    scraped = queued = failed = 0
+    if pending:
+        audience_doc = get_pipeline_settings().get("audience_doc") or ""
+        domains = list({_registrable_domain(a["url"]) for a in pending})
+        scrape_modes = _fetch_scrape_modes([d for d in domains if d])
+        auto_domains = [d for d in domains if d and scrape_modes.get(d, "auto") == "auto"]
+        auth_by_domain = _fetch_auth_by_domain(auto_domains)
+
+        for article in pending:
+            domain = _registrable_domain(article["url"])
+            if domain and scrape_modes.get(domain, "auto") == "manual":
+                try:
+                    enqueue_article(article["id"])
+                    queued += 1
+                except Exception as exc:
+                    failed += 1
+                    logger.warning(
+                        "Research (cluster): enqueue failed for article %s: %s",
+                        article["id"], exc,
+                    )
+                continue
+            status, _ = _process_article(
+                article, auth_by_domain.get(domain), audience_doc,
+                RESEARCH_USE_BROWSER, client,
+            )
+            scraped += status == "scraped"
+            failed  += status != "scraped"
+
+    from briefing.brief import rebrief_cluster
+    rebriefed = rebrief_cluster(cluster_id)
+    logger.info(
+        "Research (cluster) complete — %s: %d already researched, %d scraped, "
+        "%d queued (extension), %d failed, brief %s",
+        cluster_id, already, scraped, queued, failed,
+        "regenerated" if rebriefed else "unchanged",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Extension content-grab lane (manual initiation)
 # ---------------------------------------------------------------------------
@@ -581,6 +650,35 @@ def claim_pending(limit: int = 10) -> list[dict]:
     return [{"queue_id": r["id"], "article_id": r["article_id"], "url": r["url"]} for r in pending]
 
 
+def _maybe_rebrief_cluster(article_id) -> None:
+    """
+    After a successful extension import, refresh the article's cluster brief so it
+    reflects the new deep summary — but only when the cluster already has a brief
+    ("redo", e.g. queued from run_research_cluster). A never-briefed cluster is left
+    for the briefing stage. Best-effort: a failure never breaks the import.
+    """
+    try:
+        client = get_client()
+        rows = client.table(TABLE).select("cluster_id").eq("id", article_id).limit(1).execute().data or []
+        cluster_id = rows[0].get("cluster_id") if rows else None
+        if not cluster_id:
+            return
+        clusters = (
+            client.table(CLUSTERS_TABLE)
+            .select("brief")
+            .eq("cluster_id", cluster_id)
+            .limit(1)
+            .execute()
+            .data
+        ) or []
+        if not clusters or not (clusters[0].get("brief") or "").strip():
+            return
+        from briefing.brief import rebrief_cluster
+        rebrief_cluster(cluster_id)
+    except Exception as exc:
+        logger.warning("Re-brief after import failed for article %s: %s", article_id, exc)
+
+
 def complete_from_html(queue_id, article_id, html: str) -> dict:
     """
     Research an enqueued article from the extension-supplied HTML and close out its queue
@@ -596,6 +694,9 @@ def complete_from_html(queue_id, article_id, html: str) -> dict:
     except Exception as exc:
         error = str(exc)[:300]
         logger.warning("Research queue: import failed for article %s: %s", article_id, exc)
+
+    if status == "scraped":
+        _maybe_rebrief_cluster(article_id)
 
     queue_status = "done" if status == "scraped" else "failed"
     if queue_id is not None:
