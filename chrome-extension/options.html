@@ -23,6 +23,17 @@
     <input id="apiKey" type="password" placeholder="PIPELINE_API_KEY" />
     <div class="hint">Sent as the <code>x-api-key</code> header. Stored only in this browser.</div>
 
+    <label style="display: flex; align-items: center; gap: 8px; font-weight: 600;">
+      <input id="researchEnabled" type="checkbox" style="width: auto;" checked />
+      Enable auto-research
+    </label>
+    <div class="hint">
+      When on, this browser polls the pipeline (~1&nbsp;min) for articles an editor queued
+      via Admin's <em>Research</em> button, opens each in a background tab using your
+      logged-in session, and sends the article text back. Keep this browser open and
+      logged into the publishers you cover. Turn off to stop the polling.
+    </div>
+
     <button id="save">Save</button>
     <div id="status"></div>
 

@@ -2,15 +2,21 @@
 const $ = (id) => document.getElementById(id);
 
 async function load() {
-  const { apiBase = "", apiKey = "" } = await chrome.storage.local.get(["apiBase", "apiKey"]);
+  const {
+    apiBase = "",
+    apiKey = "",
+    researchEnabled = true,
+  } = await chrome.storage.local.get(["apiBase", "apiKey", "researchEnabled"]);
   $("apiBase").value = apiBase;
   $("apiKey").value = apiKey;
+  $("researchEnabled").checked = researchEnabled;
 }
 
 async function save() {
   const apiBase = $("apiBase").value.trim().replace(/\/+$/, ""); // strip trailing slashes
   const apiKey = $("apiKey").value.trim();
-  await chrome.storage.local.set({ apiBase, apiKey });
+  const researchEnabled = $("researchEnabled").checked;
+  await chrome.storage.local.set({ apiBase, apiKey, researchEnabled });
   $("status").textContent = "Saved.";
   setTimeout(() => ($("status").textContent = ""), 1500);
 }

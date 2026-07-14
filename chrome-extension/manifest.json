@@ -1,10 +1,13 @@
 {
   "manifest_version": 3,
   "name": "Curve Auth Capture",
-  "version": "1.0.0",
-  "description": "Capture the current publisher's logged-in session (cookies + localStorage) from your real browser and send it to The Curve pipeline.",
-  "permissions": ["cookies", "scripting", "activeTab", "storage"],
+  "version": "1.1.0",
+  "description": "Capture the current publisher's logged-in session (cookies + localStorage) and grab full article text from your real browser for The Curve pipeline.",
+  "permissions": ["cookies", "scripting", "activeTab", "tabs", "alarms", "storage"],
   "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
   "action": {
     "default_popup": "popup.html",
     "default_title": "Capture auth for The Curve"

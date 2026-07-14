@@ -69,7 +69,10 @@ def _proxy_config() -> dict | None:
 
 # Substrings that distinguish *why* a page yielded no article, matched case-insensitively
 # against the rendered HTML. Bot walls vs. paywalls vs. JS shells need different fixes.
-_DIAGNOSTIC_MARKERS = (
+# _BOT_WALL_MARKERS are the anti-bot / CAPTCHA challenges (PerimeterX px-captcha,
+# DataDome, Cloudflare) — a *different* failure from a subscription paywall, so they get
+# their own scrape_status ("bot_wall") instead of masquerading as "paywalled".
+_BOT_WALL_MARKERS = (
     "unusual activity",
     "are you a robot",
     "press & hold",
@@ -78,11 +81,56 @@ _DIAGNOSTIC_MARKERS = (
     "captcha",
     "px-captcha",
     "access to this page has been denied",
+)
+_PAYWALL_MARKERS = (
     "subscribe to continue",
     "sign in to continue",
     "become a subscriber",
     "enable javascript",
 )
+_DIAGNOSTIC_MARKERS = _BOT_WALL_MARKERS + _PAYWALL_MARKERS
+
+# PerimeterX bot-defence cookies. They are bound to the IP + fingerprint that minted
+# them, so replaying a captured token from a *different* egress IP (the read-path
+# Browserbase session differs from the login-capture session) reads as token theft and
+# trips the "Are you a robot?" wall. Dropping just these — the subscriber-login cookies
+# are left intact — forces PerimeterX to re-evaluate fresh from the current IP.
+_BOT_COOKIE_PREFIXES = ("_px", "pxcts")
+
+
+def _is_bot_wall(html: str) -> bool:
+    """True when the rendered HTML is an anti-bot / CAPTCHA challenge rather than an
+    article or a subscription paywall."""
+    lowered = html.lower()
+    return any(m in lowered for m in _BOT_WALL_MARKERS)
+
+
+def _strip_bot_cookies(storage_state: dict | None) -> dict | None:
+    """Return storage_state with PerimeterX bot-defence cookies removed. A shallow copy
+    is made so the caller's dict (and the cached site_auth blob) is left untouched.
+    Never raises — a malformed blob is returned unchanged so the scrape still proceeds."""
+    if not storage_state:
+        return storage_state
+    try:
+        cookies = storage_state.get("cookies")
+        if not cookies:
+            return storage_state
+        kept = [
+            c for c in cookies
+            if not (c.get("name", "").lower().startswith(_BOT_COOKIE_PREFIXES))
+        ]
+        if len(kept) == len(cookies):
+            return storage_state
+        stripped = dict(storage_state)
+        stripped["cookies"] = kept
+        logger.info(
+            "Stripped %d PerimeterX cookie(s) from storage_state before render",
+            len(cookies) - len(kept),
+        )
+        return stripped
+    except Exception as exc:
+        logger.warning("Could not strip bot cookies, using storage_state as-is: %s", exc)
+        return storage_state
 
 
 async def _log_non_article(page, url: str, html: str, status: str) -> None:
@@ -109,6 +157,17 @@ def _extract(html: str) -> ScrapeResult:
         no_fallback=False,
     )
     return classify_text(text)
+
+
+def extract_article_html(html: str) -> ScrapeResult:
+    """
+    Extract clean article text from already-rendered HTML — e.g. HTML captured by the
+    Curve Auth Chrome extension inside a real, logged-in browser tab — and apply the same
+    deterministic paywall/word-count classification the browser and static scrapers use.
+    No network, no browser: the page was already fetched by a human's browser, so there is
+    nothing for a bot detector to flag. Shares the ScrapeResult contract with the scrapers.
+    """
+    return _extract(html)
 
 
 def _browserbase_connect_url() -> str | None:
@@ -162,7 +221,7 @@ async def _scrape(url: str, storage_state: dict | None) -> ScrapeResult:
         context = None
         try:
             context = await browser.new_context(
-                storage_state=storage_state,
+                storage_state=_strip_bot_cookies(storage_state),
                 user_agent=_USER_AGENT,
                 locale="en-GB",
             )
@@ -182,6 +241,16 @@ async def _scrape(url: str, storage_state: dict | None) -> ScrapeResult:
             html = await page.content()
             result = _extract(html)
             if result.status != "scraped":
+                # An anti-bot / CAPTCHA challenge is a different failure from a real
+                # paywall (needs a fresh session/IP, not a re-login), so relabel it
+                # "bot_wall" rather than let it masquerade as "paywalled".
+                if _is_bot_wall(html):
+                    result = ScrapeResult(
+                        status="bot_wall",
+                        full_text=None,
+                        word_count=0,
+                        error="Anti-bot challenge served instead of the article",
+                    )
                 # No article extracted — log what the page actually was so we can tell a
                 # bot wall from a real paywall from a blank JS shell (the raw HTML is not
                 # persisted anywhere). Best-effort; never affects the returned result.

@@ -28,6 +28,23 @@ Browserbase remote-login flow for sites hostile to remote browsers (WSJ, AFR, �
 The session is keyed server-side by the **registrable base domain** (e.g. `afr.com`),
 the same key the scraper reads — so `www.afr.com`, `afr.com`, etc. all resolve to one row.
 
+## Auto-research (content-grab lane)
+
+Beyond capturing logins, this extension also fetches **article text** for publishers the
+server-side scraper can't reach (paywalled / anti-bot sites marked `manual` in the
+pipeline). It works the same way — the page is loaded in *your* real, logged-in browser,
+so there is nothing for a bot detector to flag.
+
+Flow: an editor clicks **Research** on an article in the Admin app → the pipeline queues
+it → this extension (running in your browser) polls the queue about once a minute, opens
+the article in a **background tab** using your session, reads the rendered text, and sends
+it back to `<base>/research/import`. The editor never leaves Admin; the article fills in a
+minute or so later.
+
+Enable it on the Settings page ("Enable auto-research", on by default once the URL + key
+are set). **Keep this browser open and logged into the publishers you cover** — the lane
+only runs while the browser is running. Turn the toggle off to stop polling.
+
 ## Notes / limits
 
 - **Re-run when it expires.** Subscriber sessions lapse (~7–30 days); just capture again.

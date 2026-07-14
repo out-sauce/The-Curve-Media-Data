@@ -10,6 +10,7 @@ import os
 import sys
 import threading
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 # Configure root logging for the uvicorn/Railway entrypoint. main.py does this for the
 # CLI, but api.py never did — so under uvicorn the app loggers had no handler and Python
@@ -33,7 +34,13 @@ from scoring.score import run_scoring
 from briefing.brief import run_briefing
 from tagging.tag import run_tagging
 from daily_brief.daily_brief import run_daily_brief
-from research.research import run_research, run_research_article
+from research.research import (
+    claim_pending,
+    complete_from_html,
+    enqueue_article,
+    run_research,
+    run_research_article,
+)
 from research.site_auth import (
     SiteAuthUnavailable,
     force_capture,
@@ -42,6 +49,8 @@ from research.site_auth import (
     start_login,
 )
 from ingestion.competitors import run_competitors
+from ingestion.storage import get_client
+from research.domains import registrable_domain
 
 logger = logging.getLogger(__name__)
 
@@ -216,6 +225,12 @@ class SiteAuthImport(BaseModel):
     label: str | None = None
 
 
+class ResearchImport(BaseModel):
+    article_id: int
+    html: str
+    queue_id: int | None = None
+
+
 @app.post("/site-auth/import")
 def site_auth_import(payload: SiteAuthImport, x_api_key: str = Header(default="")):
     """
@@ -252,3 +267,71 @@ def site_auth_login_finish(session_id: str, x_api_key: str = Header(default=""))
     if not force_capture(session_id):
         raise HTTPException(status_code=404, detail="Unknown or already-finished session")
     return {"status": "capturing"}
+
+
+@app.post("/sources/scrape-mode")
+def set_scrape_mode(domain: str, mode: str, x_api_key: str = Header(default="")):
+    """
+    Set the research scrape policy for a publisher domain: 'auto' (the daily batch may
+    attempt an automated logged-in scrape) or 'manual' (the batch skips it; scraped only
+    on manual initiation). Keyed by registrable domain, so every feed of one publisher
+    shares the setting. Backs the Auto/Manual toggle on the Admin Sources page; the batch
+    also auto-demotes a domain to 'manual' on a bot_wall/paywalled result.
+    """
+    _check_key(x_api_key)
+    if mode not in ("auto", "manual"):
+        raise HTTPException(status_code=400, detail="mode must be 'auto' or 'manual'")
+    base = registrable_domain(domain)
+    if not base:
+        raise HTTPException(status_code=400, detail="invalid domain")
+    try:
+        get_client().table("domain_scrape_settings").upsert(
+            {
+                "domain": base,
+                "scrape_mode": mode,
+                "last_reason": "manual toggle",
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            on_conflict="domain",
+        ).execute()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Update failed: {exc}")
+    return {"status": "ok", "domain": base, "scrape_mode": mode}
+
+
+# --- Extension content-grab lane (manual initiation) ------------------------
+# Admin's "Research" button enqueues an article; the Curve Auth Chrome extension polls
+# /research/queue/claim, opens the page in the operator's real logged-in browser, and
+# posts the rendered HTML to /research/import. This is how 'manual' (bot-walled) domains
+# get researched without any server-side fetch for a bot detector to flag.
+
+@app.post("/research/enqueue")
+def research_enqueue(id: str, x_api_key: str = Header(default="")):
+    """Queue an article for the extension to grab. Idempotent per outstanding request."""
+    _check_key(x_api_key)
+    try:
+        return enqueue_article(id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Enqueue failed: {exc}")
+
+
+@app.post("/research/queue/claim")
+def research_queue_claim(limit: int = 5, x_api_key: str = Header(default="")):
+    """Extension poll: return pending items and mark them claimed. {items:[{queue_id,article_id,url}]}."""
+    _check_key(x_api_key)
+    return {"items": claim_pending(limit)}
+
+
+@app.post("/research/import")
+def research_import(payload: ResearchImport, x_api_key: str = Header(default="")):
+    """
+    Ingest article HTML captured by the extension in a logged-in browser: extract text,
+    write full_text + deep summary, and close the queue row. Returns the resulting
+    scrape status so the extension can surface success/failure.
+    """
+    _check_key(x_api_key)
+    if not payload.html:
+        raise HTTPException(status_code=400, detail="html is required")
+    return complete_from_html(payload.queue_id, payload.article_id, payload.html)
