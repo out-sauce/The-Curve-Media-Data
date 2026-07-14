@@ -43,7 +43,7 @@ def run_daily_pipeline() -> None:
       6. Research — scrape full text + deep summaries for clusters above the
          research score threshold, transitioning them to 'researched'
       7. Brief — editorial name + brief for researched clusters that produced a
-         deep summary, transitioning them to 'briefed'
+         deep summary (cluster_status stays 'researched')
       8. Competitor run — follower counts + recent post engagement (after the news run)
     """
     from datetime import date

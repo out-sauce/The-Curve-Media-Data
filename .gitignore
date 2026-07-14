@@ -18,5 +18,8 @@ env/
 .env
 .env.local
 
+# MCP config (contains access token)
+.mcp.json
+
 # Misc
 .DS_Store

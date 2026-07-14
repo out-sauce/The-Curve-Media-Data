@@ -11,9 +11,10 @@ Input:
   - All other articles in the cluster as supporting context
 
 Output:
-  - brief written to story_clusters
-  - cluster_status = briefed
+  - name + brief written to story_clusters
   - briefed_at timestamp set
+  - cluster_status is left at 'researched' (advancing the cluster is a
+    downstream / manual decision)
 """
 
 import logging
@@ -39,7 +40,7 @@ def _fetch_briefable_clusters(run_date: str) -> list[dict[str, Any]]:
     client = get_client()
     response = (
         client.table(CLUSTERS_TABLE)
-        .select("id, cluster_id")
+        .select("id, cluster_id, brief")
         .eq("cluster_status", "researched")
         .eq("date", run_date)
         .execute()
@@ -126,11 +127,11 @@ def run_briefing(run_date: str | None = None) -> None:
 
     For each researched cluster that has at least one article with a deep
     summary:
-      1. Fetch all cluster articles
-      2. Skip the cluster if no article has a non-empty deep_summary
-      3. Generate brief via Claude (tov_doc as system prompt)
-      4. Write name + brief to story_clusters
-      5. Set cluster_status = briefed, briefed_at = now
+      1. Skip clusters that already have a brief (idempotent re-runs)
+      2. Fetch all cluster articles
+      3. Skip the cluster if no article has a non-empty deep_summary
+      4. Generate brief via Claude (tov_doc as system prompt)
+      5. Write name + brief + briefed_at to story_clusters (status unchanged)
     """
     from datetime import date, timedelta
     target_date = run_date or (date.today() - timedelta(days=1)).isoformat()
@@ -154,6 +155,12 @@ def run_briefing(run_date: str | None = None) -> None:
 
     for cluster in clusters:
         cluster_id = cluster["cluster_id"]
+
+        # Status stays 'researched' after briefing, so a re-run would otherwise
+        # re-brief clusters that already have one. Skip those.
+        if (cluster.get("brief") or "").strip():
+            skipped += 1
+            continue
 
         articles = _fetch_cluster_articles(cluster_id)
         if not articles:
@@ -180,12 +187,19 @@ def run_briefing(run_date: str | None = None) -> None:
             continue
 
         name, brief = result
-        supabase.table(CLUSTERS_TABLE).update({
-            "name": name,
-            "brief": brief,
-            "cluster_status": "briefed",
-            "briefed_at": datetime.now(timezone.utc).isoformat(),
-        }).eq("cluster_id", cluster_id).execute()
+        # Attach the brief but leave cluster_status at 'researched' — advancing
+        # a cluster past research (e.g. to ready_for_content) is a downstream /
+        # manual decision, not something this stage does.
+        try:
+            supabase.table(CLUSTERS_TABLE).update({
+                "name": name,
+                "brief": brief,
+                "briefed_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("cluster_id", cluster_id).execute()
+        except Exception as exc:
+            failed += 1
+            logger.warning("Cluster %s — brief write failed: %s", cluster_id, exc)
+            continue
 
         briefed += 1
         logger.debug("Cluster %s — brief generated (%d chars)", cluster_id, len(brief))
