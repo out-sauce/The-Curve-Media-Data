@@ -46,6 +46,35 @@ triggers stages over HTTP.
 
 ## Recent changes
 
+- **Account-safe research: per-domain auto/manual scrape mode + `bot_wall` + extension
+  content-grab lane.** The daily batch used to send subscriber logins to every domain from
+  a datacenter IP; PerimeterX/DataDome publishers (Bloomberg confirmed) bot-wall those
+  reads, and tying bot-flagged automated traffic to a paid account risks suspension. Now a
+  per-**registrable-domain** policy lives in `domain_scrape_settings` (`scrape_mode` =
+  `auto`|`manual`, keyed like `site_auth.domain`/`sources.site_auth_domain`, default
+  `auto`). `run_research` scrapes `auto` domains and skips `manual` ones; the first time an
+  automated scrape returns `bot_wall` or `paywalled` it **auto-demotes** the domain to
+  `manual` (`_demote_domain`), so a hostile publisher is hit with the login **at most
+  once**. `bloomberg.com` is seeded `manual`. Toggle via `POST /sources/scrape-mode?domain=&mode=`
+  (Admin Sources page). A new `bot_wall` scrape status distinguishes an anti-bot/CAPTCHA
+  wall from a subscription paywall — `research/browser_scraper.py` detects it (`_is_bot_wall`)
+  and also strips PerimeterX `_px*`/`pxcts` cookies (`_strip_bot_cookies`) before rendering;
+  migration 029 widened the `news_articles.scrape_status` CHECK (from migration 018) to
+  allow `bot_wall`, or the write is rejected. `run_research_article` (manual initiation)
+  ignores the policy and always tries. **Extension content-grab lane** for `manual`
+  domains: Admin's Research button enqueues an article (`research_queue` table, `POST
+  /research/enqueue?id=`); the Curve Auth Chrome extension polls (`POST /research/queue/claim`),
+  opens the article in the operator's real logged-in browser (`background.js` service
+  worker + `chrome.alarms`), reads the rendered HTML, and posts it to `POST /research/import`
+  → `research_from_html` runs the same trafilatura extract + Claude summary via the shared
+  `_persist_result` (`scrape_method="extension"`). No server-side fetch, so nothing for a
+  bot detector to flag. Only runs while the operator's Chrome is open with auto-research
+  enabled (options toggle). Browserbase is no longer used for auth capture (the extension
+  replaced it) and the read-path toggle `RESEARCH_USE_BROWSERBASE` should be off. Migrations
+  029 (`domain_scrape_settings` + CHECK) and 030 (`research_queue`) applied manually; both
+  tables have RLS enabled with no policies (service-role access only), matching
+  `sources`/`site_auth`.
+
 - **LinkedIn + YouTube competitor channels & post transcripts.** `ingestion/competitors.py`
   now resolves up to five channels per competitor: Instagram, TikTok, LinkedIn, YouTube
   and YouTube Shorts. LinkedIn scrapes via `harvestapi~linkedin-profile-posts` (handle is
