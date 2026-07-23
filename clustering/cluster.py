@@ -21,6 +21,66 @@ logger = logging.getLogger(__name__)
 CLUSTERS_TABLE = "story_clusters"
 MODEL = "claude-sonnet-4-6"
 
+# The old free-text JSON responses truncated at max_tokens once the day grew past
+# ~500 articles ("Unterminated string" parse errors in the 2026-07-22/23 runs), and
+# every article silently fell through to a singleton. Both calls now use structured
+# outputs (guaranteed-parseable JSON), a much larger max_tokens, and an explicit
+# stop_reason check so truncation is a loud failure instead of a silent one.
+WEEK_MAX_TOKENS = 8192
+NEW_CLUSTER_MAX_TOKENS = 16384
+
+# Structured-outputs schema shared by both calls: a list of named article groups.
+_GROUPS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "clusters": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "description": {"type": "string"},
+                    "article_ids": {"type": "array", "items": {"type": "integer"}},
+                },
+                "required": ["name", "description", "article_ids"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["clusters"],
+    "additionalProperties": False,
+}
+
+
+def _call_claude_groups(system_prompt: str | None, user_prompt: str,
+                        max_tokens: int, label: str) -> list[dict]:
+    """
+    Shared Claude call for both clustering passes. Returns the parsed
+    "clusters" list, or raises on refusal/truncation (caller catches).
+    """
+    ai = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    kwargs = {"system": system_prompt} if system_prompt else {}
+    msg = ai.messages.create(
+        model=MODEL,
+        max_tokens=max_tokens,
+        messages=[{"role": "user", "content": user_prompt}],
+        # Structured outputs: the API constrains the response to this schema, so
+        # the JSON is guaranteed parseable — unless it truncates, which we check.
+        output_config={
+            "format": {
+                "type": "json_schema",
+                "schema": _GROUPS_SCHEMA,
+            }
+        },
+        **kwargs,
+    )
+    if msg.stop_reason == "refusal":
+        raise ValueError(f"{label} request was refused")
+    if msg.stop_reason == "max_tokens":
+        raise ValueError(f"{label} response truncated at max_tokens={max_tokens}")
+    raw = next(b.text for b in msg.content if b.type == "text")
+    return json.loads(raw)["clusters"]
+
 DEFAULT_CLUSTER_PROMPT = """You are an editorial assistant for Curve Media, clustering today's financial news articles into distinct stories.
 
 Group articles that are reporting on the same underlying story or feeding into the same broader narrative. Think editorially — two articles belong together if a reader would expect to read them as part of the same story, even if the headlines look different.
@@ -45,7 +105,7 @@ def _get_monday(d: str) -> str:
 
 
 def _fetch_week_names(target_date: str) -> list[str]:
-    """Return unique cluster names used earlier this week (Mon up to target_date)."""
+    """Return unique multi-article cluster names used earlier this week (Mon up to target_date)."""
     monday = _get_monday(target_date)
     if monday >= target_date:
         return []
@@ -55,6 +115,10 @@ def _fetch_week_names(target_date: str) -> list[str]:
         .select("name")
         .gte("date", monday)
         .lt("date", target_date)
+        # Singletons are named after their article's headline — feeding those into
+        # the continuity prompt snowballed it to ~1000 "week stories" in three days
+        # (2026-07-21→23). Only genuine multi-article stories count as ongoing.
+        .gte("article_count", 2)
         .not_.is_("name", "null")
         .execute()
     )
@@ -111,19 +175,8 @@ def _call_week_continuity(articles: list[dict], week_names: list[str]) -> dict[s
         "Return an empty array if nothing clearly continues a weekly story.",
     ])
 
-    ai = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     try:
-        msg = ai.messages.create(
-            model=MODEL,
-            max_tokens=2048,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        raw = msg.content[0].text.strip()
-        raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-        start = raw.find("[")
-        if start == -1:
-            return {}
-        data = json.loads(raw[start:])
+        data = _call_claude_groups(None, prompt, WEEK_MAX_TOKENS, "Week continuity")
         week_name_set = set(week_names)
         result: dict[str, tuple[list[str], str]] = {}
         for item in data:
@@ -149,20 +202,10 @@ def _call_new_clustering(articles: list[dict], system_prompt: str) -> list[dict]
         for a in articles
     )
 
-    ai = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     try:
-        msg = ai.messages.create(
-            model=MODEL,
-            max_tokens=4096,
-            system=system_prompt,
-            messages=[{"role": "user", "content": article_lines}],
+        return _call_claude_groups(
+            system_prompt, article_lines, NEW_CLUSTER_MAX_TOKENS, "New clustering"
         )
-        raw = msg.content[0].text.strip()
-        raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-        start = raw.find("[")
-        if start == -1:
-            return []
-        return json.loads(raw[start:])
     except Exception as exc:
         logger.warning("New clustering call failed: %s", exc)
         return []
@@ -182,6 +225,9 @@ def run_clustering(run_date: str | None = None) -> None:
 
     logger.info("Clustering %d articles", len(articles))
     articles_by_id = {a["id"]: a for a in articles}
+    # Claude may echo ids back as ints or strings — match on the string form and
+    # map back to the DB-typed id.
+    id_lookup = {str(a["id"]): a["id"] for a in articles}
     assigned_ids: set[str] = set()
 
     # (name, article_ids, description, is_week_continuation)
@@ -193,7 +239,7 @@ def run_clustering(run_date: str | None = None) -> None:
         logger.info("Checking %d articles against %d week stories", len(articles), len(week_names))
         week_assignments = _call_week_continuity(articles, week_names)
         for name, (ids, description) in week_assignments.items():
-            valid_ids = [i for i in ids if i in articles_by_id]
+            valid_ids = [id_lookup[str(i)] for i in ids if str(i) in id_lookup]
             if valid_ids:
                 final_clusters.append((name, valid_ids, description, True))
                 assigned_ids.update(valid_ids)
@@ -214,8 +260,8 @@ def run_clustering(run_date: str | None = None) -> None:
             name = (group.get("name") or "").strip()
             description = (group.get("description") or "").strip()
             ids = [
-                i for i in (group.get("article_ids") or [])
-                if i in articles_by_id and i not in assigned_ids
+                id_lookup[str(i)] for i in (group.get("article_ids") or [])
+                if str(i) in id_lookup and id_lookup[str(i)] not in assigned_ids
             ]
             if name and len(ids) >= 2:
                 final_clusters.append((name, ids, description, False))

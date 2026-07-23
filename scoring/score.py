@@ -25,6 +25,14 @@ logger = logging.getLogger(__name__)
 CLUSTERS_TABLE = "story_clusters"
 SCORING_MODEL = "claude-sonnet-4-6"
 
+# Score clusters in bounded batches. A single Claude call over every cluster of the
+# day overflowed max_tokens once the day grew past ~500 clusters (the JSON was
+# truncated mid-string, json.loads failed, and *every* cluster fell back to 0.0 —
+# see the 2026-07-22/23 daily run logs). Batching caps the response size so it
+# can't truncate, and isolates a bad batch from the rest. Same fix as tagging.
+SCORE_BATCH_SIZE = 100
+SCORE_MAX_TOKENS = 20000
+
 # Schema for structured outputs. Note: structured outputs don't support
 # numerical bounds (minimum/maximum), so score is validated as a plain number
 # and clamped to 0.0-1.0 client-side below.
@@ -131,7 +139,7 @@ def _call_claude_batch(clusters: list[dict[str, Any]], articles_by_cluster: dict
     try:
         message = client.messages.create(
             model=SCORING_MODEL,
-            max_tokens=20000,
+            max_tokens=SCORE_MAX_TOKENS,
             system=audience_doc,
             messages=[{"role": "user", "content": prompt}],
             # Structured outputs: the API constrains the response to this schema,
@@ -147,6 +155,13 @@ def _call_claude_batch(clusters: list[dict[str, Any]], articles_by_cluster: dict
         )
         if message.stop_reason == "refusal":
             raise ValueError("Scoring request was refused")
+        if message.stop_reason == "max_tokens":
+            # Truncated JSON is unparseable — fail the batch loudly instead of
+            # trying to parse it.
+            raise ValueError(
+                f"Scoring response truncated at max_tokens={SCORE_MAX_TOKENS} "
+                f"({len(clusters)} clusters in batch)"
+            )
 
         # With output_config.format the first text block is valid JSON matching
         # SCORING_SCHEMA.
@@ -203,12 +218,19 @@ def run_scoring(run_date: str | None = None) -> None:
         logger.info("Scoring: no pending clusters to process")
         return
 
-    logger.info("Scoring %d clusters in a single Claude call", len(clusters))
+    logger.info(
+        "Scoring %d clusters in batches of %d", len(clusters), SCORE_BATCH_SIZE
+    )
 
     cluster_ids = [c["cluster_id"] for c in clusters]
     articles_by_cluster = _fetch_articles_for_clusters(cluster_ids)
 
-    results = _call_claude_batch(clusters, articles_by_cluster, audience_doc)
+    # One Claude call per batch so the JSON response can't overflow max_tokens.
+    # A batch that fails only falls back to 0.0 for its own clusters.
+    results: dict[str, tuple[float, str]] = {}
+    for i in range(0, len(clusters), SCORE_BATCH_SIZE):
+        batch = clusters[i: i + SCORE_BATCH_SIZE]
+        results.update(_call_claude_batch(batch, articles_by_cluster, audience_doc))
 
     supabase = get_client()
     for cluster_id, (score, reason) in results.items():
