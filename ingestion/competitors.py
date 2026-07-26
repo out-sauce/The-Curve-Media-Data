@@ -740,19 +740,25 @@ def _run_competitor(competitor: dict) -> int:
     return written
 
 
-def run_competitors(competitor_id: str | None = None) -> None:
+def run_competitors(competitor_id: str | None = None, self_only: bool = False) -> None:
     """
     Run the competitor scrape via Apify. Pass `competitor_id` to refresh a single
-    competitor (a manual Refresh from the admin card); omit it for the daily job
-    that refreshes everyone.
+    competitor (a manual Refresh from the admin card); omit it to refresh everyone.
+    `self_only=True` restricts the run to the is_self ("The Curve") row — the daily
+    scheduled job uses this so own-channel follower snapshots and content_stats stay
+    daily while the full competitor sweep is weekly.
     """
     if not APIFY_TOKEN:
         logger.warning("APIFY_TOKEN not set — skipping competitor run")
         return
 
     competitors = get_competitors(competitor_id)
+    if self_only:
+        competitors = [c for c in competitors if c.get("is_self")]
     if not competitors:
         scope = f" for id={competitor_id}" if competitor_id else ""
+        if self_only:
+            scope += " (self only)"
         logger.info("No competitors to scrape%s — skipping competitor run", scope)
         return
 

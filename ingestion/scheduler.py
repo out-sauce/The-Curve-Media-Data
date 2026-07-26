@@ -3,6 +3,7 @@ Scheduler — runs the full daily pipeline at 5am UTC.
 
 Single job:
   05:00 UTC daily → ingest → filter → cluster → score → tag → research → brief
+  (+ competitors, Mondays only)
 """
 
 import logging
@@ -44,7 +45,9 @@ def run_daily_pipeline() -> None:
          research score threshold, transitioning them to 'researched'
       7. Brief — editorial name + brief for researched clusters that produced a
          deep summary (cluster_status stays 'researched')
-      8. Competitor run — follower counts + recent post engagement (after the news run)
+      8. Social scan — The Curve's own channels (is_self) every day, so follower
+         snapshots and content_stats stay daily; the full competitor sweep runs
+         Mondays only (manual /run/competitors is unaffected).
     """
     from datetime import date
     today = date.today().isoformat()
@@ -63,7 +66,11 @@ def run_daily_pipeline() -> None:
     _run("tag",          run_tagging,      run_date=today)
     _run("research",     run_research,     run_date=today)
     _run("brief",        run_briefing,     run_date=today)
-    _run("competitors",  run_competitors)
+    if date.today().weekday() == 0:  # Monday
+        _run("competitors", run_competitors)
+    else:
+        logger.info("Full competitor sweep skipped — runs weekly on Mondays; scanning own channels only")
+        _run("competitors", run_competitors, self_only=True)
     logger.info("=== Daily pipeline complete ===")
 
 

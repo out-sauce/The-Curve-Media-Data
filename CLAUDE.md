@@ -46,6 +46,13 @@ triggers stages over HTTP.
 
 ## Recent changes
 
+- **Competitor social scan is weekly; own channels stay daily.** The scheduled
+  pipeline (`ingestion/scheduler.py`) runs the full competitor sweep only on Mondays;
+  every other day it calls `run_competitors(self_only=True)`, which filters to the
+  is_self ("The Curve") row so daily follower snapshots and content_stats upserts
+  continue uninterrupted. The manual `POST /run/competitors` endpoint and
+  `python main.py --stage competitors` still run the full sweep on demand any day.
+
 - **Cluster-level on-demand research + brief redo.** Admin's story **Research** button now
   makes one call — `POST /run/research?cluster_id=` → `run_research_cluster` — instead of
   fanning out per article. It never re-scrapes articles that already have a `deep_summary`;
