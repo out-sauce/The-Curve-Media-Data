@@ -46,6 +46,26 @@ triggers stages over HTTP.
 
 ## Recent changes
 
+- **Cluster status semantics tightened (scored / researched / briefed).** A cluster
+  only advances to `researched` when **at least one of its articles has a non-NULL
+  `scrape_status`** (any value — scraped/paywalled/bot_wall/failed all count; NULL means
+  nothing was ever attempted, so it stays `scored`). The shared helper is
+  `research.research._advance_clusters_to_researched` (never demotes; only
+  `pending`/`scored` advance, `briefed`/`archived` untouched, never raises) and it is
+  called from every lane that gives an article a scrape_status: the daily batch
+  `run_research` (which previously flipped **all** selected clusters unconditionally,
+  even all-manual-skipped ones), `run_research_cluster`, `run_research_article`, and the
+  extension import (`_maybe_rebrief_cluster`). `briefed` is **reserved for the manual
+  content-studio flow** (Admin `saveResearchData`) — no pipeline code sets it anymore
+  (the dormant `custom_clustering` stage now inserts `scored` instead of `briefed`), and
+  `rebrief_cluster` now refuses to overwrite a `briefed` cluster's brief, since that
+  column then holds the studio's manual output. Auto-generated briefs (batch briefing,
+  on-demand re-brief) keep the cluster at `researched`. Admin's toolbar "Run research
+  (score 70+)" button (`runResearchForTodaysTopArticles`) was switched from per-article
+  dispatch (which never wrote a brief) to one `POST /run/research?cluster_id=` per
+  qualifying story — same path as the story-level Research button, so scrape → brief →
+  status advance happen together; it skips `briefed`/`archived` clusters.
+
 - **Competitor social scan is weekly; own channels stay daily.** The scheduled
   pipeline (`ingestion/scheduler.py`) runs the full competitor sweep only on Mondays;
   every other day it calls `run_competitors(self_only=True)`, which filters to the

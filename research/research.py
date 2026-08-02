@@ -2,8 +2,11 @@
 Research stage — scrapes full article text and generates deep summaries.
 
 Runs after tagging. Only processes articles in scored clusters that score
->= research_score_threshold (default 0.60). Transitions cluster status
-to 'researched' once all articles are processed.
+>= research_score_threshold (default 0.60). A cluster only transitions to
+'researched' once at least one of its articles has a scrape_status (any value);
+clusters where nothing was ever attempted (all articles skipped, scrape_status
+still NULL) stay 'scored'. 'briefed' is never set here — that status is
+reserved for the manual content-studio briefing flow in the Admin app.
 
 Each article URL is rendered in a real logged-in Chromium tab (Playwright,
 research/browser_scraper.py), seeded with a per-publisher-domain login session
@@ -94,6 +97,47 @@ def _fetch_research_articles(run_date: str, score_threshold: float) -> tuple[lis
         )
         articles.extend(resp.data or [])
     return articles, cluster_ids
+
+
+def _advance_clusters_to_researched(cluster_ids: list[str], supabase) -> int:
+    """
+    Move clusters to 'researched' — but only those where at least one article now
+    has a scrape_status (any value: scraped/paywalled/bot_wall/failed all count;
+    NULL means nothing was ever attempted, so the cluster stays 'scored').
+    Never demotes: only 'pending'/'scored' clusters are advanced — 'briefed'
+    (the manual content-studio state) and 'archived' are left untouched.
+    Returns the number of clusters advanced. Never raises.
+    """
+    if not cluster_ids:
+        return 0
+    try:
+        eligible: set[str] = set()
+        for i in range(0, len(cluster_ids), 50):
+            chunk = cluster_ids[i: i + 50]
+            resp = (
+                supabase.table(TABLE)
+                .select("cluster_id")
+                .in_("cluster_id", chunk)
+                .not_.is_("scrape_status", "null")
+                .execute()
+            )
+            eligible.update(r["cluster_id"] for r in (resp.data or []))
+        if not eligible:
+            return 0
+        updated = (
+            supabase.table(CLUSTERS_TABLE)
+            .update({"cluster_status": "researched"})
+            .in_("cluster_id", sorted(eligible))
+            .in_("cluster_status", ["pending", "scored"])
+            .execute()
+        )
+        advanced = len(updated.data or [])
+        if advanced:
+            logger.info("Advanced %d cluster(s) to researched", advanced)
+        return advanced
+    except Exception as exc:
+        logger.warning("Could not advance clusters to researched: %s", exc)
+        return 0
 
 
 # Registrable-domain helpers (_registrable_domain, _TWO_LABEL_TLDS) now live in
@@ -326,6 +370,7 @@ def run_research(run_date: str | None = None) -> None:
     articles = [a for a in articles if a.get("scrape_status") is None or a.get("scrape_status") == "failed"]
     if not articles:
         logger.info("Research: all articles already processed")
+        _advance_clusters_to_researched(research_cluster_ids, get_client())
         return
     logger.info("Research: processing %d articles", len(articles))
 
@@ -386,10 +431,10 @@ def run_research(run_date: str | None = None) -> None:
             _demote_domain(domain, status, datetime.now(timezone.utc).isoformat())
             demoted.add(domain)
 
-    for cluster_id in research_cluster_ids:
-        supabase.table(CLUSTERS_TABLE).update(
-            {"cluster_status": "researched"}
-        ).eq("cluster_id", cluster_id).execute()
+    # Only clusters where something was actually attempted (>=1 article with a
+    # scrape_status) advance to 'researched'; all-manual-skipped clusters stay
+    # 'scored' until the extension lane or a manual run gives them one.
+    _advance_clusters_to_researched(research_cluster_ids, supabase)
 
     logger.info(
         "Research complete — %d scraped, %d summarised, %d paywalled, %d bot_wall, "
@@ -403,15 +448,16 @@ def run_research_article(article_id: str) -> None:
     Research a single article on demand, regardless of its cluster's score or
     prior scrape_status (an explicit request overrides the batch's skip/threshold
     rules). Scrapes full text + writes a deep summary onto the news_articles row,
-    exactly as the batch path does. Does not touch cluster_status — one article
-    does not mean the whole cluster is researched.
+    exactly as the batch path does. Once the article has a scrape_status its
+    cluster qualifies as 'researched' (>=1 article attempted), so the cluster is
+    advanced from scored → researched here too (never past that).
     """
     logger.info("Research (single) started for article %s", article_id)
 
     client = get_client()
     resp = (
         client.table(TABLE)
-        .select("id, url, title, summary, source_id, scrape_status")
+        .select("id, url, title, summary, source_id, scrape_status, cluster_id")
         .eq("id", article_id)
         .limit(1)
         .execute()
@@ -434,6 +480,8 @@ def run_research_article(article_id: str) -> None:
     status, summarised = _process_article(
         article, storage_state, audience_doc, RESEARCH_USE_BROWSER, client
     )
+    if article.get("cluster_id"):
+        _advance_clusters_to_researched([article["cluster_id"]], client)
     logger.info(
         "Research (single) complete — article %s: %s (summarised=%s)",
         article_id, status, summarised,
@@ -448,8 +496,10 @@ def run_research_cluster(cluster_id: str) -> None:
     'manual' domains are enqueued for the extension lane (no server-side fetch),
     everything else is scraped here. The brief is redone at the end from whatever
     deep summaries now exist (overwriting any prior brief); articles still waiting
-    on the extension refresh it again as each import lands. Does not touch
-    cluster_status.
+    on the extension refresh it again as each import lands. The cluster is then
+    advanced scored → researched when at least one article has a scrape_status —
+    the auto-generated brief keeps it at 'researched'; 'briefed' is reserved for
+    the manual content-studio flow and is never set (or demoted) here.
     """
     logger.info("Research (cluster) started for %s", cluster_id)
 
@@ -501,6 +551,7 @@ def run_research_cluster(cluster_id: str) -> None:
 
     from briefing.brief import rebrief_cluster
     rebriefed = rebrief_cluster(cluster_id)
+    _advance_clusters_to_researched([cluster_id], client)
     logger.info(
         "Research (cluster) complete — %s: %d already researched, %d scraped, "
         "%d queued (extension), %d failed, brief %s",
@@ -652,10 +703,12 @@ def claim_pending(limit: int = 10) -> list[dict]:
 
 def _maybe_rebrief_cluster(article_id) -> None:
     """
-    After a successful extension import, refresh the article's cluster brief so it
-    reflects the new deep summary — but only when the cluster already has a brief
-    ("redo", e.g. queued from run_research_cluster). A never-briefed cluster is left
-    for the briefing stage. Best-effort: a failure never breaks the import.
+    After a successful extension import, advance the article's cluster from
+    scored → researched (it now has >=1 article with a scrape_status) and refresh
+    the cluster brief so it reflects the new deep summary — the brief redo only
+    when the cluster already has a brief ("redo", e.g. queued from
+    run_research_cluster). A never-briefed cluster is left for the briefing stage.
+    Best-effort: a failure never breaks the import.
     """
     try:
         client = get_client()
@@ -663,6 +716,7 @@ def _maybe_rebrief_cluster(article_id) -> None:
         cluster_id = rows[0].get("cluster_id") if rows else None
         if not cluster_id:
             return
+        _advance_clusters_to_researched([cluster_id], client)
         clusters = (
             client.table(CLUSTERS_TABLE)
             .select("brief")

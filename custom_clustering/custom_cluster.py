@@ -231,9 +231,11 @@ def _create_custom_clusters(
             logger.warning("Brief generation failed for group '%s' — skipping", name)
             continue
 
-        # Score the brief
+        # Score the brief. 'briefed' is reserved for the manual content-studio
+        # flow — an auto-generated brief leaves the cluster at 'scored' (it has
+        # not been researched; no article has a scrape_status yet).
         score, score_reason = _score_brief(brief, name, audience_doc)
-        cluster_status = "briefed" if score >= score_threshold else "rejected"
+        cluster_status = "scored" if score >= score_threshold else "rejected"
 
         new_cluster_id = str(uuid.uuid4())
 
@@ -246,7 +248,7 @@ def _create_custom_clusters(
             "cluster_status":    cluster_status,
             "cluster_type":      "custom",
             "brief":             brief,
-            "briefed_at":        datetime.now(timezone.utc).isoformat() if cluster_status == "briefed" else None,
+            "briefed_at":        datetime.now(timezone.utc).isoformat() if cluster_status == "scored" else None,
             "relevance_score":   score,
             "score_reason":      score_reason,
             "source_cluster_ids": valid,

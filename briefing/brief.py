@@ -122,11 +122,25 @@ def rebrief_cluster(cluster_id: str) -> bool:
     Regenerate the name + brief for a single cluster, overwriting any existing brief.
     This is the explicit "redo" used after on-demand research (the Admin story-level
     Research button, or a late-arriving extension import) — unlike run_briefing it
-    ignores date/status and does not skip clusters that already have a brief. Still
-    requires at least one article with a deep summary. Returns True when a brief was
-    written. Never raises.
+    ignores date and does not skip clusters that already have a brief. Exception:
+    a 'briefed' cluster has been through the manual content-studio flow and its
+    brief column holds that manual output — never overwrite it with an auto brief.
+    Still requires at least one article with a deep summary. Returns True when a
+    brief was written. Never raises.
     """
     try:
+        cluster_rows = (
+            get_client().table(CLUSTERS_TABLE)
+            .select("cluster_status")
+            .eq("cluster_id", cluster_id)
+            .limit(1)
+            .execute()
+            .data
+        ) or []
+        if cluster_rows and cluster_rows[0].get("cluster_status") == "briefed":
+            logger.info("Re-brief: cluster %s is 'briefed' (manual studio output) — skipping", cluster_id)
+            return False
+
         settings = get_pipeline_settings()
         tov_doc = settings.get("tov_doc", "")
         brief_instructions = settings.get("brief_instructions", "")
