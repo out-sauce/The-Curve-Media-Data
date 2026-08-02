@@ -12,6 +12,13 @@ Three passes, all in one stage:
 
 After this stage all clusters are status='pending', cluster_type='auto', and
 ready for scoring.
+
+DORMANT — not imported by main.py, api.py or ingestion/scheduler.py, and it predates
+migration 031 (story continuation). Do not revive it as-is: it still writes weekly_story
+as a story-grouping key (deprecated — a running story is one row now), never stamps
+last_article_at (so briefing would treat anything it touches as already current), and
+maintains article_count with a non-atomic read-then-increment. Use
+clustering.cluster._count_cluster_articles instead.
 """
 
 import json

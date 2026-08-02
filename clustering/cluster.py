@@ -1,15 +1,23 @@
 """
 Clustering — two Claude calls, one DB write.
 
-Call 1 (week continuity): assign today's articles to ongoing stories from earlier this week.
-Call 2 (new stories): group remaining articles into new named clusters.
+Call 1 (continuation): append today's articles to stories that already exist. Unlike the
+  old "week continuity" pass, which minted a brand-new same-named row per day, this one
+  extends the existing story_clusters row in place: the articles are repointed at it, its
+  article_count is recounted, its `date` is bumped forward to the run date (so it
+  resurfaces in the Admin day view and every downstream stage picks it up again) and its
+  status is reset to 'pending' so score → tag → research → brief all re-run over it.
+Call 2 (new stories): group the remaining articles into new named clusters.
 Unplaced articles become singletons.
+
+A cluster's `date` is therefore NOT immutable and its articles are NOT all from that date
+— see migration 031.
 """
 
 import json
 import logging
 import uuid
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import anthropic
 
@@ -26,10 +34,50 @@ MODEL = "claude-sonnet-4-6"
 # every article silently fell through to a singleton. Both calls now use structured
 # outputs (guaranteed-parseable JSON), a much larger max_tokens, and an explicit
 # stop_reason check so truncation is a loud failure instead of a silent one.
-WEEK_MAX_TOKENS = 8192
+CONTINUITY_MAX_TOKENS = 8192
 NEW_CLUSTER_MAX_TOKENS = 16384
 
-# Structured-outputs schema shared by both calls: a list of named article groups.
+# Candidate window for the continuation pass. Rolling, not Monday-to-today: a story
+# running since last Thursday is just as live on Tuesday as one that started this week.
+LOOKBACK_DAYS = 7            # multi-article running stories
+SINGLETON_LOOKBACK_DAYS = 3  # 1-article stories: only recent ones. Singletons are named
+                             # after their article's headline, and a whole week of those
+                             # snowballed the old prompt to ~1000 "week stories" in three
+                             # days (2026-07-21→23).
+
+# Candidates are gated and ranked by relevance_score, not by recency. The window holds
+# ~480 multi-article clusters and ~700 singletons, so a date-ordered cap would spend the
+# whole budget on the most recent day and the 7-day window would be fiction. Scoring runs
+# before this ever sees a prior day's cluster, so every candidate has a score (a failed
+# score writes 0.0, which this correctly excludes).
+CANDIDATE_MIN_SCORE = 0.5
+
+# Prompt caps. Multi-article stories get their own budget so a genuine running story can
+# never be crowded out by singletons; within each budget the lowest-scoring candidates are
+# dropped first, so trimming costs the least relevant stories rather than the oldest ones.
+MAX_CANDIDATE_MULTI = 150
+MAX_CANDIDATE_SINGLE = 50
+MAX_CANDIDATE_STORIES = 200
+
+# A cluster in one of these states is finished editorial output — new coverage forms a
+# fresh story rather than reopening it. 'briefed' is the manual content-studio state and
+# its brief column holds hand-written output; 'ready_for_content' has been promoted into
+# production. These are the live cluster_status enum labels — the full set is
+# (pending, scored, researched, ready_for_content, archived, briefed). Passing a label
+# that is not in the enum makes PostgREST reject the whole query, so do not add
+# 'published'/'accepted'/'rejected' here: migration 021's header lists them but the type
+# was since recreated without them.
+CLOSED_STATUSES = ("briefed", "archived", "ready_for_content")
+OPEN_STATUSES = ["pending", "scored", "researched"]
+
+# Articles per continuation call. The article list is cheap on input, but the response
+# scales with how many of them match, so chunking keeps it clear of max_tokens.
+CONTINUITY_ARTICLE_BATCH = 400
+
+# PostgREST caps a response at 1000 rows by default.
+PAGE_SIZE = 1000
+
+# Structured-outputs schema for the new-clustering pass: a list of named article groups.
 _GROUPS_SCHEMA = {
     "type": "object",
     "properties": {
@@ -51,12 +99,40 @@ _GROUPS_SCHEMA = {
     "additionalProperties": False,
 }
 
+# The continuation pass has a different contract from the new-clustering pass: it returns
+# a pointer to an EXISTING story, not a new name+description. Reusing _GROUPS_SCHEMA would
+# force Claude to emit a name and description we then throw away — wasted output tokens,
+# and an open invitation to silently rename a running story.
+_CONTINUATION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "continuations": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "story_index": {"type": "integer"},
+                    "article_ids": {"type": "array", "items": {"type": "integer"}},
+                },
+                "required": ["story_index", "article_ids"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["continuations"],
+    "additionalProperties": False,
+}
 
-def _call_claude_groups(system_prompt: str | None, user_prompt: str,
-                        max_tokens: int, label: str) -> list[dict]:
+
+def _call_claude_json(system_prompt: str | None, user_prompt: str, max_tokens: int,
+                      label: str, schema: dict, key: str) -> list[dict]:
     """
-    Shared Claude call for both clustering passes. Returns the parsed
-    "clusters" list, or raises on refusal/truncation (caller catches).
+    Shared Claude call for both clustering passes. Returns the parsed list under `key`,
+    or raises on refusal/truncation (caller catches).
+
+    The stop_reason checks are the whole point of this being one function: the old
+    free-text responses truncated silently at max_tokens and every article fell through
+    to a singleton (2026-07-22/23). Both passes must keep them.
     """
     ai = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     kwargs = {"system": system_prompt} if system_prompt else {}
@@ -69,7 +145,7 @@ def _call_claude_groups(system_prompt: str | None, user_prompt: str,
         output_config={
             "format": {
                 "type": "json_schema",
-                "schema": _GROUPS_SCHEMA,
+                "schema": schema,
             }
         },
         **kwargs,
@@ -79,7 +155,15 @@ def _call_claude_groups(system_prompt: str | None, user_prompt: str,
     if msg.stop_reason == "max_tokens":
         raise ValueError(f"{label} response truncated at max_tokens={max_tokens}")
     raw = next(b.text for b in msg.content if b.type == "text")
-    return json.loads(raw)["clusters"]
+    return json.loads(raw)[key]
+
+
+def _call_claude_groups(system_prompt: str | None, user_prompt: str,
+                        max_tokens: int, label: str) -> list[dict]:
+    """Name-groups call (new clustering pass)."""
+    return _call_claude_json(system_prompt, user_prompt, max_tokens, label,
+                             _GROUPS_SCHEMA, "clusters")
+
 
 DEFAULT_CLUSTER_PROMPT = """You are an editorial assistant for Curve Media, clustering today's financial news articles into distinct stories.
 
@@ -99,96 +183,219 @@ Articles not included will be kept as individual stories.
 Return a JSON array only: [{"name": "...", "description": "...", "article_ids": [...]}]"""
 
 
-def _get_monday(d: str) -> str:
-    dt = date.fromisoformat(d)
-    return (dt - timedelta(days=dt.weekday())).isoformat()
+_CONTINUATION_PROMPT = """You are an editorial assistant for Curve Media.
+
+Below are stories Curve is already tracking, each with a numeric index, followed by today's newly-filtered articles.
+
+Your job: for each of today's articles that is a genuine CONTINUATION of a tracked story, assign it to that story's index.
+
+A continuation means the article reports a new development in the SAME ongoing narrative — a follow-up, a reaction, a next step, a consequence, or a new data point in the same running event. It is NOT a continuation if the article merely shares a topic, a sector, a company or a country with the tracked story.
+
+Be conservative. An article you leave out is grouped into a new story a moment later, which is a far cheaper mistake than folding a genuinely distinct story into an existing one — that one silently corrupts a story readers are already following. Expect most of today's articles NOT to be continuations.
+
+A tracked story listed with 1 article is a thin story, not a weak one; grow it if today's coverage genuinely follows it.
+
+Rules:
+- Use only the story indexes listed below. Never invent an index.
+- Use only the article ids listed below. Never invent an id.
+- Assign each article to at most one story.
+- Return one entry per story that gained articles. Omit stories that gained none.
+- Return an empty list if nothing continues a tracked story.
+
+TRACKED STORIES
+{story_block}
+
+TODAY'S ARTICLES
+{article_lines}
+"""
 
 
-def _fetch_week_names(target_date: str) -> list[str]:
-    """Return unique multi-article cluster names used earlier this week (Mon up to target_date)."""
-    monday = _get_monday(target_date)
-    if monday >= target_date:
-        return []
+# ---------------------------------------------------------------------------
+# DB reads
+# ---------------------------------------------------------------------------
+
+def _fetch_open_clusters(target_date: str) -> list[dict]:
+    """
+    Candidate stories the continuation pass may extend, best-first.
+
+      - article_count >= 2   over the full LOOKBACK_DAYS window
+      - article_count == 1   only from the last SINGLETON_LOOKBACK_DAYS
+      - relevance_score >= CANDIDATE_MIN_SCORE — a story Curve is not tracking is not a
+        story to continue, and this is what keeps the list small enough to rank by
+        editorial weight instead of truncating it by date
+      - cluster_status not in CLOSED_STATUSES, published_at unset, ready_for_content false
+      - date <= target_date  so a backfill run can never see (or bump) a later story
+
+    Two queries rather than one plus a Python filter: a few days of singletons can exceed
+    PostgREST's 1000-row default cap, and a server-side order + limit on each keeps the
+    cap from silently deciding which candidates we see.
+    """
+    target = date.fromisoformat(target_date)
+    window_start = (target - timedelta(days=LOOKBACK_DAYS)).isoformat()
+    singleton_start = (target - timedelta(days=SINGLETON_LOOKBACK_DAYS)).isoformat()
     supabase = get_client()
-    resp = (
-        supabase.table(CLUSTERS_TABLE)
-        .select("name")
-        .gte("date", monday)
-        .lt("date", target_date)
-        # Singletons are named after their article's headline — feeding those into
-        # the continuity prompt snowballed it to ~1000 "week stories" in three days
-        # (2026-07-21→23). Only genuine multi-article stories count as ongoing.
-        .gte("article_count", 2)
-        .not_.is_("name", "null")
-        .execute()
-    )
-    seen = set()
-    names = []
-    for r in (resp.data or []):
-        name = (r.get("name") or "").strip()
-        if name and name not in seen:
-            seen.add(name)
-            names.append(name)
-    return names
+    cols = "cluster_id, name, description, article_count, date, cluster_status"
+
+    def _query(start: str, exact_one: bool, limit: int) -> list[dict]:
+        q = (
+            supabase.table(CLUSTERS_TABLE)
+            .select(cols)
+            .gte("date", start)
+            .lte("date", target_date)
+            .not_.in_("cluster_status", list(CLOSED_STATUSES))
+            # Belt and braces beyond the status filter: a cluster that has shipped or
+            # been promoted into production must not be silently grown and re-briefed.
+            # ready_for_content exists both as a status and as this boolean flag.
+            .is_("published_at", "null")
+            .eq("ready_for_content", False)
+            .not_.is_("name", "null")
+            .gte("relevance_score", CANDIDATE_MIN_SCORE)
+        )
+        q = q.eq("article_count", 1) if exact_one else q.gte("article_count", 2)
+        resp = (
+            q.order("relevance_score", desc=True)
+            .order("article_count", desc=True)
+            .order("date", desc=True)
+            .order("cluster_id")  # deterministic tiebreak
+            .limit(limit)
+            .execute()
+        )
+        return resp.data or []
+
+    multi = _query(window_start, False, MAX_CANDIDATE_MULTI)
+    singles = _query(singleton_start, True, MAX_CANDIDATE_SINGLE)
+
+    candidates = [
+        c for c in (multi + singles)[:MAX_CANDIDATE_STORIES]
+        if (c.get("name") or "").strip()
+    ]
+    if len(multi) + len(singles) > len(candidates):
+        logger.info(
+            "Continuation: %d candidate stories trimmed to %d",
+            len(multi) + len(singles), len(candidates),
+        )
+    return candidates
 
 
 def _fetch_included_articles(run_date: str) -> list[dict]:
+    """
+    Today's filtered-in articles that are not yet in a cluster.
+
+    cluster_id IS NULL is what makes the stage re-runnable. Clustering never changes
+    news_articles.status, so without it a second run for the same date re-clusters
+    everything — and with continuation that means today's own clusters (date == run_date)
+    appear as candidates and get re-extended, while the new-clustering pass mints
+    duplicate rows whose articles are then stolen by the newest row, leaving zero-article
+    ghost clusters with a stale article_count. With it, a second run finds nothing.
+
+    Paginated: PostgREST caps a response at 1000 rows by default, so a big day was
+    silently clustering only its first 1000 articles.
+    """
     client = get_client()
+    out: list[dict] = []
+    page = 0
+    while True:
+        resp = (
+            client.table(TABLE)
+            .select("id, title, summary")
+            .eq("status", "included")
+            .is_("cluster_id", "null")
+            .gte("fetched_at", f"{run_date}T00:00:00.000Z")
+            .lte("fetched_at", f"{run_date}T23:59:59.999Z")
+            .order("id")
+            .range(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE - 1)
+            .execute()
+        )
+        rows = resp.data or []
+        out.extend(rows)
+        if len(rows) < PAGE_SIZE:
+            return out
+        page += 1
+
+
+def _count_cluster_articles(supabase, cluster_id: str) -> int:
+    """
+    Authoritative article count for a cluster, straight from the DB.
+
+    Not a read-then-increment (hybrid_clustering/hybrid_cluster.py:262-272 does that):
+    that is non-atomic and permanently self-corrupting — if a re-link partly failed the
+    stored count drifts and never recovers. A COUNT is idempotent, so a re-run converges
+    on the truth instead of compounding. count="exact" reads the Content-Range total, so
+    the 1000-row cap cannot under-count a large story.
+    """
     resp = (
-        client.table(TABLE)
-        .select("id, title, summary")
-        .eq("status", "included")
-        .gte("fetched_at", f"{run_date}T00:00:00.000Z")
-        .lte("fetched_at", f"{run_date}T23:59:59.999Z")
+        supabase.table(TABLE)
+        .select("id", count="exact")
+        .eq("cluster_id", cluster_id)
+        .limit(1)
         .execute()
     )
-    return resp.data or []
+    return resp.count or 0
 
 
-def _call_week_continuity(articles: list[dict], week_names: list[str]) -> dict[str, list[str]]:
+# ---------------------------------------------------------------------------
+# Claude calls
+# ---------------------------------------------------------------------------
+
+def _build_candidate_block(candidates: list[dict]) -> str:
+    lines = []
+    for i, c in enumerate(candidates, 1):
+        n = c.get("article_count") or 1
+        line = (
+            f'[{i}] ({n} article{"s" if n != 1 else ""}, last updated {c.get("date")}) '
+            f'{(c.get("name") or "").strip()}'
+        )
+        description = (c.get("description") or "").strip()
+        if description:
+            line += f" — {description}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _call_continuation(articles: list[dict], candidates: list[dict]) -> dict[int, list]:
     """
-    Call 1: assign articles to ongoing week stories.
-    Returns {week_name: [article_ids]}.
-    Only returns matches — articles not mentioned are not continuing any week story.
+    Call 1: match today's articles against existing stories.
+    Returns {candidate_index: [article_ids]} with indexes already range-checked.
+    Only matches are returned — anything not mentioned is not continuing a tracked story.
     """
-    article_lines = "\n".join(
-        f'id: {a["id"]} | {a["title"]} — {(a.get("summary") or "").strip()}'
-        for a in articles
-    )
-    names_block = "\n".join(f"  - {n}" for n in week_names)
+    story_block = _build_candidate_block(candidates)
+    merged: dict[int, list] = {}
 
-    prompt = "\n".join([
-        "You are an editorial assistant for Curve Media.",
-        "These stories have been running earlier this week:",
-        "",
-        names_block,
-        "",
-        "Today's articles:",
-        "",
-        article_lines,
-        "",
-        "For each article that clearly continues one of this week's ongoing stories, assign it.",
-        "Only assign if the article is genuinely reporting on the same ongoing narrative — not just the same broad topic.",
-        "Articles not mentioned will be treated as new stories.",
-        "",
-        'Return JSON only — an array: [{"name": "<exact story name from the list above>", "description": "<10 words summarising the story>", "article_ids": [...]}]',
-        "Return an empty array if nothing clearly continues a weekly story.",
-    ])
+    for start in range(0, len(articles), CONTINUITY_ARTICLE_BATCH):
+        batch = articles[start:start + CONTINUITY_ARTICLE_BATCH]
+        article_lines = "\n".join(
+            f'id: {a["id"]} | {a["title"]} — {(a.get("summary") or "").strip()}'
+            for a in batch
+        )
+        prompt = _CONTINUATION_PROMPT.format(
+            story_block=story_block, article_lines=article_lines
+        )
+        try:
+            data = _call_claude_json(
+                None, prompt, CONTINUITY_MAX_TOKENS, "Story continuation",
+                _CONTINUATION_SCHEMA, "continuations",
+            )
+        except Exception as exc:
+            # Degrade to "nothing continues" for this batch — those articles simply flow
+            # into the new-clustering pass. Same failure posture as the old week pass.
+            logger.warning("Continuation call failed (batch at %d): %s", start, exc)
+            continue
 
-    try:
-        data = _call_claude_groups(None, prompt, WEEK_MAX_TOKENS, "Week continuity")
-        week_name_set = set(week_names)
-        result: dict[str, tuple[list[str], str]] = {}
         for item in data:
-            name = (item.get("name") or "").strip()
-            description = (item.get("description") or "").strip()
+            try:
+                idx = int(item.get("story_index"))
+            except (TypeError, ValueError):
+                logger.warning("Continuation: dropping non-integer story_index %r",
+                               item.get("story_index"))
+                continue
             ids = item.get("article_ids") or []
-            if name in week_name_set and ids:
-                result[name] = (ids, description)
-        return result
-    except Exception as exc:
-        logger.warning("Week continuity call failed: %s", exc)
-        return {}
+            if not ids:
+                continue
+            if 1 <= idx <= len(candidates):
+                merged.setdefault(idx, []).extend(ids)  # same story twice → merge
+            else:
+                logger.warning("Continuation: dropping out-of-range story_index %d", idx)
+    return merged
 
 
 def _call_new_clustering(articles: list[dict], system_prompt: str) -> list[dict]:
@@ -211,6 +418,67 @@ def _call_new_clustering(articles: list[dict], system_prompt: str) -> list[dict]
         return []
 
 
+# ---------------------------------------------------------------------------
+# DB write
+# ---------------------------------------------------------------------------
+
+def _extend_cluster(supabase, candidate: dict, article_ids: list, target_date: str) -> int:
+    """
+    Append article_ids to an existing story: repoint the articles, recount, bump the
+    cluster's date to the run date and reset it to 'pending' so score → tag → research →
+    brief all re-process it.
+
+    Returns the new article_count, or 0 if the cluster was not claimed (no longer open) —
+    in which case NOTHING was written and the caller must let those articles fall through
+    to the new-clustering pass.
+    """
+    cluster_id = candidate["cluster_id"]
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    # Never bump a story's date backwards. run_clustering defaults to *yesterday* while
+    # the scheduler passes *today*, so a manual backfill (--date 2026-07-20) must not
+    # yank a live story out of today's Admin view.
+    new_date = max(candidate.get("date") or target_date, target_date)
+
+    # Claim first, articles second. The status filter re-checks eligibility at write time
+    # (the Claude call sits between the SELECT and here, so an operator could have briefed
+    # or published the story in between), and claiming before we touch news_articles means
+    # a refused claim leaves no half-moved articles behind.
+    #
+    # This is a deliberate DEMOTION (researched → pending) — the only one in the codebase.
+    # research._advance_clusters_to_researched explicitly never demotes and must not start.
+    claimed = (
+        supabase.table(CLUSTERS_TABLE)
+        .update({
+            "date":            new_date,
+            "cluster_status":  "pending",
+            "last_article_at": now_iso,
+            "weekly_story":    (candidate.get("name") or "").strip().lower() or None,
+        })
+        .eq("cluster_id", cluster_id)
+        .in_("cluster_status", OPEN_STATUSES)
+        .is_("published_at", "null")
+        .eq("ready_for_content", False)
+        .execute()
+    )
+    if not (claimed.data or []):
+        logger.info("Continuation: cluster %s no longer open — skipping extension",
+                    cluster_id)
+        return 0
+
+    supabase.table(TABLE).update({"cluster_id": cluster_id}).in_("id", article_ids).execute()
+    count = _count_cluster_articles(supabase, cluster_id)
+    supabase.table(CLUSTERS_TABLE).update({"article_count": count}) \
+        .eq("cluster_id", cluster_id).execute()
+
+    logger.info(
+        "Extended story '%s' (%s): +%d article(s) → %d total, date %s → %s",
+        candidate.get("name"), cluster_id, len(article_ids), count,
+        candidate.get("date"), new_date,
+    )
+    return count
+
+
 def run_clustering(run_date: str | None = None) -> None:
     target_date = run_date or (date.today() - timedelta(days=1)).isoformat()
     logger.info("Clustering started for %s", target_date)
@@ -220,96 +488,105 @@ def run_clustering(run_date: str | None = None) -> None:
 
     articles = _fetch_included_articles(target_date)
     if not articles:
-        logger.info("Clustering: no included articles to process")
+        logger.info("Clustering: no unclustered included articles to process")
         return
 
     logger.info("Clustering %d articles", len(articles))
-    articles_by_id = {a["id"]: a for a in articles}
     # Claude may echo ids back as ints or strings — match on the string form and
     # map back to the DB-typed id.
     id_lookup = {str(a["id"]): a["id"] for a in articles}
-    assigned_ids: set[str] = set()
+    assigned_ids: set = set()
+    supabase = get_client()
 
-    # (name, article_ids, description, is_week_continuation)
-    final_clusters: list[tuple[str, list[str], str, bool]] = []
-
-    # ── Call 1: week continuity ──────────────────────────────────────────────
-    week_names = _fetch_week_names(target_date)
-    if week_names:
-        logger.info("Checking %d articles against %d week stories", len(articles), len(week_names))
-        week_assignments = _call_week_continuity(articles, week_names)
-        for name, (ids, description) in week_assignments.items():
-            valid_ids = [id_lookup[str(i)] for i in ids if str(i) in id_lookup]
-            if valid_ids:
-                final_clusters.append((name, valid_ids, description, True))
-                assigned_ids.update(valid_ids)
-        logger.info(
-            "Week continuity: %d articles → %d ongoing stories",
-            sum(len(ids) for ids, _ in week_assignments.values()),
-            len(week_assignments),
-        )
+    # ── Call 1: extend existing stories ──────────────────────────────────────
+    # Extensions are written before Call 2 runs, so articles whose target cluster failed
+    # to claim can still be picked up as a new story below.
+    candidates = _fetch_open_clusters(target_date)
+    extended_articles = 0
+    extended_stories = 0
+    if candidates:
+        logger.info("Continuation: %d articles against %d open stories",
+                    len(articles), len(candidates))
+        matches = _call_continuation(articles, candidates)
+        # Sorted by candidate index, and candidates are relevance-ranked — so when Claude
+        # assigns one article to two stories (it does, despite the prompt saying at most
+        # one) the higher-scoring story wins, deterministically. Dropping the id_lookup
+        # filter is not an option either: Claude also invents article ids that were never
+        # in the prompt, and repointing an unrelated article would be silent corruption.
+        for idx in sorted(matches):
+            valid = list(dict.fromkeys(
+                id_lookup[str(i)] for i in matches[idx]
+                if str(i) in id_lookup and id_lookup[str(i)] not in assigned_ids
+            ))
+            dropped = len(matches[idx]) - len(valid)
+            if dropped:
+                logger.info("Continuation: story '%s' — dropped %d unknown/already-assigned id(s)",
+                            candidates[idx - 1].get("name"), dropped)
+            if not valid:
+                continue
+            if _extend_cluster(supabase, candidates[idx - 1], valid, target_date):
+                assigned_ids.update(valid)
+                extended_articles += len(valid)
+                extended_stories += 1
+        logger.info("Continuation: %d article(s) appended to %d existing stories",
+                    extended_articles, extended_stories)
     else:
-        logger.info("No earlier stories this week — skipping week continuity pass")
+        logger.info("No open stories in the last %d days — skipping continuation pass",
+                    LOOKBACK_DAYS)
 
     # ── Call 2: new clustering ───────────────────────────────────────────────
     remaining = [a for a in articles if a["id"] not in assigned_ids]
+    new_clusters: list[tuple[str, list, str]] = []
     if remaining:
         logger.info("New clustering: grouping %d remaining articles", len(remaining))
-        new_groups = _call_new_clustering(remaining, cluster_prompt)
-        for group in new_groups:
+        for group in _call_new_clustering(remaining, cluster_prompt):
             name = (group.get("name") or "").strip()
             description = (group.get("description") or "").strip()
-            ids = [
+            ids = list(dict.fromkeys(
                 id_lookup[str(i)] for i in (group.get("article_ids") or [])
                 if str(i) in id_lookup and id_lookup[str(i)] not in assigned_ids
-            ]
+            ))
             if name and len(ids) >= 2:
-                final_clusters.append((name, ids, description, False))
+                new_clusters.append((name, ids, description))
                 assigned_ids.update(ids)
 
     singletons = [a for a in articles if a["id"] not in assigned_ids]
 
-    # ── DB write ─────────────────────────────────────────────────────────────
-    supabase = get_client()
+    # ── DB write: brand-new clusters ─────────────────────────────────────────
+    now_iso = datetime.now(timezone.utc).isoformat()
 
-    for name, ids, description, is_continuation in final_clusters:
+    for name, ids, description in new_clusters:
         cluster_id = str(uuid.uuid4())
-        weekly_story = name.strip().lower() if is_continuation else None
-
         supabase.table(CLUSTERS_TABLE).insert({
-            "cluster_id":     cluster_id,
-            "date":           target_date,
-            "name":           name,
-            "description":    description or None,
-            "weekly_story":   weekly_story,
-            "article_count":  len(ids),
-            "cluster_status": "pending",
+            "cluster_id":      cluster_id,
+            "date":            target_date,
+            "name":            name,
+            "description":     description or None,
+            # Deprecated by migration 031 — written only so any Admin query that still
+            # selects it keeps returning data. A running story is one row now.
+            "weekly_story":    name.strip().lower(),
+            "article_count":   len(ids),
+            "cluster_status":  "pending",
+            "last_article_at": now_iso,
         }).execute()
         supabase.table(TABLE).update({"cluster_id": cluster_id}).in_("id", ids).execute()
-
-        if weekly_story:
-            supabase.table(CLUSTERS_TABLE)\
-                .update({"weekly_story": weekly_story})\
-                .eq("name", name)\
-                .is_("weekly_story", "null")\
-                .execute()
 
     for a in singletons:
         cluster_id = str(uuid.uuid4())
         supabase.table(CLUSTERS_TABLE).insert({
-            "cluster_id":     cluster_id,
-            "date":           target_date,
-            "name":           a.get("title", ""),
-            "description":    a.get("summary") or None,
-            "article_count":  1,
-            "cluster_status": "pending",
+            "cluster_id":      cluster_id,
+            "date":            target_date,
+            "name":            a.get("title", ""),
+            "description":     a.get("summary") or None,
+            "article_count":   1,
+            "cluster_status":  "pending",
+            "last_article_at": now_iso,
         }).execute()
         supabase.table(TABLE).update({"cluster_id": cluster_id}).eq("id", a["id"]).execute()
 
     logger.info(
-        "Clustering complete — %d articles → %d clusters (%d multi, %d singletons)",
-        len(articles),
-        len(final_clusters) + len(singletons),
-        len(final_clusters),
-        len(singletons),
+        "Clustering complete — %d articles: %d appended to %d existing stories, "
+        "%d new clusters, %d singletons",
+        len(articles), extended_articles, extended_stories,
+        len(new_clusters), len(singletons),
     )

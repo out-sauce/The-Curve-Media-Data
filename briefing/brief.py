@@ -40,12 +40,37 @@ def _fetch_briefable_clusters(run_date: str) -> list[dict[str, Any]]:
     client = get_client()
     response = (
         client.table(CLUSTERS_TABLE)
-        .select("id, cluster_id, brief")
+        .select("id, cluster_id, brief, briefed_at, last_article_at")
         .eq("cluster_status", "researched")
         .eq("date", run_date)
         .execute()
     )
     return response.data or []
+
+
+def _brief_is_current(cluster: dict[str, Any]) -> bool:
+    """
+    True when the cluster's brief already covers everything in it.
+
+    The clustering stage stamps last_article_at every time a cluster is created or
+    EXTENDED with a later day's coverage (migration 031), so comparing it against
+    briefed_at is what lets an extended story be re-briefed while an unchanged one keeps
+    the idempotent re-run skip. Legacy rows (last_article_at NULL, pre-031) and any
+    unparseable timestamp are treated as current — i.e. the pre-031 skip behaviour.
+    """
+    last = cluster.get("last_article_at")
+    briefed = cluster.get("briefed_at")
+    if not last:
+        return True
+    if not briefed:
+        return False
+    try:
+        return (
+            datetime.fromisoformat(str(briefed).replace("Z", "+00:00"))
+            >= datetime.fromisoformat(str(last).replace("Z", "+00:00"))
+        )
+    except Exception:
+        return True
 
 
 def _fetch_cluster_articles(cluster_id: str) -> list[dict[str, Any]]:
@@ -180,7 +205,9 @@ def run_briefing(run_date: str | None = None) -> None:
 
     For each researched cluster that has at least one article with a deep
     summary:
-      1. Skip clusters that already have a brief (idempotent re-runs)
+      1. Skip clusters whose brief is already current — i.e. they have a brief and
+         have not gained articles since it was written (idempotent re-runs; an
+         extended story is re-briefed)
       2. Fetch all cluster articles
       3. Skip the cluster if no article has a non-empty deep_summary
       4. Generate brief via Claude (tov_doc as system prompt)
@@ -210,8 +237,10 @@ def run_briefing(run_date: str | None = None) -> None:
         cluster_id = cluster["cluster_id"]
 
         # Status stays 'researched' after briefing, so a re-run would otherwise
-        # re-brief clusters that already have one. Skip those.
-        if (cluster.get("brief") or "").strip():
+        # re-brief clusters that already have one. Skip those — unless the story has
+        # gained articles since the brief was written (continuation, migration 031),
+        # in which case the existing brief no longer covers the whole story.
+        if (cluster.get("brief") or "").strip() and _brief_is_current(cluster):
             skipped += 1
             continue
 

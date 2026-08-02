@@ -46,6 +46,68 @@ triggers stages over HTTP.
 
 ## Recent changes
 
+- **Story continuation — a running story is now ONE cluster row that grows.** The old
+  "week continuity" pass matched today's articles against the *names* of clusters created
+  earlier this week and then minted a **brand-new `story_clusters` row per day** sharing
+  that name, correlated only by the lowercase `weekly_story` slug. `clustering/cluster.py`
+  now **extends the existing row in place**: `_fetch_open_clusters` offers Claude the open
+  stories from a **rolling 7 days** (`article_count >= 2`; plus `article_count = 1`
+  singletons from the last **3** days only — a full week of headline-named singletons is
+  what snowballed the old prompt to ~1000 "week stories" over 2026-07-21→23). Candidates
+  are gated at `relevance_score >= CANDIDATE_MIN_SCORE` (0.5) and **ordered by score, not
+  by date**, with separate caps (150 multi + 50 singleton): the window holds ~480
+  multi-article clusters and ~700 singletons, so a date-ordered cap spends its whole
+  budget on the most recent day and the 7-day window becomes fiction — score-ordering
+  makes trimming cost the least relevant story instead of the oldest one, and everything
+  is already scored by the time a prior day's cluster is a candidate.
+  `_call_continuation` returns a **1-based candidate index** (not the uuid — cheaper and a
+  mangled uuid would silently drop the match) plus article_ids, under its own
+  `_CONTINUATION_SCHEMA`; matches are applied in index order, so when Claude assigns one
+  article to two stories (**it does**, despite the prompt) the higher-scoring story wins
+  deterministically, and ids Claude invents (**it does that too**) are dropped by the
+  `id_lookup` filter. `_extend_cluster` **claims the cluster first** (a single UPDATE
+  re-filtered on `cluster_status in (pending,scored,researched)` + `published_at IS NULL`
+  + `ready_for_content = false`, closing the race where an operator promotes the story
+  during the Claude call), then repoints the articles and recomputes
+  `article_count` with a **`count="exact"` COUNT**, never a read-then-increment.
+  **`story_clusters.date` is no longer immutable** — an extended story's date is bumped
+  forward (never backwards: `max(candidate.date, target_date)`, so a `--date` backfill
+  can't yank a live story out of today's view), which is what makes every downstream
+  `.eq("date", run_date)` stage pick it up again unchanged; `created_at` is the origin
+  day. The cluster is reset to `pending`, so score → tag → research → brief all re-run —
+  the **only** deliberate demotion in the codebase (`_advance_clusters_to_researched`
+  still never demotes). Research only scrapes the new articles (its `scrape_status IS
+  NULL/'failed'` filter already handles that). `briefed`/`archived`/`ready_for_content`
+  clusters are never extended, so the content studio's manual output is untouchable.
+  **The live `cluster_status` enum is `(pending, scored, researched, ready_for_content,
+  archived, briefed)`** — migration 021's header still lists `scoring`/`accepted`/
+  `rejected`/`published` but the type was since recreated without them, and passing a
+  non-existent label makes PostgREST reject the **whole** query, so never add one to a
+  status filter. (`custom_clustering/custom_cluster.py` still writes `'rejected'` and is
+  therefore broken if ever revived.) `ready_for_content` exists both as a status and as a
+  separate boolean column; both block extension.
+  **Re-briefing** is driven by a new `last_article_at` column (migration 031, stamped on
+  every create *and* extend): `run_briefing` skips a cluster only when its brief is
+  **current** (`_brief_is_current` — `briefed_at >= last_article_at`; NULL/unparseable
+  = current, i.e. pre-031 behaviour), so an extended story re-briefs while an unchanged
+  one keeps the idempotent skip. Two pre-existing bugs became load-bearing and are fixed
+  in the same change: `_fetch_included_articles` now filters `cluster_id IS NULL` (without
+  it a second run re-extends today's own clusters and mints duplicate rows that leave
+  zero-article ghosts) and **paginates** (the 1000-row PostgREST cap was silently dropping
+  the tail of big days); and `reset_date.py` — whose article-side UPDATE filtered
+  `status in ('accepted','briefed','published')` and therefore **matched zero rows**,
+  since clustering leaves articles at `included` — now drives off `cluster_id` and splits
+  the date's clusters into **born** (created that day → detach all articles, delete) vs
+  **extended** (grew into that day → detach only that day's articles, recount, roll `date`
+  back to `created_at`, delete only if empty), with a `--dry-run`. Deleting an extended
+  cluster by date would otherwise orphan the earlier days' articles forever.
+  `weekly_story` is **deprecated** — still written as `lower(name)` for Admin back-compat,
+  but the unbounded name-keyed backfill UPDATE is gone and nothing should group by it.
+  **Admin app (separate repo) must be checked:** any query listing a story's articles by a
+  `fetched_at` window instead of `.eq('cluster_id', …)` will now under-report, `date` and
+  `created_at` diverge for running stories, and per-day `article_count` no longer sums to
+  the day's ingest.
+
 - **Cluster status semantics tightened (scored / researched / briefed).** A cluster
   only advances to `researched` when **at least one of its articles has a non-NULL
   `scrape_status`** (any value — scraped/paywalled/bot_wall/failed all count; NULL means
