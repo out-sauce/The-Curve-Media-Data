@@ -57,9 +57,14 @@ logger = logging.getLogger(__name__)
 SITE_AUTH_TABLE = "site_auth"
 SCRAPE_SETTINGS_TABLE = "domain_scrape_settings"
 QUEUE_TABLE = "research_queue"
-# An automated scrape returning one of these means the batch cannot get this domain with
-# the login — demote it to manual so a hostile publisher is not hit again (see run_research).
-DEMOTE_STATUSES = {"bot_wall", "paywalled"}
+# An automated scrape returning one of these means the batch is a RISK to the account on
+# this domain — demote it to manual so a hostile publisher is not hit again (see
+# run_research). Only 'bot_wall' qualifies: an anti-bot/CAPTCHA wall means the traffic was
+# flagged as automated, and tying that to a paid login risks suspension. 'paywalled' is
+# NOT a risk — it just means we lack a subscription (or the session lapsed); the read was
+# served normally, so there is nothing to back away from and demoting on it would strand
+# perfectly safe domains in the manual lane.
+DEMOTE_STATUSES = {"bot_wall"}
 
 CLUSTERS_TABLE = "story_clusters"
 MODEL = "claude-sonnet-4-6"
@@ -425,8 +430,9 @@ def run_research(run_date: str | None = None) -> None:
         failed     += status == "failed"
         summarised += did_summarise
 
-        # Wall hit on an automated read → demote the domain and skip its remaining
-        # articles this run, so we don't send the login to it again.
+        # Bot wall hit on an automated read → the login is now attached to traffic a
+        # detector flagged, so demote the domain and skip its remaining articles this
+        # run. A paywall does not demote: it is a subscription gap, not an account risk.
         if domain and status in DEMOTE_STATUSES:
             _demote_domain(domain, status, datetime.now(timezone.utc).isoformat())
             demoted.add(domain)

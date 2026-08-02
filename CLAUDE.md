@@ -94,9 +94,13 @@ triggers stages over HTTP.
   per-**registrable-domain** policy lives in `domain_scrape_settings` (`scrape_mode` =
   `auto`|`manual`, keyed like `site_auth.domain`/`sources.site_auth_domain`, default
   `auto`). `run_research` scrapes `auto` domains and skips `manual` ones; the first time an
-  automated scrape returns `bot_wall` or `paywalled` it **auto-demotes** the domain to
-  `manual` (`_demote_domain`), so a hostile publisher is hit with the login **at most
-  once**. `bloomberg.com` is seeded `manual`. Toggle via `POST /sources/scrape-mode?domain=&mode=`
+  automated scrape returns **`bot_wall`** it **auto-demotes** the domain to
+  `manual` (`_demote_domain`, `DEMOTE_STATUSES`), so a hostile publisher is hit with the
+  login **at most once**. `paywalled` does **not** demote — it means we lack a subscription
+  (or the session lapsed), the read was served normally, and nothing flagged us as a bot, so
+  there is no account risk to back away from. (It did demote until 2026-08-02, which
+  stranded `ft.com`, `bbc.co.uk` and `economist.com` in the manual lane — `bbc.co.uk` has no
+  paywall at all, so that one was a pure misdetection.) `bloomberg.com` is seeded `manual`. Toggle via `POST /sources/scrape-mode?domain=&mode=`
   (Admin Sources page). A new `bot_wall` scrape status distinguishes an anti-bot/CAPTCHA
   wall from a subscription paywall — `research/browser_scraper.py` detects it (`_is_bot_wall`)
   and also strips PerimeterX `_px*`/`pxcts` cookies (`_strip_bot_cookies`) before rendering;
