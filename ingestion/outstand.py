@@ -57,6 +57,7 @@ from config import (
     OUTSTAND_IMPORT_LIMIT,
     OUTSTAND_IMPORT_POLL_TIMEOUT_SEC,
     OUTSTAND_INITIAL_BACKFILL_DAYS,
+    OUTSTAND_INITIAL_BACKFILL_LIMIT,
     COMPETITOR_POST_LIMIT,
     COMPETITOR_LOOKBACK_DAYS,
     SELF_CONTENT_STATS_LOOKBACK_DAYS,
@@ -137,15 +138,29 @@ def _fetch_account_metrics(outstand_account_id: str) -> dict:
 
 def _list_posts(outstand_account_id: str) -> list[dict]:
     """GET /posts?social_account_id=... — every post Outstand currently knows about
-    for this account (imported organic posts + anything published through Outstand)."""
-    payload = _get("/posts", params={"social_account_id": outstand_account_id})
-    return payload.get("data") or payload.get("posts") or []
+    for this account (imported organic posts + anything published through Outstand).
+    Paginates (default page size 50) — live-checked 2026-08-06: total=91 but a single
+    unpaginated call only returned 50, silently truncating everything older, which is
+    exactly what caused the initial-backfill gap to look "fixed" at the import layer
+    but still be missing from content_stats."""
+    posts: list[dict] = []
+    offset = 0
+    while True:
+        payload = _get("/posts", params={"social_account_id": outstand_account_id, "offset": offset})
+        page = payload.get("data") or payload.get("posts") or []
+        posts.extend(page)
+        pagination = payload.get("pagination") or {}
+        total = pagination.get("total")
+        if not page or total is None or len(posts) >= total:
+            break
+        offset += len(page)
+    return posts
 
 
-def _start_import(outstand_account_id: str, since: datetime) -> str | None:
+def _start_import(outstand_account_id: str, since: datetime, limit: int) -> str | None:
     payload = _post(
         f"/social-accounts/{outstand_account_id}/imports",
-        {"since": _iso_z(since), "limit": OUTSTAND_IMPORT_LIMIT},
+        {"since": _iso_z(since), "limit": limit},
     )
     job = payload.get("data") or {}
     return job.get("id")
@@ -173,10 +188,10 @@ def _wait_for_import(outstand_account_id: str, import_id: str) -> dict:
     return job
 
 
-def _import_new_posts(outstand_account_id: str, since: datetime) -> None:
+def _import_new_posts(outstand_account_id: str, since: datetime, limit: int) -> None:
     """Kick off and wait (bounded) for an incremental import job. Best-effort — a
     failure here just means this run's post list won't include anything new."""
-    import_id = _start_import(outstand_account_id, since)
+    import_id = _start_import(outstand_account_id, since, limit)
     if not import_id:
         return
     job = _wait_for_import(outstand_account_id, import_id)
@@ -302,7 +317,12 @@ def _run_account(platform: str, account: dict, competitor_id: str | None) -> Non
 
         watermark = _parse_dt(account.get("last_imported_at"))
         since = watermark or (datetime.now(timezone.utc) - timedelta(days=OUTSTAND_INITIAL_BACKFILL_DAYS))
-        _import_new_posts(outstand_account_id, since)
+        # No watermark yet = first-ever run for this account: the import endpoint
+        # returns the MOST RECENT posts within [since, now], not a chronological page,
+        # so a small limit here would silently truncate to only the newest few and
+        # never reach the rest of the target window (see OUTSTAND_INITIAL_BACKFILL_LIMIT).
+        import_limit = OUTSTAND_INITIAL_BACKFILL_LIMIT if watermark is None else OUTSTAND_IMPORT_LIMIT
+        _import_new_posts(outstand_account_id, since, import_limit)
 
         posts = _list_posts(outstand_account_id)
 

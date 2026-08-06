@@ -35,14 +35,22 @@ APIFY_TIKTOK_TRANSCRIPT_ACTOR    = os.getenv("APIFY_TIKTOK_TRANSCRIPT_ACTOR",   
 OUTSTAND_API_KEY = os.getenv("OUTSTAND_API_KEY", "")
 OUTSTAND_ORG_ID = os.getenv("OUTSTAND_ORG_ID", "")
 OUTSTAND_API_BASE = os.getenv("OUTSTAND_API_BASE", "https://api.outstand.so/v1")
-# Cap per incremental import call — the endpoint bills per post, so keep this bounded;
-# the watermark (social_accounts.outstand_last_imported_at) keeps each call's `since`
-# window small in practice.
+# Cap per incremental import call (steady-state, once a watermark exists) — the
+# endpoint bills per post, so keep this bounded; the watermark
+# (social_accounts.outstand_last_imported_at) keeps each call's `since` window small
+# in practice, so a handful of new posts per run is always enough.
 OUTSTAND_IMPORT_LIMIT = int(os.getenv("OUTSTAND_IMPORT_LIMIT", 20))
 # Only used the first time an account is seen (no watermark yet) — matches
 # SELF_CONTENT_STATS_LOOKBACK_DAYS so the one-off backfill doesn't under-cover
 # what the retired Apify self-Instagram scrape used to feed content_stats.
 OUTSTAND_INITIAL_BACKFILL_DAYS = int(os.getenv("OUTSTAND_INITIAL_BACKFILL_DAYS", 90))
+# The import endpoint returns the MOST RECENT posts within [since, now], not a
+# chronological page from `since` forward — so a small limit on the one-time initial
+# backfill silently truncates to only the newest few posts and never reaches the rest
+# of the 90-day window (confirmed live: a 20-post limit against 90 days of history
+# left everything older than ~3 weeks with no data, permanently, since the watermark
+# then advances past the gap). Outstand's own limit ceiling is 1000.
+OUTSTAND_INITIAL_BACKFILL_LIMIT = int(os.getenv("OUTSTAND_INITIAL_BACKFILL_LIMIT", 500))
 # Import jobs are observed to sit at status="running" indefinitely rather than ever
 # flipping to "completed" for small backfills, and appear to serialize one-at-a-time
 # per account — so polling must be bounded, not wait for "completed".
