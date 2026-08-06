@@ -13,7 +13,8 @@ or both. For each channel present on the row it:
   4. writes the per-platform stat columns back onto the competitors row.
 
 The single is_self ("The Curve") competitor additionally has its posts upserted into
-content_stats (deduped on (platform, post_id)) over a wider window.
+content_stats (deduped on (platform, post_id)) over a wider window — EXCEPT Instagram,
+which ingestion/outstand.py now owns entirely (real OAuth Insights, retired here).
 
 Reuses the existing Apify plumbing (ingestion/apify.run_actor) and APIFY_TOKEN /
 actor-id config — it does NOT touch the news flow or news_articles.
@@ -451,10 +452,18 @@ def _resolve_channels(competitor: dict) -> list[dict]:
     Resolve the channels present on a competitor row to a list of
     {"platform", "handle"} — instagram if it carries an instagram handle/url,
     tiktok likewise. The handle comes from *_handle, falling back to parsing *_url.
+
+    The is_self ("The Curve") row's Instagram channel is deliberately excluded —
+    ingestion/outstand.py is now the sole source for it (real OAuth Insights via
+    Outstand, retired the Apify public scrape for that one channel). Competitor
+    Instagram tracking is unaffected; Outstand can't reach accounts we don't own.
     """
     channels = []
-    # Instagram + TikTok (unchanged)
+    is_self = bool(competitor.get("is_self"))
+    # Instagram + TikTok
     for platform in ("instagram", "tiktok"):
+        if is_self and platform == "instagram":
+            continue
         raw_handle = (competitor.get(f"{platform}_handle") or "").lstrip("@").strip()
         handle = raw_handle or _handle_from_url(competitor.get(f"{platform}_url"))
         if handle:

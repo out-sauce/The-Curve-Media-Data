@@ -1,9 +1,14 @@
 """
-Scheduler — runs the full daily pipeline at 5am UTC.
+Scheduler — runs the full daily pipeline at 5am UTC, plus a separate hourly job.
 
-Single job:
+Jobs:
   05:00 UTC daily → ingest → filter → cluster → score → tag → research → brief
   (+ competitors, Mondays only)
+  hourly (every :00) → Outstand self-Instagram Insights refresh (ingestion/outstand.py)
+  — kept off the daily job because it needs its own cadence: account-metrics/per-post
+  analytics are cheap reads worth refreshing often, but the underlying incremental
+  import step is billed per post and watermark-gated, so hourly here does not mean
+  hourly full re-imports.
 """
 
 import logging
@@ -20,6 +25,7 @@ from tagging.tag import run_tagging
 from research.research import run_research
 from briefing.brief import run_briefing
 from ingestion.competitors import run_competitors
+from ingestion.outstand import run_outstand_hourly
 
 logger = logging.getLogger(__name__)
 
@@ -82,5 +88,11 @@ def start_scheduler() -> None:
         id="daily_pipeline",
         replace_existing=True,
     )
-    logger.info("Scheduler started — daily pipeline runs at 05:00 UTC")
+    scheduler.add_job(
+        run_outstand_hourly,
+        CronTrigger(minute=0, timezone="UTC"),
+        id="outstand_hourly",
+        replace_existing=True,
+    )
+    logger.info("Scheduler started — daily pipeline at 05:00 UTC, Outstand refresh hourly")
     scheduler.start()

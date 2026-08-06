@@ -246,10 +246,14 @@ def upsert_competitor_posts(rows: list[dict[str, Any]]) -> int:
 # engagement_rate need migration 025's columns. Keys absent from the live table are
 # dropped, and None values are skipped on update, so a scrape that lacks a field
 # never clobbers what the admin/analytics populated (reach/downloads/watch time/…).
+# reach/impressions/accounts_engaged/total_interactions/platform_specific are
+# owner-only Insights the Apify scrape never fills — real values only come from an
+# authenticated source (Outstand), see migrations 025 and 033.
 _CONTENT_STATS_FIELDS = (
     "post_url", "posted_at", "views", "likes", "comments", "shares", "saves",
     "caption", "hashtags", "duration_sec",
     "engagement_rate", "engagement_reach", "engagement_audience",
+    "reach", "impressions", "accounts_engaged", "total_interactions", "platform_specific",
     "transcript",
 )
 
@@ -349,6 +353,52 @@ def get_self_social_accounts() -> dict[str, str]:
     for row in response.data or []:
         accounts.setdefault(row["platform"], row["id"])
     return accounts
+
+
+def get_self_competitor_id() -> str | None:
+    """Return the id of the is_self ('The Curve') competitors row, if any — used by
+    ingestion/outstand.py to write instagram_* stat columns / competitor_posts rows
+    that Apify's self-Instagram scrape used to own."""
+    client = get_client()
+    response = client.table("competitors").select("id").eq("is_self", True).limit(1).execute()
+    return response.data[0]["id"] if response.data else None
+
+
+def get_outstand_connected_accounts() -> dict[str, dict[str, Any]]:
+    """
+    Return {platform: {social_account_id, outstand_account_id, last_imported_at}}
+    for self channels the Admin app has connected through Outstand (account_id set,
+    connected=true — the same generic OAuth columns the Xero integration uses).
+    """
+    client = get_client()
+    response = (
+        client.table("social_accounts")
+        .select("id, platform, account_id, outstand_last_imported_at, connected")
+        .in_("platform", ["instagram", "tiktok", "linkedin", "youtube"])
+        .eq("connected", True)
+        .not_.is_("account_id", "null")
+        .execute()
+    )
+    accounts: dict[str, dict[str, Any]] = {}
+    for row in response.data or []:
+        accounts.setdefault(row["platform"], {
+            "social_account_id": row["id"],
+            "outstand_account_id": row["account_id"],
+            "last_imported_at": row.get("outstand_last_imported_at"),
+        })
+    return accounts
+
+
+def update_outstand_watermark(social_account_id: str, last_imported_at: str) -> None:
+    """
+    Advance the incremental-import watermark. Never call with an earlier timestamp
+    than what's stored — Outstand's import endpoint bills per post and does not
+    dedupe overlapping `since` windows, so this must only move forward.
+    """
+    client = get_client()
+    client.table("social_accounts").update(
+        {"outstand_last_imported_at": last_imported_at}
+    ).eq("id", social_account_id).execute()
 
 
 def upsert_follower_snapshot(

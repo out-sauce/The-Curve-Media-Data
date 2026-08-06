@@ -24,6 +24,30 @@ APIFY_YOUTUBE_SHORTS_ACTOR       = os.getenv("APIFY_YOUTUBE_SHORTS_ACTOR",      
 APIFY_INSTAGRAM_TRANSCRIPT_ACTOR = os.getenv("APIFY_INSTAGRAM_TRANSCRIPT_ACTOR", "apple_yang~instagram-transcripts-scraper")
 APIFY_TIKTOK_TRANSCRIPT_ACTOR    = os.getenv("APIFY_TIKTOK_TRANSCRIPT_ACTOR",    "scrape-creators~best-tiktok-transcripts-scraper")
 
+# Outstand (outstand.so) — OAuth-connected self-account Insights (real shares/saves/
+# reach/accounts_engaged, which Apify's public IG scrape can never provide). Account
+# connection happens in the Admin app; this pipeline only reads social_accounts.account_id
+# (populated there) and pulls analytics. Sole source for self Instagram (Apify's
+# self-Instagram scrape is retired — see ingestion/competitors.py's _resolve_channels);
+# competitor Instagram tracking is unaffected and stays on Apify. Content_stats/
+# competitor_posts window sizing reuses the existing SELF_CONTENT_STATS_*/COMPETITOR_*
+# constants below rather than introducing parallel ones.
+OUTSTAND_API_KEY = os.getenv("OUTSTAND_API_KEY", "")
+OUTSTAND_ORG_ID = os.getenv("OUTSTAND_ORG_ID", "")
+OUTSTAND_API_BASE = os.getenv("OUTSTAND_API_BASE", "https://api.outstand.so/v1")
+# Cap per incremental import call — the endpoint bills per post, so keep this bounded;
+# the watermark (social_accounts.outstand_last_imported_at) keeps each call's `since`
+# window small in practice.
+OUTSTAND_IMPORT_LIMIT = int(os.getenv("OUTSTAND_IMPORT_LIMIT", 20))
+# Only used the first time an account is seen (no watermark yet) — matches
+# SELF_CONTENT_STATS_LOOKBACK_DAYS so the one-off backfill doesn't under-cover
+# what the retired Apify self-Instagram scrape used to feed content_stats.
+OUTSTAND_INITIAL_BACKFILL_DAYS = int(os.getenv("OUTSTAND_INITIAL_BACKFILL_DAYS", 90))
+# Import jobs are observed to sit at status="running" indefinitely rather than ever
+# flipping to "completed" for small backfills, and appear to serialize one-at-a-time
+# per account — so polling must be bounded, not wait for "completed".
+OUTSTAND_IMPORT_POLL_TIMEOUT_SEC = int(os.getenv("OUTSTAND_IMPORT_POLL_TIMEOUT_SEC", 45))
+
 # Maximum articles to keep per source per run (0 = no limit)
 MAX_ARTICLES_PER_SOURCE = int(os.getenv("MAX_ARTICLES_PER_SOURCE", 50))
 

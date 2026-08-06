@@ -51,6 +51,7 @@ from research.site_auth import (
     start_login,
 )
 from ingestion.competitors import run_competitors
+from ingestion.outstand import run_outstand_hourly
 from ingestion.storage import get_client
 from research.domains import registrable_domain
 
@@ -186,6 +187,17 @@ def run_competitors_endpoint(background_tasks: BackgroundTasks, id: str | None =
     """
     _check_key(x_api_key)
     background_tasks.add_task(run_competitors, id)
+    return {"status": "started"}
+
+
+@app.post("/run/outstand")
+def run_outstand_endpoint(background_tasks: BackgroundTasks, x_api_key: str = Header(default="")):
+    """
+    Run the Outstand self-account Insights refresh on demand — same as the hourly
+    scheduled job. Pilot scope: Instagram only.
+    """
+    _check_key(x_api_key)
+    background_tasks.add_task(run_outstand_hourly)
     return {"status": "started"}
 
 
