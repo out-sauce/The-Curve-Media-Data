@@ -209,6 +209,7 @@ def _fetch_post_analytics_row(post: dict, outstand_account_id: str, platform: st
             "post_id": entry.get("platform_post_id") or post["id"],
             "post_url": entry.get("platform_post_url"),
             "posted_at": entry.get("published_at") or post.get("publishedAt"),
+            "caption": _extract_caption(post),
             "views": views,
             "likes": metrics.get("likes"),
             "comments": metrics.get("comments"),
