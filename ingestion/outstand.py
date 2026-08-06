@@ -49,7 +49,7 @@ import logging
 import time
 from datetime import datetime, timedelta, timezone
 
-import requests
+import httpx
 
 from config import (
     OUTSTAND_API_KEY,
@@ -88,13 +88,13 @@ def _headers() -> dict:
 
 
 def _get(path: str, params: dict | None = None) -> dict:
-    resp = requests.get(f"{OUTSTAND_API_BASE}{path}", headers=_headers(), params=params, timeout=30)
+    resp = httpx.get(f"{OUTSTAND_API_BASE}{path}", headers=_headers(), params=params, timeout=30)
     resp.raise_for_status()
     return resp.json()
 
 
 def _post(path: str, payload: dict) -> dict:
-    resp = requests.post(f"{OUTSTAND_API_BASE}{path}", headers=_headers(), json=payload, timeout=30)
+    resp = httpx.post(f"{OUTSTAND_API_BASE}{path}", headers=_headers(), json=payload, timeout=30)
     resp.raise_for_status()
     return resp.json()
 
