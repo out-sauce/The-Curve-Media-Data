@@ -401,18 +401,36 @@ def update_outstand_watermark(social_account_id: str, last_imported_at: str) -> 
     ).eq("id", social_account_id).execute()
 
 
+# Keys of Outstand's account-metrics `engagement` block → follower_snapshots
+# `*_30d` columns (migration 034). Trailing ~30-day rolling totals, NOT daily
+# activity — adjacent daily rows overlap by ~29 days, so never SUM or diff them.
+_ENGAGEMENT_30D_KEYS = (
+    "views", "likes", "comments", "shares", "saves",
+    "reach", "accounts_engaged", "total_interactions",
+)
+
+
 def upsert_follower_snapshot(
-    social_account_id: str, platform: str, follower_count: int
+    social_account_id: str, platform: str, follower_count: int,
+    engagement_30d: dict | None = None,
 ) -> None:
     """
     Record one follower snapshot for a self channel, one row per UTC day: update
     today's row in place if present, else insert. Builds a clean daily growth series
     across re-runs (manual refreshes won't create duplicate same-day rows).
+
+    engagement_30d, when given (Outstand-connected channels only), is the account
+    metrics `engagement` block; its values land in the *_30d columns. Omitted keys
+    are not written, so an Apify-flow update never blanks an Outstand-written value.
     """
     from datetime import datetime, timezone
     client = get_client()
     now = datetime.now(timezone.utc)
     day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    values: dict = {"follower_count": follower_count, "recorded_at": now.isoformat()}
+    for key in _ENGAGEMENT_30D_KEYS:
+        if engagement_30d and engagement_30d.get(key) is not None:
+            values[f"{key}_30d"] = engagement_30d[key]
     existing = (
         client.table("follower_snapshots")
         .select("id")
@@ -423,15 +441,12 @@ def upsert_follower_snapshot(
         .execute()
     )
     if existing.data:
-        client.table("follower_snapshots").update(
-            {"follower_count": follower_count, "recorded_at": now.isoformat()}
-        ).eq("id", existing.data[0]["id"]).execute()
+        client.table("follower_snapshots").update(values).eq("id", existing.data[0]["id"]).execute()
     else:
         client.table("follower_snapshots").insert({
             "social_account_id": social_account_id,
             "platform": platform,
-            "follower_count": follower_count,
-            "recorded_at": now.isoformat(),
+            **values,
         }).execute()
 
 

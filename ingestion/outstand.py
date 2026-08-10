@@ -11,7 +11,9 @@ accounts we don't own.
 Writes everything the retired self-Instagram Apify channel used to, so nothing
 downstream regresses:
   - content_stats (real Insights, not the old proxy/null fields)
-  - follower_snapshots + social_accounts.follower_count
+  - follower_snapshots + social_accounts.follower_count (plus the account-level
+    trailing-30-day engagement aggregate into the *_30d columns, migration 034 —
+    rolling-window totals, never SUM/diff across days)
   - competitors.instagram_{avatar_url,follower_count,post_count,engagement_rate} +
     competitor_posts (the leaderboard/comparison card Admin renders The Curve's row
     alongside competitors in) — skipped if no is_self competitors row exists.
@@ -312,7 +314,12 @@ def _run_account(platform: str, account: dict, competitor_id: str | None) -> Non
         metrics = _fetch_account_metrics(outstand_account_id)
         follower_count = metrics.get("followers_count")
         if follower_count is not None:
-            upsert_follower_snapshot(social_account_id, platform, follower_count)
+            # engagement block = trailing ~30-day rolling totals (period.since/until),
+            # stored in follower_snapshots *_30d columns (migration 034).
+            upsert_follower_snapshot(
+                social_account_id, platform, follower_count,
+                engagement_30d=metrics.get("engagement"),
+            )
             update_social_account_follower_count(social_account_id, follower_count)
 
         watermark = _parse_dt(account.get("last_imported_at"))

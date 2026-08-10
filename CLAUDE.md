@@ -46,6 +46,21 @@ triggers stages over HTTP.
 
 ## Recent changes
 
+- **`follower_snapshots` now carries Outstand's account-level engagement aggregate.**
+  The hourly Outstand run fetched `GET /social-accounts/{id}/metrics` and threw the
+  `engagement` block away; migration 034 adds nullable `views_30d / likes_30d /
+  comments_30d / shares_30d / saves_30d / reach_30d / accounts_engaged_30d /
+  total_interactions_30d` columns and `upsert_follower_snapshot` writes them when the
+  caller passes `engagement_30d` (only `ingestion/outstand.py` does; the Apify flow in
+  `competitors.py` passes nothing and never blanks Outstand-written values — omitted
+  keys are simply not written). **These are trailing ~30-day rolling-window totals**
+  (the payload's `period.since/until`), not daily activity: adjacent daily rows overlap
+  by ~29 days, so charting the trend is fine but never SUM rows or diff two days to get
+  a daily figure. Non-Outstand channels (Apify TikTok/LinkedIn/YouTube snapshots) and
+  pre-034 rows leave them NULL. Outstand has **no audience-demographics endpoint**
+  (live-probed 2026-08-10: `/audience`/`/insights`/`/demographics` all 404) — age/
+  gender/geo would need a direct Meta Graph API integration, not Outstand.
+
 - **Story continuation — a running story is now ONE cluster row that grows.** The old
   "week continuity" pass matched today's articles against the *names* of clusters created
   earlier this week and then minted a **brand-new `story_clusters` row per day** sharing
