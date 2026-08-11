@@ -137,7 +137,10 @@ def store_competitor_image(url: str | None, path: str) -> str | None:
             return None
         content_type = (resp.headers.get("content-type") or "image/jpeg").split(";")[0].strip()
         if not content_type.startswith("image/"):
-            content_type = "image/jpeg"
+            # e.g. an Outstand reel whose media URL is the mp4 itself — storing video
+            # bytes under a .jpg path renders as a broken image, worse than nothing.
+            logger.warning("Skipping non-image content (%s) for %s", content_type, path)
+            return None
     except Exception as exc:
         logger.warning("Could not download competitor image %s: %s", url, str(exc)[:200])
         return None

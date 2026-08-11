@@ -47,20 +47,27 @@ triggers stages over HTTP.
 ## Recent changes
 
 - **`content_stats` rows now carry a post thumbnail** (migration 035, nullable
-  `thumbnail_url`). The Outstand hourly run persists each in-window post's first media
-  image (`containers[0].media[0].url`) into the `competitor-thumbnails` bucket at the
-  **same** deterministic path the competitor card uses (`posts/{platform}_{post_id}.jpg`)
-  — one stored object backs both `competitor_posts.thumbnail_url` and
+  `thumbnail_url`). The Outstand hourly run persists each post's first media image
+  (`containers[0].media[0].url` — the only media fields are `url`/`filename`, no
+  separate thumbnail) into the `competitor-thumbnails` bucket at the **same**
+  deterministic path the competitor card uses (`posts/{platform}_{post_id}.jpg`) — one
+  stored object backs both `competitor_posts.thumbnail_url` and
   `content_stats.thumbnail_url`. `_attach_thumbnails` skips posts whose content_stats
-  row already has a thumbnail (so the 90-day window isn't re-downloaded every hour) and
-  `_write_competitor_card` reuses the stamped URL instead of downloading again. For
-  video posts the stored image may be a video frame, not a curated cover — "something
-  to show" is the bar. The Apify self flow (`competitors.py`) passes the card-window
-  posts' persisted thumbnails into its content_stats rows too; self posts older than
-  the 14-day card window get None there (skip-None never blanks a stored value).
-  Pre-035 the field is filtered out by `_content_stats_column_set()` and the
-  existing-thumbnail lookup returns `{}` with a warning — deploy order doesn't matter,
-  but note the column set is **cached per process**, so apply the migration before (or
+  row already has a thumbnail and `_write_competitor_card` reuses the stamped URL
+  instead of downloading again. **Outstand's media URLs are signed IG CDN links that
+  expire within days** (live-verified 2026-08-11: a 90-day backfill 403'd on all but
+  the 2 newest posts), so thumbnails are **forward-only** — captured while a post is
+  fresh; posts older than `_THUMBNAIL_FETCH_MAX_AGE_DAYS` (14) are never attempted
+  since their URLs are guaranteed dead and hourly retries would be pure churn. For
+  reels the media URL may be the **mp4 itself**; `store_competitor_image` now rejects
+  non-image content-types (video bytes under a .jpg path render as a broken image) and
+  returns None. Historical gap: 38 pre-Outstand rows were backfilled one-off (2026-08-11
+  SQL, joining `competitor_posts.thumbnail_url` on trimmed `post_url` — old Apify rows
+  share URLs but not post-id format); ~100 older rows have no recoverable image short
+  of an Apify re-scrape. The Apify self flow (`competitors.py`) passes the card-window
+  posts' persisted thumbnails into its content_stats rows too (skip-None never blanks
+  a stored value). Pre-035 the field is filtered out by `_content_stats_column_set()`
+  — but the column set is **cached per process**, so apply the migration before (or
   with) the deploy that restarts the service.
 
 - **`follower_snapshots` now carries Outstand's account-level engagement aggregate.**

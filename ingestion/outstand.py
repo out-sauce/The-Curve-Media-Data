@@ -85,6 +85,9 @@ _RUN_CATEGORY = "outstand"
 _PILOT_PLATFORMS = ("instagram",)  # scope: Instagram only for the pilot
 _POLL_INTERVAL_SEC = 5
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+# Outstand media URLs are signed IG CDN links that expire within days — only
+# attempt thumbnail downloads for posts young enough that the URL can be live.
+_THUMBNAIL_FETCH_MAX_AGE_DAYS = 14
 
 
 def _headers() -> dict:
@@ -255,20 +258,29 @@ def _attach_thumbnails(platform: str, in_window: list[dict], analytics: dict[str
     and stamp the public URL onto the analytics row for content_stats. Posts that
     already have a content_stats thumbnail are skipped, so the hourly run doesn't
     re-download the whole 90-day window; a failed fetch leaves None, which the
-    skip-None update ignores and the next run retries. For video posts the first
-    media item may be a video frame — an image to show is the bar, not a curated
-    cover. Best-effort throughout (store_competitor_image never raises)."""
+    skip-None update ignores and the next run retries while the post is still
+    fresh. Outstand's media URLs are signed Instagram CDN links that expire after
+    a few days (live-verified 2026-08-11: the 90-day backfill 403'd on all but the
+    2 newest posts), so posts older than _THUMBNAIL_FETCH_MAX_AGE_DAYS are never
+    attempted — their URLs are guaranteed dead and retrying them hourly is pure
+    churn. Thumbnails therefore only accrue forward, captured while each post is
+    new. For reels the media URL may be the mp4 itself; store_competitor_image
+    rejects non-image content, leaving None. Best-effort throughout (it never
+    raises)."""
     existing = get_existing_content_stats_thumbnails(
         platform, [row["post_id"] for row in analytics.values()]
     )
     posts_by_id = {p.get("id"): p for p in in_window}
+    fetch_cutoff = datetime.now(timezone.utc) - timedelta(days=_THUMBNAIL_FETCH_MAX_AGE_DAYS)
     for outstand_id, row in analytics.items():
         thumb = existing.get(row["post_id"])
         if not thumb:
-            thumb = store_competitor_image(
-                _extract_media_url(posts_by_id.get(outstand_id) or {}),
-                f"posts/{platform}_{row['post_id']}.jpg",
-            )
+            post = posts_by_id.get(outstand_id) or {}
+            if (_parse_dt(post.get("publishedAt")) or _EPOCH) >= fetch_cutoff:
+                thumb = store_competitor_image(
+                    _extract_media_url(post),
+                    f"posts/{platform}_{row['post_id']}.jpg",
+                )
         row["thumbnail_url"] = thumb
 
 
