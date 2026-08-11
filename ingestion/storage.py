@@ -181,6 +181,33 @@ def get_existing_post_thumbnails(
     return {row["post_id"]: row.get("thumbnail_url") for row in (response.data or [])}
 
 
+def get_existing_content_stats_thumbnails(
+    platform: str, post_ids: list[str]
+) -> dict[str, str | None]:
+    """
+    Return {post_id: thumbnail_url} for already-stored content_stats rows, so the
+    hourly Outstand run only downloads/persists an image for posts that don't have
+    one yet — the 90-day content_stats window would otherwise re-fetch every post's
+    image every hour. Returns {} pre-migration-035 (selecting the missing column
+    errors) — harmless, the write path filters the field out then too.
+    """
+    if not post_ids:
+        return {}
+    client = get_client()
+    try:
+        response = (
+            client.table("content_stats")
+            .select("post_id, thumbnail_url")
+            .eq("platform", platform)
+            .in_("post_id", post_ids)
+            .execute()
+        )
+    except Exception as exc:
+        logger.warning("Could not read existing content_stats thumbnails: %s", str(exc)[:200])
+        return {}
+    return {row["post_id"]: row.get("thumbnail_url") for row in (response.data or [])}
+
+
 def get_existing_post_transcripts(
     competitor_id: str, post_ids: list[str]
 ) -> dict[str, str]:
@@ -254,7 +281,7 @@ _CONTENT_STATS_FIELDS = (
     "caption", "hashtags", "duration_sec",
     "engagement_rate", "engagement_reach", "engagement_audience",
     "reach", "impressions", "accounts_engaged", "total_interactions", "platform_specific",
-    "transcript",
+    "transcript", "thumbnail_url",
 )
 
 _content_stats_columns: set[str] | None = None

@@ -74,6 +74,7 @@ from ingestion.storage import (
     update_competitor_stats,
     upsert_competitor_posts,
     get_existing_post_thumbnails,
+    get_existing_content_stats_thumbnails,
     store_competitor_image,
     log_source_run,
 )
@@ -248,6 +249,29 @@ def _fetch_post_analytics_row(post: dict, outstand_account_id: str, platform: st
     return None
 
 
+def _attach_thumbnails(platform: str, in_window: list[dict], analytics: dict[str, dict]) -> None:
+    """Persist each post's first media image into the competitor-thumbnails bucket
+    (posts/{platform}_{post_id}.jpg — the same object the competitor card writes)
+    and stamp the public URL onto the analytics row for content_stats. Posts that
+    already have a content_stats thumbnail are skipped, so the hourly run doesn't
+    re-download the whole 90-day window; a failed fetch leaves None, which the
+    skip-None update ignores and the next run retries. For video posts the first
+    media item may be a video frame — an image to show is the bar, not a curated
+    cover. Best-effort throughout (store_competitor_image never raises)."""
+    existing = get_existing_content_stats_thumbnails(
+        platform, [row["post_id"] for row in analytics.values()]
+    )
+    posts_by_id = {p.get("id"): p for p in in_window}
+    for outstand_id, row in analytics.items():
+        thumb = existing.get(row["post_id"])
+        if not thumb:
+            thumb = store_competitor_image(
+                _extract_media_url(posts_by_id.get(outstand_id) or {}),
+                f"posts/{platform}_{row['post_id']}.jpg",
+            )
+        row["thumbnail_url"] = thumb
+
+
 def _write_competitor_card(competitor_id: str, platform: str, posts: list[dict],
                             analytics: dict[str, dict], metrics: dict) -> int:
     """
@@ -272,9 +296,10 @@ def _write_competitor_card(competitor_id: str, platform: str, posts: list[dict],
     engagements = []
     for post, row in selected_rows:
         post_id = row["post_id"]
-        thumbnail_url = store_competitor_image(_extract_media_url(post), f"posts/{platform}_{post_id}.jpg")
-        if thumbnail_url is None:
-            thumbnail_url = existing_thumbs.get(post_id)
+        # _attach_thumbnails already persisted this post's image (same storage
+        # path) and stamped the row; fall back to the prior competitor_posts value
+        # so a failed fetch never blanks an existing thumbnail.
+        thumbnail_url = row.get("thumbnail_url") or existing_thumbs.get(post_id)
         likes, comments = row.get("likes"), row.get("comments")
         post_rows.append({
             "competitor_id": competitor_id,
@@ -351,6 +376,7 @@ def _run_account(platform: str, account: dict, competitor_id: str | None) -> Non
                 analytics[post["id"]] = row
 
         if analytics:
+            _attach_thumbnails(platform, in_window, analytics)
             content_rows_written = upsert_self_content_stats(list(analytics.values()))
 
         if competitor_id:

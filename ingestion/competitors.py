@@ -659,6 +659,10 @@ def _run_channel(competitor_id, name: str, platform: str, handle: str, is_self: 
     # content_stats over a wider window (decoupled from the card cap).
     if is_self:
         _snapshot_self_follower(stats_key, follower_count)
+        # Reuse the thumbnails persisted for the card rows above; posts outside the
+        # 14-day card window get None, and the skip-None update never blanks a
+        # thumbnail content_stats already has.
+        card_thumbs = {row["post_id"]: row["thumbnail_url"] for row in rows}
         self_cutoff = now - timedelta(days=SELF_CONTENT_STATS_LOOKBACK_DAYS)
         for dt, post in normalised:
             if dt < self_cutoff:
@@ -691,6 +695,7 @@ def _run_channel(competitor_id, name: str, platform: str, handle: str, is_self: 
                 "engagement_reach": engagement_reach,
                 "engagement_audience": engagement_audience,
                 "transcript": transcripts.get(post["post_id"]),
+                "thumbnail_url": card_thumbs.get(post["post_id"]),
             })
 
     logger.info(
