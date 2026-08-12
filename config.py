@@ -133,6 +133,17 @@ COMPETITOR_LOOKBACK_DAYS = int(os.getenv("COMPETITOR_LOOKBACK_DAYS", 14))
 # public URL back into the *_avatar_url / thumbnail_url columns.
 COMPETITOR_THUMBNAILS_BUCKET = os.getenv("COMPETITOR_THUMBNAILS_BUCKET", "competitor-thumbnails")
 
+# Guest posts (ingestion/guest_posts.py) — calendar items posted from a GUEST's own
+# account (content_calendar_items.social_kind = 'guest' in the admin app). The guest
+# may or may not be a tracked competitor, so their stats come from one Apify run per
+# post URL rather than any profile scrape. The daily sweep only re-scrapes posts whose
+# publish_date falls within this window; the admin's on-demand refresh ignores it.
+GUEST_POST_LOOKBACK_DAYS = int(os.getenv("GUEST_POST_LOOKBACK_DAYS", 90))
+# LinkedIn single-post actor (the profile actor above can't take a post URL).
+# Verified live (2026-08-12): takes {"post_urls": [url-or-id, ...]}, no cookies.
+# Set empty to disable LinkedIn guest scrapes (items log a warning and skip).
+APIFY_LINKEDIN_POST_ACTOR = os.getenv("APIFY_LINKEDIN_POST_ACTOR", "apimaestro~linkedin-post-detail")
+
 # The is_self ("The Curve") competitor additionally feeds content_stats. That feed
 # uses a wider window than the competitor card: a larger per-channel fetch and a
 # separate (longer) lookback applied only to the content_stats post set. The

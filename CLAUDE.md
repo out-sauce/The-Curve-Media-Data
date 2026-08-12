@@ -46,6 +46,31 @@ triggers stages over HTTP.
 
 ## Recent changes
 
+- **Guest-post stats — one Apify run per post URL** (`ingestion/guest_posts.py`).
+  The admin's Content Calendar can hold posts published from a GUEST's own account
+  (`content_calendar_items.social_kind = 'guest'`, admin-side migration); the guest
+  may or may not be a tracked competitor, so no profile scrape covers them. New
+  `POST /run/guest-post-stats?id=<calendar_item_id>` (id = the drawer's "Refresh
+  stats"; omitted = sweep every guest item with a `post_url` whose `publish_date`
+  is within `GUEST_POST_LOOKBACK_DAYS`, default 90) — the sweep also runs daily
+  after the competitors stage (`scheduler.run_daily_pipeline`). Single-post actor
+  inputs, all verified live 2026-08-12: IG `apify~instagram-api-scraper`
+  `{"directUrls":[url],"resultsType":"posts"}` (post items directly — the
+  `latestPosts` normalisers apply); TikTok `clockworks~tiktok-scraper`
+  `{"postURLs":[url]}`; YouTube `streamers~youtube-scraper` `{"startUrls":
+  [{"url":url}]}` (a /shorts/ URL works and stays platform `youtube`); LinkedIn
+  needs a DIFFERENT actor from the profile run — new `APIFY_LINKEDIN_POST_ACTOR`
+  (default `apimaestro~linkedin-post-detail`, `{"post_urls":[url]}`, its own
+  normaliser: `post.id`/`stats.total_reactions`/`created_at.timestamp` in **ms**).
+  Rows reuse the competitor normalisers + `store_competitor_image` (same
+  deterministic thumbnail path) and are written via `upsert_self_content_stats`,
+  which now accepts `calendar_item_id` per row — set on insert, **fill-only-if-null
+  on update** (an existing admin link is never stolen; rows without the key behave
+  exactly as before). The link must travel with the write because the admin's URL
+  auto-linking only runs on item saves. `engagement_audience` stays None — a lone
+  post carries no follower count. Failures follow the competitor pattern: per-item
+  `logger.warning` + continue, one `source_runs` row (category `guest_post`) per run.
+
 - **`content_stats` rows now carry a post thumbnail** (migration 035, nullable
   `thumbnail_url`). The Outstand hourly run persists each post's first media image
   (`containers[0].media[0].url` — the only media fields are `url`/`filename`, no

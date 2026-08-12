@@ -338,6 +338,12 @@ def upsert_self_content_stats(rows: list[dict[str, Any]]) -> int:
     null). On update, None values are skipped so an absent field (e.g. Instagram
     shares/saves) never clobbers an existing value. Returns the number of rows
     written. Best-effort per row — one failure never aborts the rest.
+
+    calendar_item_id is handled explicitly (never via _CONTENT_STATS_FIELDS): a row
+    may carry it (the guest-post scrape, ingestion/guest_posts.py — its stats can
+    never auto-link to The Curve's own scrape, so the link travels with the write).
+    It lands on insert, and on update only fills a NULL — an existing admin/human
+    link is never overwritten. Rows without the key behave exactly as before.
     """
     if not rows:
         return 0
@@ -353,10 +359,11 @@ def upsert_self_content_stats(rows: list[dict[str, Any]]) -> int:
         if not platform or not post_id:
             continue
         scraped = {k: row.get(k) for k in allowed}
+        calendar_item_id = row.get("calendar_item_id")
         try:
             existing = (
                 client.table("content_stats")
-                .select("id")
+                .select("id, calendar_item_id")
                 .eq("platform", platform)
                 .eq("post_id", post_id)
                 .limit(1)
@@ -365,6 +372,8 @@ def upsert_self_content_stats(rows: list[dict[str, Any]]) -> int:
             if existing.data:
                 # Skip None so a missing field never blanks an existing value.
                 changed = {k: v for k, v in scraped.items() if v is not None}
+                if calendar_item_id and not existing.data[0].get("calendar_item_id"):
+                    changed["calendar_item_id"] = calendar_item_id
                 client.table("content_stats").update(
                     {**changed, "stats_synced_at": now_iso, "updated_at": now_iso}
                 ).eq("id", existing.data[0]["id"]).execute()
@@ -372,7 +381,7 @@ def upsert_self_content_stats(rows: list[dict[str, Any]]) -> int:
                 client.table("content_stats").insert({
                     "platform": platform,
                     "post_id": post_id,
-                    "calendar_item_id": None,
+                    "calendar_item_id": calendar_item_id,
                     "stats_synced_at": now_iso,
                     **scraped,
                 }).execute()
@@ -382,7 +391,7 @@ def upsert_self_content_stats(rows: list[dict[str, Any]]) -> int:
                 "Could not upsert content_stats row (%s/%s): %s",
                 platform, post_id, str(exc)[:200],
             )
-    logger.info("Upserted %d is_self posts into content_stats", written)
+    logger.info("Upserted %d posts into content_stats", written)
     return written
 
 

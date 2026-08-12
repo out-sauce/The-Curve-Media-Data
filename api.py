@@ -51,6 +51,7 @@ from research.site_auth import (
     start_login,
 )
 from ingestion.competitors import run_competitors
+from ingestion.guest_posts import run_guest_post_stats
 from ingestion.outstand import run_outstand_hourly
 from ingestion.storage import get_client
 from research.domains import registrable_domain
@@ -187,6 +188,20 @@ def run_competitors_endpoint(background_tasks: BackgroundTasks, id: str | None =
     """
     _check_key(x_api_key)
     background_tasks.add_task(run_competitors, id)
+    return {"status": "started"}
+
+
+@app.post("/run/guest-post-stats")
+def run_guest_post_stats_endpoint(background_tasks: BackgroundTasks, id: str | None = None, x_api_key: str = Header(default="")):
+    """
+    Scrape public stats for guest-post calendar items (the admin's
+    content_calendar_items rows with social_kind='guest') — one Apify run per
+    post URL, since a guest's account isn't covered by the profile scrapes.
+    Pass ?id=<calendar_item_id> for the admin drawer's "Refresh stats"; omit
+    it to sweep every guest post inside GUEST_POST_LOOKBACK_DAYS (the daily job).
+    """
+    _check_key(x_api_key)
+    background_tasks.add_task(run_guest_post_stats, id)
     return {"status": "started"}
 
 

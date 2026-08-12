@@ -25,6 +25,7 @@ from tagging.tag import run_tagging
 from research.research import run_research
 from briefing.brief import run_briefing
 from ingestion.competitors import run_competitors
+from ingestion.guest_posts import run_guest_post_stats
 from ingestion.outstand import run_outstand_hourly
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,8 @@ def run_daily_pipeline() -> None:
       8. Social scan — The Curve's own channels (is_self) every day, so follower
          snapshots and content_stats stay daily; the full competitor sweep runs
          Mondays only (manual /run/competitors is unaffected).
+      9. Guest posts — per-post-URL Apify scrape for calendar items posted from
+         a guest's own account (social_kind='guest'), within the lookback window.
     """
     from datetime import date
     today = date.today().isoformat()
@@ -77,6 +80,7 @@ def run_daily_pipeline() -> None:
     else:
         logger.info("Full competitor sweep skipped — runs weekly on Mondays; scanning own channels only")
         _run("competitors", run_competitors, self_only=True)
+    _run("guest_posts",  run_guest_post_stats)
     logger.info("=== Daily pipeline complete ===")
 
 
