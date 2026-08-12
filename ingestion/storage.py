@@ -120,6 +120,22 @@ _IMAGE_HEADERS = {
 }
 
 
+# The content-type header alone is not enough: nine pre-guard reel videos
+# reached the bucket as .jpg and rendered as broken images in the Admin
+# (repaired 2026-08-12 by re-encoding a frame of each in place), and a CDN can
+# mislabel a payload either way — so the bytes themselves get the final say.
+def _looks_like_image(data: bytes) -> bool:
+    if data.startswith((b"\xff\xd8", b"\x89PNG", b"GIF8")):
+        return True
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return True
+    # ISO-BMFF (ftyp) covers both avif images and mp4 video — admit only the
+    # image brands so a reel's mp4 can't slip through.
+    if data[4:8] == b"ftyp" and data[8:12] in (b"avif", b"avis", b"heic", b"heix", b"mif1"):
+        return True
+    return False
+
+
 def store_competitor_image(url: str | None, path: str) -> str | None:
     """
     Download a competitor avatar/thumbnail from its (expiring) CDN URL and re-upload
@@ -140,6 +156,11 @@ def store_competitor_image(url: str | None, path: str) -> str | None:
             # e.g. an Outstand reel whose media URL is the mp4 itself — storing video
             # bytes under a .jpg path renders as a broken image, worse than nothing.
             logger.warning("Skipping non-image content (%s) for %s", content_type, path)
+            return None
+        if not _looks_like_image(data):
+            # Header said image/* but the bytes disagree (mislabelled mp4/HTML
+            # error page) — same broken-image outcome, so same skip.
+            logger.warning("Skipping mislabelled non-image bytes (%s) for %s", content_type, path)
             return None
     except Exception as exc:
         logger.warning("Could not download competitor image %s: %s", url, str(exc)[:200])
