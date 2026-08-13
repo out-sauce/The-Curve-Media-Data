@@ -65,6 +65,7 @@ from config import (
     SELF_CONTENT_STATS_LOOKBACK_DAYS,
 )
 from ingestion.storage import (
+    get_follower_snapshot_history,
     get_outstand_connected_accounts,
     get_self_competitor_id,
     update_outstand_watermark,
@@ -140,6 +141,34 @@ def _fetch_account_metrics(outstand_account_id: str) -> dict:
     """GET /social-accounts/{id}/metrics — account-level Insights aggregate."""
     payload = _get(f"/social-accounts/{outstand_account_id}/metrics")
     return payload.get("data") or {}
+
+
+_follower_history: dict[str, list[tuple[str, int]]] = {}
+
+
+def _followers_at(platform: str, published_at: str | None) -> int | None:
+    """
+    Follower count from the latest follower_snapshots row on or before the post date.
+
+    engagement_audience is defined as interactions / followers-AT-TIME, so an older
+    post must not be divided by today's audience (we grew from ~45.3k in April to
+    ~48.7k in August, which would understate every older post). Loaded once per
+    process and reused; falls back to the earliest snapshot for a post that predates
+    our history, and returns None when we have no snapshots for the platform at all.
+    """
+    if platform not in _follower_history:
+        rows = get_follower_snapshot_history(platform)
+        _follower_history[platform] = [
+            (str(recorded)[:10], count) for recorded, count in rows
+        ]
+    history = _follower_history[platform]
+    if not history:
+        return None
+    if not published_at:
+        return history[-1][1]
+    stamp = str(published_at)[:10]
+    prior = [count for day, count in history if day <= stamp]
+    return prior[-1] if prior else history[0][1]
 
 
 def _list_posts(outstand_account_id: str) -> list[dict]:
@@ -225,6 +254,9 @@ def _fetch_post_analytics_row(post: dict, outstand_account_id: str, platform: st
             + (metrics.get("shares") or 0) + (metrics.get("saves") or 0)
         )
         views = metrics.get("views")
+        reach = metrics.get("reach")
+        published_at = entry.get("published_at") or post.get("publishedAt")
+        followers = _followers_at(platform, published_at)
         return {
             "platform": platform,
             "post_id": entry.get("platform_post_id") or post["id"],
@@ -236,15 +268,35 @@ def _fetch_post_analytics_row(post: dict, outstand_account_id: str, platform: st
             "comments": metrics.get("comments"),
             "shares": metrics.get("shares"),
             "saves": metrics.get("saves"),
-            "reach": metrics.get("reach"),
+            "reach": reach,
             # Outstand's own engagement_rate is on a percent-like scale (e.g. 7.78),
             # NOT the 0-1 fraction convention engagement_reach/engagement_audience use
             # below — stored as-is (the real source value); see instagram_engagement_
             # rate on competitors, which is deliberately recomputed to match that
             # fraction convention instead, for apples-to-apples brand comparison.
             "engagement_rate": metrics.get("engagement_rate"),
+            # engagement_reach is interactions / VIEWS despite the name (migration
+            # 026's proxy, kept because it's the only engagement figure every source
+            # can produce). engagement_on_reach is the real thing — interactions over
+            # the unique accounts that saw the post. Outstand is the ONLY source that
+            # gives us reach, so it's the only writer here; both stay 0-1 fractions.
             "engagement_reach": round(interactions / views, 6) if views else None,
-            "engagement_audience": None,  # per-post follower-at-time isn't available
+            # reach < interactions is impossible (an account can't interact without
+            # being reached), so treat it as a broken denominator and store nothing
+            # rather than a >100% rate. It bit the backfill: a YouTube row carried an
+            # admin-entered reach of 8 against 201 views and 10 interactions.
+            "engagement_on_reach": (
+                round(interactions / reach, 6)
+                if reach and reach >= interactions
+                else None
+            ),
+            # interactions / followers-at-time. Outstand's payload has no follower
+            # count per post, but follower_snapshots is our own daily series, so the
+            # denominator comes from there rather than being left unset.
+            "engagement_audience": (
+                round(interactions / followers, 6)
+                if followers and interactions else None
+            ),
             "accounts_engaged": None,
             "total_interactions": interactions or None,
             "platform_specific": metrics.get("platform_specific"),

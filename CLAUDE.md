@@ -46,6 +46,106 @@ triggers stages over HTTP.
 
 ## Recent changes
 
+- **A true engagement rate on reach** (migration 036, nullable `engagement_on_reach`).
+  Despite its name, `engagement_reach` is interactions / **views** — migration 026's
+  proxy, chosen when reach wasn't available to us — and it stayed that way even after
+  Outstand started handing us real `reach` in the same payload. New
+  `engagement_on_reach` = interactions / reach, a 0-1 fraction like its siblings,
+  written **only by `ingestion/outstand.py`**: reach is an owner-only Meta insight, so
+  the Apify paths can't produce it and Meta doesn't attribute a collab post published
+  from a guest's account to our account either. `engagement_reach` is deliberately
+  **left as-is** rather than redefined — it's the only engagement figure every source
+  can produce, so it remains the cross-source proxy (guest/collab posts and the admin
+  bulk imports have no reach and would otherwise go blank). Prefer
+  `engagement_on_reach` in the UI, fall back to `engagement_reach`.
+  **The two are different questions, not two estimates of one** — `reach` counts unique
+  accounts that saw the post, `views` counts plays including replays (~2.1 plays per
+  reached account across our IG posts), so the reach-based rate runs roughly **2x** the
+  views-based one (97 IG posts backfilled 2026-08-13: median 1.82%, max 10.98%, vs 1.14%
+  average on views). Never plot them on one axis or read one as the other.
+  **`engagement_audience` is now populated by Outstand too** (it previously always wrote
+  None, so no post got an audience rate at all once the Apify self-IG channel was
+  retired). The denominator is **followers-at-time**, from a new
+  `get_follower_snapshot_history()` + `_followers_at()` pair reading our own
+  `follower_snapshots` series (45,280 in April vs 48,691 in August — today's count would
+  understate every older post). So both intended engagement metrics — on reach and on
+  audience — are live for all 97 Outstand-covered posts.
+  A `reach >= interactions` guard gates the write, since an account can't interact
+  without being reached: the backfill initially stamped **125%** on a YouTube row whose
+  `reach` was **8** against 201 views and 10 interactions. That value was *not* from a
+  pipeline writer — `reach` on non-Outstand rows is admin-entered and not necessarily
+  Meta's reach at all, so never assume a non-NULL `reach` is a credible denominator.
+  Per the usual gotcha, `_content_stats_column_set()` caches the column list per
+  process, so 036 must be applied before (or with) the deploy that restarts the service.
+
+- **`likesCount = -1` means Instagram HID the like count** — not an import artefact.
+  `_to_int` (`ingestion/competitors.py`) passed it through, making interactions negative
+  and printing a **negative engagement rate**; it now maps negatives to None (every
+  call site is a non-negative count). Note skip-None cannot *clear* an already-stored
+  -1, so the two affected April rows were nulled by hand along with their engagement
+  columns — comments-only engagement on a hidden-likes post reads as real but isn't.
+  Related: 12 `youtube_shorts` rows have `likes` NULL with engagement computed from
+  comments alone, so those rates are understated; left as-is deliberately (gating
+  engagement on a known like count would blank all 12).
+
+- **Collabs are common, and roughly a third are published from the partner's account.**
+  Ownership was checked live on 41 IG rows (2026-08-13): 16 carry co-authors, of which
+  **7 are owned by another account** (`nzhviva`, `ciara___anne`, `hannahkoumakis` ×3,
+  `francescooknz`, `shityoushouldcareabout`) — several of them tagged
+  `social_kind = 'own'` in the calendar. Consequences for reporting: those rows'
+  likes/views belong to the partner's audience (6 guest-tagged rows alone were 8.3% of
+  all IG likes), and a **sponsored** collab is still a paid deliverable, so it belongs
+  in the sponsor report even though it must not count toward own-channel
+  engagement-vs-followers. Collab posts also enter The Curve's own `competitor_posts`
+  rows and therefore its brand `instagram_engagement_rate`, which is NOT gated —
+  a 2,276-like partner-audience post inflated that figure while inside the 14-day window.
+
+- **IG collab posts: plays-only `views`, and no `engagement_audience`.** Instagram
+  **collab (co-author) posts appear on every co-author's grid**, so The Curve's `is_self`
+  profile scrape returns posts *published from someone else's account* and writes
+  `content_stats` rows for them. Live 2026-08-13, 5 of the 7 IG rows that carried
+  `engagement_audience` were collabs owned by guests (`hannahkoumakis`, `ciara___anne`,
+  `nzhviva`), several of them tagged `social_kind = 'own'` in the calendar — so
+  `social_kind` is **not** a reliable "is this ours" signal; post ownership is.
+  Two fixes in `ingestion/competitors.py`:
+  1. **`views` must be the plays figure.** `videoViewCount` is the legacy 3-second-view
+     metric and is orders of magnitude below the `videoPlayCount` figure Instagram now
+     labels "views" (one reel: 928 vs 62557, against 471 likes). The old
+     `videoViewCount or videoPlayCount` preference stored views *below* likes and pushed
+     `engagement_rate`/`engagement_reach` (interactions ÷ views) over 100%.
+     `_ig_view_count` now takes the **larger** of the two. Crucially the profile
+     scrape's **`latestPosts` items carry `videoViewCount` only — no `videoPlayCount`**
+     (verified live), so a `view_count_is_plays` flag rides along and the `is_self`
+     content_stats path **omits `views` entirely** when the number is the legacy metric;
+     skip-None then preserves Outstand's authoritative hourly value, and guest/collab
+     posts get a real figure from the single-post guest sweep, whose payload does include
+     `videoPlayCount`. `competitor_posts` still stores the legacy number, leaving the
+     cards unchanged. Four rows were re-scraped by URL to correct them (153→24277,
+     406→62557, 1251→28876, 607→39014).
+  2. **`engagement_audience` is only written for posts we published.** It divides by OUR
+     follower count, which means nothing for a post on the owner's account that
+     Instagram delivered to the union of the co-authors' audiences — and no follower
+     count for the owner is available: the post payload has **no follower field at all**
+     (only `ownerUsername`/`ownerId` + a `coauthorProducers` list of usernames), so a
+     guest denominator would need a second details-mode profile run, and
+     followers-at-time can never be reconstructed retrospectively anyway. The
+     `published_by_us` gate (owner == `handle`, no co-authors; owner `None` → assume ours,
+     preserving TikTok/LinkedIn/YouTube behaviour) leaves it None otherwise, and the 5
+     historical values were nulled by hand. `latestPosts` exposes `ownerUsername` but
+     **not** `coauthorProducers`, so a co-authored post of *ours* is indistinguishable
+     from a plain one in the profile scrape — ownership is the signal that always works.
+     **`engagement_reach` (interactions ÷ plays) is the engagement rate to use for
+     guest/collab posts**; it needs no follower count and is comparable with own posts.
+  Also note `content_stats.views` has **three** writers with different provenance —
+  Outstand (authoritative owner insights, also sets `reach`), this Apify path, and
+  admin-side bulk imports (a 2026-08-01 batch, some rows with `likes = -1` and no
+  `post_url`) — so `reach IS NULL` is a rough "not Outstand-enriched" filter, not proof a
+  row came from Apify. Outstand does **not** carry collab posts (checked across
+  2026-07-08→07-25): they are published from the guest's account, so Meta never
+  attributes them to our IG account's insights, and Outstand's `post_id` is an 18-digit
+  media id rather than the Apify format — the same physical post from both sources would
+  land as two rows.
+
 - **Guest-post stats — one Apify run per post URL** (`ingestion/guest_posts.py`).
   The admin's Content Calendar can hold posts published from a GUEST's own account
   (`content_calendar_items.social_kind = 'guest'`, admin-side migration); the guest

@@ -303,7 +303,7 @@ def upsert_competitor_posts(rows: list[dict[str, Any]]) -> int:
 _CONTENT_STATS_FIELDS = (
     "post_url", "posted_at", "views", "likes", "comments", "shares", "saves",
     "caption", "hashtags", "duration_sec",
-    "engagement_rate", "engagement_reach", "engagement_audience",
+    "engagement_rate", "engagement_reach", "engagement_audience", "engagement_on_reach",
     "reach", "impressions", "accounts_engaged", "total_interactions", "platform_specific",
     "transcript", "thumbnail_url",
 )
@@ -459,6 +459,39 @@ def update_outstand_watermark(social_account_id: str, last_imported_at: str) -> 
     client.table("social_accounts").update(
         {"outstand_last_imported_at": last_imported_at}
     ).eq("id", social_account_id).execute()
+
+
+def get_follower_snapshot_history(platform: str) -> list[tuple[str, int]]:
+    """
+    [(recorded_at, follower_count)] for a platform, oldest first, nulls dropped.
+
+    Backs the followers-at-time denominator for engagement_audience — a post must be
+    measured against the audience it had when it published, not today's. Paginated
+    because PostgREST caps a response at 1000 rows and this table grows daily.
+    """
+    client = get_client()
+    history: list[tuple[str, int]] = []
+    page_size = 1000
+    offset = 0
+    while True:
+        response = (
+            client.table("follower_snapshots")
+            .select("recorded_at, follower_count")
+            .eq("platform", platform)
+            .order("recorded_at")
+            .range(offset, offset + page_size - 1)
+            .execute()
+        )
+        rows = response.data or []
+        history.extend(
+            (row["recorded_at"], row["follower_count"])
+            for row in rows
+            if row.get("follower_count") and row.get("recorded_at")
+        )
+        if len(rows) < page_size:
+            break
+        offset += page_size
+    return history
 
 
 # Keys of Outstand's account-metrics `engagement` block → follower_snapshots

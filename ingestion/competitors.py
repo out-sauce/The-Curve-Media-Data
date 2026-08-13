@@ -64,13 +64,23 @@ _RUN_CATEGORY = "competitor"
 
 
 def _to_int(value) -> int | None:
-    """Best-effort coerce an Apify count to int, tolerating None/strings."""
+    """
+    Best-effort coerce an Apify count to int, tolerating None/strings.
+
+    Negatives become None: every caller is a non-negative count (followers, plays,
+    likes, comments, shares, duration), and Instagram returns **likesCount = -1**
+    for a post whose creator has hidden its like count. Passing that through made
+    interactions negative and produced a negative engagement rate in reporting
+    (live: two of our April posts). None = "unknown", which skip-None then keeps
+    out of the stored row instead of writing a fake number.
+    """
     if value is None or value == "":
         return None
     try:
-        return int(value)
+        number = int(value)
     except (TypeError, ValueError):
         return None
+    return number if number >= 0 else None
 
 
 def _parse_dt(iso_value: str | None) -> datetime | None:
@@ -107,6 +117,24 @@ def _ig_posts(items: list[dict]) -> list[dict]:
     return profile.get("latestPosts") or []
 
 
+def _ig_view_count(item: dict) -> int | None:
+    """
+    Instagram plays, from whichever of the actor's two view fields is populated.
+
+    `videoViewCount` is the legacy 3-second-view metric and is wildly lower than
+    the plays figure Instagram now shows as "views" in `videoPlayCount` — live
+    2026-08-13 on a collab reel: videoViewCount 928 vs videoPlayCount 62557 with
+    471 likes. Preferring viewCount put views *below* likes and drove
+    engagement_reach over 100%, so take the larger of the two rather than the
+    first present one (either field can be absent on a given item).
+    """
+    counts = [
+        c for c in (_to_int(item.get("videoPlayCount")), _to_int(item.get("videoViewCount")))
+        if c is not None
+    ]
+    return max(counts) if counts else None
+
+
 def _ig_normalise_post(item: dict) -> dict | None:
     post_id = item.get("id") or item.get("shortCode") or item.get("shortcode")
     short_code = item.get("shortCode") or item.get("shortcode")
@@ -123,13 +151,29 @@ def _ig_normalise_post(item: dict) -> dict | None:
         "published_at": parse_ts(item.get("timestamp")),
         "like_count": _to_int(item.get("likesCount")),
         "comment_count": _to_int(item.get("commentsCount")),
-        "view_count": _to_int(item.get("videoViewCount") or item.get("videoPlayCount")),
+        "view_count": _ig_view_count(item),
+        # True only when the count above is the plays figure. The profile scrape's
+        # `latestPosts` items carry videoViewCount only, so their view_count is the
+        # legacy metric — content_stats declines to store it (see _run_channel);
+        # competitor_posts still does, keeping the cards' numbers as they were.
+        "view_count_is_plays": _to_int(item.get("videoPlayCount")) is not None,
         # Instagram's public scrape does not expose shares/saves (owner-only insights).
         "share_count": None,
         "save_count": None,
         "hashtags": hashtags,
         "duration_sec": _to_int(item.get("videoDuration")),
         "thumbnail_url": item.get("displayUrl") or None,
+        # Who actually published it. A collab post appears on every co-author's grid,
+        # so our own profile scrape returns posts owned by other accounts — see
+        # `published_by_us` in _run_channel. `latestPosts` carries ownerUsername but
+        # NOT coauthorProducers, so a co-authored post of ours is indistinguishable
+        # from a plain one there; ownership is the signal that always works.
+        "owner_username": (item.get("ownerUsername") or "").strip().lower() or None,
+        "coauthor_usernames": [
+            (c.get("username") or "").strip().lower()
+            for c in (item.get("coauthorProducers") or [])
+            if isinstance(c, dict) and c.get("username")
+        ],
     }
 
 
@@ -664,6 +708,7 @@ def _run_channel(competitor_id, name: str, platform: str, handle: str, is_self: 
         # thumbnail content_stats already has.
         card_thumbs = {row["post_id"]: row["thumbnail_url"] for row in rows}
         self_cutoff = now - timedelta(days=SELF_CONTENT_STATS_LOOKBACK_DAYS)
+        self_handle = (handle or "").strip().lstrip("@").lower() or None
         for dt, post in normalised:
             if dt < self_cutoff:
                 continue
@@ -671,13 +716,37 @@ def _run_channel(competitor_id, name: str, platform: str, handle: str, is_self: 
             comments = post["comment_count"]
             shares = post["share_count"]
             saves = post["save_count"]
-            views = post["view_count"]
+            # Only store a view count we know is the plays figure. Instagram's
+            # `latestPosts` payload carries videoViewCount but NOT videoPlayCount, and
+            # the two differ by orders of magnitude, so writing the profile-scrape
+            # number would put a different metric in the same column (and inflate
+            # engagement_reach past 100%). Omitting it lets skip-None keep whatever
+            # Outstand — the authoritative hourly source for our own posts — already
+            # stored; guest/collab posts get theirs from the single-post guest sweep,
+            # whose payload does include videoPlayCount.
+            views = post["view_count"] if post.get("view_count_is_plays", True) else None
             interactions = (likes or 0) + (comments or 0) + (shares or 0) + (saves or 0)
             # engagement_reach = interactions / views (a proxy — true reach/unique-views
             # needs owner analytics). engagement_audience = interactions / followers-at-time.
             # Both stored as fractions (e.g. 0.043 = 4.3%).
             engagement_reach = round(interactions / views, 6) if views else None
-            engagement_audience = round(interactions / follower_count, 6) if follower_count else None
+            # engagement_audience divides by OUR followers, so it only means something
+            # for a post we actually published. Guest/collab posts live on the owner's
+            # account and are merely surfaced on our grid, and Instagram delivered them
+            # to the union of the co-authors' audiences — no single follower count is
+            # the right denominator, and we hold none for the owner. Leave it None for
+            # those (skip-None on update also stops it re-appearing once cleared).
+            # Platforms whose normaliser exposes no owner (TikTok/LinkedIn/YouTube)
+            # report None and keep the original behaviour.
+            owner = post.get("owner_username")
+            published_by_us = (
+                owner in (None, self_handle) and not post.get("coauthor_usernames")
+            )
+            engagement_audience = (
+                round(interactions / follower_count, 6)
+                if published_by_us and follower_count
+                else None
+            )
             content_stats_rows.append({
                 "platform": platform,
                 "post_id": post["post_id"],
