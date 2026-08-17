@@ -1,0 +1,30 @@
+-- content_stats: a TRUE engagement rate, measured against reach.
+--
+--   engagement_on_reach — interactions / reach, as a fraction (0.024 = 2.4%).
+--
+-- Why a new column instead of fixing engagement_reach: despite its name,
+-- engagement_reach is interactions / VIEWS (migration 026 says so — it was the
+-- proxy chosen when reach wasn't available to us). It is the only engagement
+-- figure that exists for EVERY source, so it stays as-is; redefining it would
+-- blank the number for guest/collab posts and the admin bulk imports, none of
+-- which have reach. Prefer engagement_on_reach in the UI and fall back to
+-- engagement_reach when it is null.
+--
+-- reach is an owner-only Meta insight and reaches us solely via Outstand
+-- (ingestion/outstand.py), so this column is populated for The Curve's own
+-- Outstand-covered posts and is NULL everywhere else — the Apify scrape cannot
+-- produce reach at any price, and Meta does not attribute a collab post published
+-- from a guest's account to our insights.
+--
+-- reach counts unique ACCOUNTS that saw the post at least once, while views counts
+-- plays including replays (~2.1 plays per reached account across our IG posts), so
+-- engagement_on_reach runs roughly 2x engagement_reach. They are different
+-- questions — never chart them on one axis or compare one to the other.
+--
+-- "interactions" = likes + comments + shares + saves (whatever the platform
+-- exposes). The writer drops unknown keys, so applying this is what "turns the
+-- column on" — and _content_stats_column_set() caches the column list per
+-- process, so apply this before (or with) the deploy that restarts the service.
+-- Idempotent — safe to re-run.
+
+alter table content_stats add column if not exists engagement_on_reach numeric;

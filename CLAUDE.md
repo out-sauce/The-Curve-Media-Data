@@ -15,8 +15,14 @@ triggers stages over HTTP.
 - **Playwright + Chromium** for the research-stage browser scraper; **Browserbase**
   for headful, human-driven remote logins (site-auth capture).
 - Apify / NewsAPI / Finnhub / feedparser for ingestion sources.
+- **Zernio** (`ingestion/zernio.py`, `ingestion/inbox.py`) for The Curve's OWN channels:
+  owner-only Instagram insights, audience demographics, story insights, and the
+  comments/DM mirror. Replaced Outstand. Competitor tracking stays on Apify — Zernio can
+  only read accounts we've connected. The Admin app is a second Zernio client, for
+  publishing.
 - Deployed on **Railway** via the `Dockerfile` (bundles Chromium). **Single replica**
-  required — the site-auth flow keeps an in-process session registry.
+  required — the site-auth flow keeps an in-process session registry, and the Zernio
+  inbox webhook hands work to in-process background tasks.
 
 ## Run & test
 
@@ -24,9 +30,13 @@ triggers stages over HTTP.
 - Config comes from env / `.env.local` (see `config.py`). Required: `NEXT_PUBLIC_SUPABASE_URL`,
   `SUPABASE_SERVICE_ROLE_KEY`. Optional: `PIPELINE_API_KEY` (guards every endpoint),
   `ANTHROPIC_API_KEY`, Apify/NewsAPI/Finnhub keys, `BROWSERBASE_API_KEY` +
-  `BROWSERBASE_PROJECT_ID` (site-auth capture).
+  `BROWSERBASE_PROJECT_ID` (site-auth capture), `ZERNIO_API_KEY` (own-channel analytics
+  + the comments/DM inbox), `ZERNIO_WEBHOOK_SECRET` + `PUBLIC_BASE_URL` (the inbox
+  webhook — the receiver fails closed without the secret, and registration needs the
+  deployed URL).
 - API: `uvicorn api:app --reload`. CLI: `python main.py --once` (full run) or
-  `python main.py --stage <ingest|filter|cluster|score|competitors> [--date YYYY-MM-DD]`.
+  `python main.py --stage <ingest|filter|cluster|score|competitors|zernio|zernio-daily>
+  [--date YYYY-MM-DD]`.
 - There is no formal test suite; validate with `python -m py_compile` on changed files
   and `fastapi.testclient.TestClient` smoke tests of the endpoints.
 
@@ -45,6 +55,223 @@ triggers stages over HTTP.
   auto-applied at runtime.
 
 ## Recent changes
+
+- **Outstand → Zernio (migrations 037/038/039).** `ingestion/outstand.py` is GONE,
+  replaced by `ingestion/zernio.py` (analytics) + `ingestion/inbox.py` (comments/DMs).
+  The move was for the **comments and DM APIs Outstand simply did not have**; Zernio
+  also covers everything Outstand did, plus audience demographics, story insights, a
+  daily follower series and per-post Reels watch time. Every `OUTSTAND_*` config key,
+  `POST /run/outstand`, the `outstand` stage and the `outstand_hourly` job are deleted.
+  **Read every note below about Outstand as history** — the machinery is gone, but the
+  column semantics it established are all still live.
+  - **The whole import/watermark/billing subsystem is gone.** Outstand billed per
+    imported post, so it needed `social_accounts.outstand_last_imported_at` and a
+    bounded poll loop. Zernio background-syncs each connected account's external posts
+    itself (~90 min, ~12 months retained) and analytics are plain GETs, so there is
+    nothing to meter. The column is left in place (the Admin owns that table) but
+    nothing reads or writes it. `get_outstand_connected_accounts` →
+    `get_zernio_connected_accounts`, minus the watermark.
+  - **Row identity is unchanged and that is the load-bearing assumption.**
+    Zernio's `platforms[].platformPostId` is the platform's own media id — the same
+    18-digit Instagram id Outstand wrote to `content_stats.post_id` — so existing rows
+    continue rather than duplicating. A post with **no** `platformPostId` is SKIPPED,
+    never keyed on Zernio's internal `_id`: a row keyed on a vendor id would never
+    reconcile with the one already there. **Verify this live before cutover** — if a
+    second row appears for a post that already had one, stop.
+  - **`engagement_rate` is computed, not taken from the vendor.** Checked against the
+    live table: all 100 Outstand-written values encode interactions/**reach**×100
+    exactly. Zernio's `engagementRate` divides by the *first non-zero* of impressions,
+    reach, views — so its basis can change from post to post with nothing in the row to
+    say which was used — and arrives rounded to 2dp. We compute interactions/reach×100
+    ourselves, which keeps the column meaning one thing either side of the swap and
+    makes `engagement_rate == engagement_on_reach × 100` an invariant. The vendor value
+    is kept in `platform_specific.vendor_engagement_rate` for reconciliation.
+  - **Zero means ABSENT for half the metrics** (`_nz` in zernio.py). Zernio returns
+    `0`, not null, for a metric it could not obtain — follows on a reel, watch time on
+    a non-video, any insight inside Meta's ~24h delay, anything on an unsynced post —
+    and `upsert_self_content_stats` only skips `None`. So a 0 would be *written*, read
+    as "this post reached nobody", and overwrite the good value from the previous hour.
+    `views/reach/impressions/clicks/follows/watch-times/duration` map 0 → None.
+    `likes/comments/shares/saves` deliberately do NOT: a real post can honestly have
+    zero, and mapping those to None would make a genuine zero unwritable forever.
+    Related guard: a post whose `syncStatus` is `pending`/`unavailable` is skipped
+    entirely (its analytics block is all zeros) — the analogue of Outstand's
+    `token_expired` check.
+  - **Instagram stories are `platform = 'instagram_story'`** (migration 038 widens the
+    `content_stats_platform_check`, which would otherwise reject them with a 23514).
+    Folding them into `'instagram'` would inject ~10 rows/day into every query that
+    filters on that value and silently change what "our Instagram performance" means.
+    The sweep runs hourly (Meta serves a story for 24h) and has a **settle pass**: a
+    story's numbers climb until it expires, so the last live poll is systematically an
+    undercount, and Zernio serves the final figures afterwards from Meta's story
+    webhook (`source: "cached"`). `sticker_taps` is **never written** — Meta exposes no
+    such metric for stories (`navigation` is taps/exits/swipes, a different thing) and
+    that column is hand-entered by the operator; a 0 there would destroy typed-in data.
+    No `engagement_*` rates either: a story's interactions-over-views is a different
+    question from a feed post's.
+  - **Demographics land in the Admin's existing `audience_demographics`** — its shape
+    already matched exactly. Gender is normalised `M/F/U → male/female/unknown`: the
+    table's natural key includes `bucket`, so writing "F" where the rest of the system
+    writes "female" would split one audience across two buckets permanently. Country is
+    ISO-2 verbatim (matches the existing rows); city keeps its region suffix. Written as
+    a keyed upsert, never delete-then-insert, because the table also holds hand-entered
+    and podcast rows. Only `follower_demographics` — there is no column distinguishing
+    it from the engaged audience, so writing both would collide on the key.
+  - **Follower backfill is gap-fill only.** `/v1/accounts/follower-stats` gives the
+    daily series and the current count and the avatar and the lifetime post count in one
+    call (its account entries extend the full SocialAccount schema), so it replaces both
+    of Outstand's account calls. The Instagram series is ~108 rows since 2021 — largely
+    monthly, hand-entered — and it is the denominator behind every `engagement_audience`
+    value, so the backfill uses `insert_only` and never overwrites an existing day.
+    **Filling gaps moves `engagement_audience` on posts published in them**, and only
+    posts still inside the 90-day window get recomputed, so the column is briefly
+    inconsistent across that boundary. `_followers_at`'s cache is now cleared at the
+    start of every run — the Outstand version loaded it once and froze for the life of
+    the process.
+  - **New per-post columns (037):** `follows`, `avg_watch_time_ms`,
+    `total_watch_time_ms`. `impressions`, `clicks` and `duration_sec` already existed
+    and are populated for the first time. Watch times are **milliseconds** (Meta's unit).
+    Per the standing gotcha, `_content_stats_column_set()` caches the column list per
+    process, so 037 must land before the deploy restarts the service or all three are
+    silently filtered out of every write.
+  - Latent bug fixed on the way: the account-matching filter used `and` where `or` was
+    meant (`outstand.py:244`), which accepted an entry belonging to a *different*
+    account of the same network. Harmless with one connected account; a foot-gun the
+    moment there are two. The replacement matches on `accountId` first and only falls
+    back to platform when the entry carries no account id to contradict it.
+
+- **The comments + DM inbox** (`ingestion/inbox.py`, migration 039 — five tables).
+  New capability, not a port. **The webhook is the fast path; the sweep is the correct
+  one**, and neither is redundant: Meta replays up to 500 pre-connect conversations per
+  account *in the background, emitting no webhooks*, keeping each thread's original
+  timestamp so replayed threads sort into date order rather than to the top — a single
+  incremental pass provably cannot see them. Dead-lettered events are gone after ~51h.
+  And a third party editing/hiding/deleting/liking a comment is never evented at all.
+  So nothing depends on webhook completeness: `*/15` incremental sweep, exhaustive
+  `full=True` pass nightly at 04:30, and `POST /run/inbox-sweep?full=true` after
+  connecting an account.
+  `POST /webhooks/zernio` deviates from this repo's endpoint conventions on purpose and
+  says so in place: `async def` (the HMAC needs the RAW body), **no `x-api-key`** (the
+  signature is the authentication, and it fails closed when the secret is unset), and it
+  returns **200 for everything authenticated** including unknown events and unparseable
+  bodies — a non-2xx costs 7 retries over ~51h and **10 consecutive failures make Zernio
+  disable the subscription**, which would silently stop every comment and DM. The ack
+  budget is 5 seconds, so the only synchronous work is the signature check and one
+  ledger insert; `inbox_webhook_events.event_id` (the envelope uuid) is the PK and
+  *is* the at-least-once dedupe. Note the signature format differs from Outstand's:
+  a bare lowercase hex digest with **no `sha256=` prefix** — the old verifier *required*
+  one, so copying it would reject every delivery.
+  Ownership split: this repo writes every row; the Admin owns
+  `inbox_conversations.{is_read,read_at,read_by}`, `inbox_comments.{handled_at,
+  handled_by}` and its own optimistic `source='admin'` rows. The upserts here achieve
+  that by never naming those columns. Comments link to our content via
+  `inbox_posts.platform_post_id` → `content_stats.post_id` → `calendar_item_id`,
+  resolved at write time, **fill-only-if-null and retried every sweep** (a post
+  published minutes ago has no stats row yet). `parent_comment_id` is a platform id
+  **string, not a uuid FK**, because a reply's webhook can arrive before its parent is
+  mirrored. **TikTok has no comment API and no DMs in Zernio at all** — one of the four
+  brand channels is simply not covered, and the UI says so rather than showing an empty
+  list.
+
+- **A true engagement rate on reach** (migration 036, nullable `engagement_on_reach`).
+  Despite its name, `engagement_reach` is interactions / **views** — migration 026's
+  proxy, chosen when reach wasn't available to us — and it stayed that way even after
+  Outstand started handing us real `reach` in the same payload. New
+  `engagement_on_reach` = interactions / reach, a 0-1 fraction like its siblings,
+  written **only by `ingestion/outstand.py`**: reach is an owner-only Meta insight, so
+  the Apify paths can't produce it and Meta doesn't attribute a collab post published
+  from a guest's account to our account either. `engagement_reach` is deliberately
+  **left as-is** rather than redefined — it's the only engagement figure every source
+  can produce, so it remains the cross-source proxy (guest/collab posts and the admin
+  bulk imports have no reach and would otherwise go blank). Prefer
+  `engagement_on_reach` in the UI, fall back to `engagement_reach`.
+  **The two are different questions, not two estimates of one** — `reach` counts unique
+  accounts that saw the post, `views` counts plays including replays (~2.1 plays per
+  reached account across our IG posts), so the reach-based rate runs roughly **2x** the
+  views-based one (97 IG posts backfilled 2026-08-13: median 1.82%, max 10.98%, vs 1.14%
+  average on views). Never plot them on one axis or read one as the other.
+  **`engagement_audience` is now populated by Outstand too** (it previously always wrote
+  None, so no post got an audience rate at all once the Apify self-IG channel was
+  retired). The denominator is **followers-at-time**, from a new
+  `get_follower_snapshot_history()` + `_followers_at()` pair reading our own
+  `follower_snapshots` series (45,280 in April vs 48,691 in August — today's count would
+  understate every older post). So both intended engagement metrics — on reach and on
+  audience — are live for all 97 Outstand-covered posts.
+  A `reach >= interactions` guard gates the write, since an account can't interact
+  without being reached: the backfill initially stamped **125%** on a YouTube row whose
+  `reach` was **8** against 201 views and 10 interactions. That value was *not* from a
+  pipeline writer — `reach` on non-Outstand rows is admin-entered and not necessarily
+  Meta's reach at all, so never assume a non-NULL `reach` is a credible denominator.
+  Per the usual gotcha, `_content_stats_column_set()` caches the column list per
+  process, so 036 must be applied before (or with) the deploy that restarts the service.
+
+- **`likesCount = -1` means Instagram HID the like count** — not an import artefact.
+  `_to_int` (`ingestion/competitors.py`) passed it through, making interactions negative
+  and printing a **negative engagement rate**; it now maps negatives to None (every
+  call site is a non-negative count). Note skip-None cannot *clear* an already-stored
+  -1, so the two affected April rows were nulled by hand along with their engagement
+  columns — comments-only engagement on a hidden-likes post reads as real but isn't.
+  Related: 12 `youtube_shorts` rows have `likes` NULL with engagement computed from
+  comments alone, so those rates are understated; left as-is deliberately (gating
+  engagement on a known like count would blank all 12).
+
+- **Collabs are common, and roughly a third are published from the partner's account.**
+  Ownership was checked live on 41 IG rows (2026-08-13): 16 carry co-authors, of which
+  **7 are owned by another account** (`nzhviva`, `ciara___anne`, `hannahkoumakis` ×3,
+  `francescooknz`, `shityoushouldcareabout`) — several of them tagged
+  `social_kind = 'own'` in the calendar. Consequences for reporting: those rows'
+  likes/views belong to the partner's audience (6 guest-tagged rows alone were 8.3% of
+  all IG likes), and a **sponsored** collab is still a paid deliverable, so it belongs
+  in the sponsor report even though it must not count toward own-channel
+  engagement-vs-followers. Collab posts also enter The Curve's own `competitor_posts`
+  rows and therefore its brand `instagram_engagement_rate`, which is NOT gated —
+  a 2,276-like partner-audience post inflated that figure while inside the 14-day window.
+
+- **IG collab posts: plays-only `views`, and no `engagement_audience`.** Instagram
+  **collab (co-author) posts appear on every co-author's grid**, so The Curve's `is_self`
+  profile scrape returns posts *published from someone else's account* and writes
+  `content_stats` rows for them. Live 2026-08-13, 5 of the 7 IG rows that carried
+  `engagement_audience` were collabs owned by guests (`hannahkoumakis`, `ciara___anne`,
+  `nzhviva`), several of them tagged `social_kind = 'own'` in the calendar — so
+  `social_kind` is **not** a reliable "is this ours" signal; post ownership is.
+  Two fixes in `ingestion/competitors.py`:
+  1. **`views` must be the plays figure.** `videoViewCount` is the legacy 3-second-view
+     metric and is orders of magnitude below the `videoPlayCount` figure Instagram now
+     labels "views" (one reel: 928 vs 62557, against 471 likes). The old
+     `videoViewCount or videoPlayCount` preference stored views *below* likes and pushed
+     `engagement_rate`/`engagement_reach` (interactions ÷ views) over 100%.
+     `_ig_view_count` now takes the **larger** of the two. Crucially the profile
+     scrape's **`latestPosts` items carry `videoViewCount` only — no `videoPlayCount`**
+     (verified live), so a `view_count_is_plays` flag rides along and the `is_self`
+     content_stats path **omits `views` entirely** when the number is the legacy metric;
+     skip-None then preserves Outstand's authoritative hourly value, and guest/collab
+     posts get a real figure from the single-post guest sweep, whose payload does include
+     `videoPlayCount`. `competitor_posts` still stores the legacy number, leaving the
+     cards unchanged. Four rows were re-scraped by URL to correct them (153→24277,
+     406→62557, 1251→28876, 607→39014).
+  2. **`engagement_audience` is only written for posts we published.** It divides by OUR
+     follower count, which means nothing for a post on the owner's account that
+     Instagram delivered to the union of the co-authors' audiences — and no follower
+     count for the owner is available: the post payload has **no follower field at all**
+     (only `ownerUsername`/`ownerId` + a `coauthorProducers` list of usernames), so a
+     guest denominator would need a second details-mode profile run, and
+     followers-at-time can never be reconstructed retrospectively anyway. The
+     `published_by_us` gate (owner == `handle`, no co-authors; owner `None` → assume ours,
+     preserving TikTok/LinkedIn/YouTube behaviour) leaves it None otherwise, and the 5
+     historical values were nulled by hand. `latestPosts` exposes `ownerUsername` but
+     **not** `coauthorProducers`, so a co-authored post of *ours* is indistinguishable
+     from a plain one in the profile scrape — ownership is the signal that always works.
+     **`engagement_reach` (interactions ÷ plays) is the engagement rate to use for
+     guest/collab posts**; it needs no follower count and is comparable with own posts.
+  Also note `content_stats.views` has **three** writers with different provenance —
+  Outstand (authoritative owner insights, also sets `reach`), this Apify path, and
+  admin-side bulk imports (a 2026-08-01 batch, some rows with `likes = -1` and no
+  `post_url`) — so `reach IS NULL` is a rough "not Outstand-enriched" filter, not proof a
+  row came from Apify. Outstand does **not** carry collab posts (checked across
+  2026-07-08→07-25): they are published from the guest's account, so Meta never
+  attributes them to our IG account's insights, and Outstand's `post_id` is an 18-digit
+  media id rather than the Apify format — the same physical post from both sources would
+  land as two rows.
 
 - **Guest-post stats — one Apify run per post URL** (`ingestion/guest_posts.py`).
   The admin's Content Calendar can hold posts published from a GUEST's own account

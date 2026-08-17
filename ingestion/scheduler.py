@@ -4,11 +4,12 @@ Scheduler — runs the full daily pipeline at 5am UTC, plus a separate hourly jo
 Jobs:
   05:00 UTC daily → ingest → filter → cluster → score → tag → research → brief
   (+ competitors, Mondays only)
-  hourly (every :00) → Outstand self-Instagram Insights refresh (ingestion/outstand.py)
-  — kept off the daily job because it needs its own cadence: account-metrics/per-post
-  analytics are cheap reads worth refreshing often, but the underlying incremental
-  import step is billed per post and watermark-gated, so hourly here does not mean
-  hourly full re-imports.
+  hourly (every :05) → Zernio self-Instagram Insights refresh (ingestion/zernio.py)
+  — kept off the daily job because it needs its own cadence: Zernio caches post
+  analytics for 60 minutes server-side so hourly is exactly the useful rate, and
+  Instagram stories only live for 24 hours, so anything slower loses them outright.
+  The daily pipeline calls run_zernio_daily instead, which is the same work plus the
+  once-a-day extras (audience demographics, which Meta delays 48h anyway).
 """
 
 import logging
@@ -26,7 +27,8 @@ from research.research import run_research
 from briefing.brief import run_briefing
 from ingestion.competitors import run_competitors
 from ingestion.guest_posts import run_guest_post_stats
-from ingestion.outstand import run_outstand_hourly
+from ingestion.zernio import run_zernio_hourly, run_zernio_daily
+from ingestion.inbox import run_inbox_sweep
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +83,7 @@ def run_daily_pipeline() -> None:
         logger.info("Full competitor sweep skipped — runs weekly on Mondays; scanning own channels only")
         _run("competitors", run_competitors, self_only=True)
     _run("guest_posts",  run_guest_post_stats)
+    _run("zernio",       run_zernio_daily)
     logger.info("=== Daily pipeline complete ===")
 
 
@@ -93,10 +96,32 @@ def start_scheduler() -> None:
         replace_existing=True,
     )
     scheduler.add_job(
-        run_outstand_hourly,
-        CronTrigger(minute=0, timezone="UTC"),
-        id="outstand_hourly",
+        run_zernio_hourly,
+        # :05 rather than :00 — the daily pipeline fires at 05:00 and the two would
+        # otherwise start together, doubling up on the same account for no gain.
+        CronTrigger(minute=5, timezone="UTC"),
+        id="zernio_hourly",
         replace_existing=True,
     )
-    logger.info("Scheduler started — daily pipeline at 05:00 UTC, Outstand refresh hourly")
+    scheduler.add_job(
+        run_inbox_sweep,
+        CronTrigger(minute="*/15", timezone="UTC"),
+        id="inbox_sweep",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        run_inbox_sweep,
+        # The exhaustive pass. It is the ONLY thing that can find a conversation from
+        # Meta's pre-connect replay: those arrive in the background, emit no webhooks,
+        # and keep their original timestamps, so they sort into date order rather than
+        # to the top where an incremental pass would see them.
+        CronTrigger(hour=4, minute=30, timezone="UTC"),
+        id="inbox_sweep_full",
+        kwargs={"full": True},
+        replace_existing=True,
+    )
+    logger.info(
+        "Scheduler started — daily pipeline at 05:00 UTC, Zernio refresh hourly at :05, "
+        "inbox sweep every 15m (full at 04:30)"
+    )
     scheduler.start()

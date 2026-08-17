@@ -5,6 +5,7 @@ Exposes HTTP endpoints so the admin app can trigger pipeline stages.
 The APScheduler daily job starts in a background thread on startup.
 """
 
+import json
 import logging
 import os
 import sys
@@ -24,7 +25,8 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 
-from fastapi import BackgroundTasks, FastAPI, Header, HTTPException
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 from ingestion.scheduler import run_ingestion, start_scheduler, run_daily_pipeline
@@ -52,7 +54,14 @@ from research.site_auth import (
 )
 from ingestion.competitors import run_competitors
 from ingestion.guest_posts import run_guest_post_stats
-from ingestion.outstand import run_outstand_hourly
+from ingestion.zernio import run_zernio_hourly, run_zernio_daily
+from ingestion.inbox import (
+    accept_webhook,
+    process_webhook_event,
+    register_webhook,
+    run_inbox_sweep,
+    verify_signature,
+)
 from ingestion.storage import get_client
 from research.domains import registrable_domain
 
@@ -205,15 +214,108 @@ def run_guest_post_stats_endpoint(background_tasks: BackgroundTasks, id: str | N
     return {"status": "started"}
 
 
-@app.post("/run/outstand")
-def run_outstand_endpoint(background_tasks: BackgroundTasks, x_api_key: str = Header(default="")):
+@app.post("/run/zernio")
+def run_zernio_endpoint(
+    background_tasks: BackgroundTasks,
+    daily: bool = False,
+    x_api_key: str = Header(default=""),
+):
     """
-    Run the Outstand self-account Insights refresh on demand — same as the hourly
-    scheduled job. Pilot scope: Instagram only.
+    Run the Zernio self-account Insights refresh on demand — same as the hourly
+    scheduled job. Scope: Instagram only.
+
+    Pass ?daily=true to also pull the once-a-day extras (audience demographics), i.e.
+    exactly what the 05:00 pipeline runs.
     """
     _check_key(x_api_key)
-    background_tasks.add_task(run_outstand_hourly)
+    background_tasks.add_task(run_zernio_daily if daily else run_zernio_hourly)
     return {"status": "started"}
+
+
+@app.post("/run/inbox-sweep")
+def run_inbox_sweep_endpoint(
+    background_tasks: BackgroundTasks,
+    full: bool = False,
+    x_api_key: str = Header(default=""),
+):
+    """
+    Reconcile the comments/DM mirror against Zernio on demand.
+
+    ?full=true walks every listing to exhaustion — use it right after connecting an
+    account, since Meta replays that account's pre-connect message history in the
+    background with no webhooks and in its ORIGINAL date order, which an incremental
+    pass structurally cannot see.
+    """
+    _check_key(x_api_key)
+    background_tasks.add_task(run_inbox_sweep, full)
+    return {"status": "started"}
+
+
+@app.post("/inbox/webhook/register")
+def register_inbox_webhook_endpoint(
+    public_url: str = "",
+    x_api_key: str = Header(default=""),
+):
+    """
+    Create or update this service's Zernio webhook subscription (idempotent).
+
+    Zernio webhooks are created through the API, not a dashboard field, and the secret
+    has to match what this service verifies with — so registration lives here, next to
+    the receiver, rather than in a runbook step someone performs by hand.
+
+    Pass ?public_url= to override the deployed base URL.
+    """
+    _check_key(x_api_key)
+    return register_webhook(public_url or None)
+
+
+@app.post("/webhooks/zernio")
+async def zernio_webhook(request: Request, background_tasks: BackgroundTasks):
+    """
+    Zernio inbox webhook receiver.
+
+    Three deliberate deviations from this file's conventions, all forced by the vendor
+    contract:
+
+    1. `async def`, because the HMAC is computed over the RAW body — a Pydantic model
+       would hand back re-serialised bytes whose signature no longer matches.
+    2. No `x-api-key`. The signature IS the authentication; Zernio has no way to send
+       our key. It fails closed when ZERNIO_WEBHOOK_SECRET is unset.
+    3. It returns 200 for everything that authenticates, including unknown events and
+       unparseable bodies. A non-2xx costs 7 retries over ~51 hours and, at 10
+       consecutive failures, Zernio DISABLES the subscription — which would silently
+       stop every comment and DM from arriving.
+
+    The ack budget is five seconds, so the only synchronous work is the signature check
+    and one insert; everything else runs on a background task. The insert happens before
+    the ack, so a crash in between loses nothing — drain_inbox_ledger picks it up.
+
+    Bodies are never logged: these are private messages.
+    """
+    raw = await request.body()
+    if not verify_signature(raw, request.headers.get("X-Zernio-Signature")
+                            or request.headers.get("X-Late-Signature")):
+        raise HTTPException(status_code=401, detail="Invalid signature")
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return {"ok": True, "ignored": "unparseable"}
+    if not isinstance(payload, dict):
+        return {"ok": True, "ignored": "unexpected_shape"}
+
+    try:
+        is_new, event_id = await run_in_threadpool(accept_webhook, raw, payload)
+    except Exception as exc:
+        # Still ack. Unlike the admin's publish confirmation, this event has a backstop:
+        # the reconciliation sweep re-reads the same data every 15 minutes, so losing a
+        # delivery costs latency, not correctness. Returning 5xx would buy 7 retries and,
+        # after 10 consecutive failures, get the whole subscription disabled — which
+        # would cost us every comment and DM until someone noticed.
+        logger.warning("Zernio webhook could not be recorded: %s", str(exc)[:300])
+        return {"ok": True, "recorded": False}
+    if event_id and is_new:
+        background_tasks.add_task(process_webhook_event, event_id)
+    return {"ok": True}
 
 
 @app.post("/run/pipeline")
