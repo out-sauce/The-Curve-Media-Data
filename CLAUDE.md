@@ -15,8 +15,14 @@ triggers stages over HTTP.
 - **Playwright + Chromium** for the research-stage browser scraper; **Browserbase**
   for headful, human-driven remote logins (site-auth capture).
 - Apify / NewsAPI / Finnhub / feedparser for ingestion sources.
+- **Zernio** (`ingestion/zernio.py`, `ingestion/inbox.py`) for The Curve's OWN channels:
+  owner-only Instagram insights, audience demographics, story insights, and the
+  comments/DM mirror. Replaced Outstand. Competitor tracking stays on Apify — Zernio can
+  only read accounts we've connected. The Admin app is a second Zernio client, for
+  publishing.
 - Deployed on **Railway** via the `Dockerfile` (bundles Chromium). **Single replica**
-  required — the site-auth flow keeps an in-process session registry.
+  required — the site-auth flow keeps an in-process session registry, and the Zernio
+  inbox webhook hands work to in-process background tasks.
 
 ## Run & test
 
@@ -24,9 +30,13 @@ triggers stages over HTTP.
 - Config comes from env / `.env.local` (see `config.py`). Required: `NEXT_PUBLIC_SUPABASE_URL`,
   `SUPABASE_SERVICE_ROLE_KEY`. Optional: `PIPELINE_API_KEY` (guards every endpoint),
   `ANTHROPIC_API_KEY`, Apify/NewsAPI/Finnhub keys, `BROWSERBASE_API_KEY` +
-  `BROWSERBASE_PROJECT_ID` (site-auth capture).
+  `BROWSERBASE_PROJECT_ID` (site-auth capture), `ZERNIO_API_KEY` (own-channel analytics
+  + the comments/DM inbox), `ZERNIO_WEBHOOK_SECRET` + `PUBLIC_BASE_URL` (the inbox
+  webhook — the receiver fails closed without the secret, and registration needs the
+  deployed URL).
 - API: `uvicorn api:app --reload`. CLI: `python main.py --once` (full run) or
-  `python main.py --stage <ingest|filter|cluster|score|competitors> [--date YYYY-MM-DD]`.
+  `python main.py --stage <ingest|filter|cluster|score|competitors|zernio|zernio-daily>
+  [--date YYYY-MM-DD]`.
 - There is no formal test suite; validate with `python -m py_compile` on changed files
   and `fastapi.testclient.TestClient` smoke tests of the endpoints.
 
@@ -45,6 +55,123 @@ triggers stages over HTTP.
   auto-applied at runtime.
 
 ## Recent changes
+
+- **Outstand → Zernio (migrations 037/038/039).** `ingestion/outstand.py` is GONE,
+  replaced by `ingestion/zernio.py` (analytics) + `ingestion/inbox.py` (comments/DMs).
+  The move was for the **comments and DM APIs Outstand simply did not have**; Zernio
+  also covers everything Outstand did, plus audience demographics, story insights, a
+  daily follower series and per-post Reels watch time. Every `OUTSTAND_*` config key,
+  `POST /run/outstand`, the `outstand` stage and the `outstand_hourly` job are deleted.
+  **Read every note below about Outstand as history** — the machinery is gone, but the
+  column semantics it established are all still live.
+  - **The whole import/watermark/billing subsystem is gone.** Outstand billed per
+    imported post, so it needed `social_accounts.outstand_last_imported_at` and a
+    bounded poll loop. Zernio background-syncs each connected account's external posts
+    itself (~90 min, ~12 months retained) and analytics are plain GETs, so there is
+    nothing to meter. The column is left in place (the Admin owns that table) but
+    nothing reads or writes it. `get_outstand_connected_accounts` →
+    `get_zernio_connected_accounts`, minus the watermark.
+  - **Row identity is unchanged and that is the load-bearing assumption.**
+    Zernio's `platforms[].platformPostId` is the platform's own media id — the same
+    18-digit Instagram id Outstand wrote to `content_stats.post_id` — so existing rows
+    continue rather than duplicating. A post with **no** `platformPostId` is SKIPPED,
+    never keyed on Zernio's internal `_id`: a row keyed on a vendor id would never
+    reconcile with the one already there. **Verify this live before cutover** — if a
+    second row appears for a post that already had one, stop.
+  - **`engagement_rate` is computed, not taken from the vendor.** Checked against the
+    live table: all 100 Outstand-written values encode interactions/**reach**×100
+    exactly. Zernio's `engagementRate` divides by the *first non-zero* of impressions,
+    reach, views — so its basis can change from post to post with nothing in the row to
+    say which was used — and arrives rounded to 2dp. We compute interactions/reach×100
+    ourselves, which keeps the column meaning one thing either side of the swap and
+    makes `engagement_rate == engagement_on_reach × 100` an invariant. The vendor value
+    is kept in `platform_specific.vendor_engagement_rate` for reconciliation.
+  - **Zero means ABSENT for half the metrics** (`_nz` in zernio.py). Zernio returns
+    `0`, not null, for a metric it could not obtain — follows on a reel, watch time on
+    a non-video, any insight inside Meta's ~24h delay, anything on an unsynced post —
+    and `upsert_self_content_stats` only skips `None`. So a 0 would be *written*, read
+    as "this post reached nobody", and overwrite the good value from the previous hour.
+    `views/reach/impressions/clicks/follows/watch-times/duration` map 0 → None.
+    `likes/comments/shares/saves` deliberately do NOT: a real post can honestly have
+    zero, and mapping those to None would make a genuine zero unwritable forever.
+    Related guard: a post whose `syncStatus` is `pending`/`unavailable` is skipped
+    entirely (its analytics block is all zeros) — the analogue of Outstand's
+    `token_expired` check.
+  - **Instagram stories are `platform = 'instagram_story'`** (migration 038 widens the
+    `content_stats_platform_check`, which would otherwise reject them with a 23514).
+    Folding them into `'instagram'` would inject ~10 rows/day into every query that
+    filters on that value and silently change what "our Instagram performance" means.
+    The sweep runs hourly (Meta serves a story for 24h) and has a **settle pass**: a
+    story's numbers climb until it expires, so the last live poll is systematically an
+    undercount, and Zernio serves the final figures afterwards from Meta's story
+    webhook (`source: "cached"`). `sticker_taps` is **never written** — Meta exposes no
+    such metric for stories (`navigation` is taps/exits/swipes, a different thing) and
+    that column is hand-entered by the operator; a 0 there would destroy typed-in data.
+    No `engagement_*` rates either: a story's interactions-over-views is a different
+    question from a feed post's.
+  - **Demographics land in the Admin's existing `audience_demographics`** — its shape
+    already matched exactly. Gender is normalised `M/F/U → male/female/unknown`: the
+    table's natural key includes `bucket`, so writing "F" where the rest of the system
+    writes "female" would split one audience across two buckets permanently. Country is
+    ISO-2 verbatim (matches the existing rows); city keeps its region suffix. Written as
+    a keyed upsert, never delete-then-insert, because the table also holds hand-entered
+    and podcast rows. Only `follower_demographics` — there is no column distinguishing
+    it from the engaged audience, so writing both would collide on the key.
+  - **Follower backfill is gap-fill only.** `/v1/accounts/follower-stats` gives the
+    daily series and the current count and the avatar and the lifetime post count in one
+    call (its account entries extend the full SocialAccount schema), so it replaces both
+    of Outstand's account calls. The Instagram series is ~108 rows since 2021 — largely
+    monthly, hand-entered — and it is the denominator behind every `engagement_audience`
+    value, so the backfill uses `insert_only` and never overwrites an existing day.
+    **Filling gaps moves `engagement_audience` on posts published in them**, and only
+    posts still inside the 90-day window get recomputed, so the column is briefly
+    inconsistent across that boundary. `_followers_at`'s cache is now cleared at the
+    start of every run — the Outstand version loaded it once and froze for the life of
+    the process.
+  - **New per-post columns (037):** `follows`, `avg_watch_time_ms`,
+    `total_watch_time_ms`. `impressions`, `clicks` and `duration_sec` already existed
+    and are populated for the first time. Watch times are **milliseconds** (Meta's unit).
+    Per the standing gotcha, `_content_stats_column_set()` caches the column list per
+    process, so 037 must land before the deploy restarts the service or all three are
+    silently filtered out of every write.
+  - Latent bug fixed on the way: the account-matching filter used `and` where `or` was
+    meant (`outstand.py:244`), which accepted an entry belonging to a *different*
+    account of the same network. Harmless with one connected account; a foot-gun the
+    moment there are two. The replacement matches on `accountId` first and only falls
+    back to platform when the entry carries no account id to contradict it.
+
+- **The comments + DM inbox** (`ingestion/inbox.py`, migration 039 — five tables).
+  New capability, not a port. **The webhook is the fast path; the sweep is the correct
+  one**, and neither is redundant: Meta replays up to 500 pre-connect conversations per
+  account *in the background, emitting no webhooks*, keeping each thread's original
+  timestamp so replayed threads sort into date order rather than to the top — a single
+  incremental pass provably cannot see them. Dead-lettered events are gone after ~51h.
+  And a third party editing/hiding/deleting/liking a comment is never evented at all.
+  So nothing depends on webhook completeness: `*/15` incremental sweep, exhaustive
+  `full=True` pass nightly at 04:30, and `POST /run/inbox-sweep?full=true` after
+  connecting an account.
+  `POST /webhooks/zernio` deviates from this repo's endpoint conventions on purpose and
+  says so in place: `async def` (the HMAC needs the RAW body), **no `x-api-key`** (the
+  signature is the authentication, and it fails closed when the secret is unset), and it
+  returns **200 for everything authenticated** including unknown events and unparseable
+  bodies — a non-2xx costs 7 retries over ~51h and **10 consecutive failures make Zernio
+  disable the subscription**, which would silently stop every comment and DM. The ack
+  budget is 5 seconds, so the only synchronous work is the signature check and one
+  ledger insert; `inbox_webhook_events.event_id` (the envelope uuid) is the PK and
+  *is* the at-least-once dedupe. Note the signature format differs from Outstand's:
+  a bare lowercase hex digest with **no `sha256=` prefix** — the old verifier *required*
+  one, so copying it would reject every delivery.
+  Ownership split: this repo writes every row; the Admin owns
+  `inbox_conversations.{is_read,read_at,read_by}`, `inbox_comments.{handled_at,
+  handled_by}` and its own optimistic `source='admin'` rows. The upserts here achieve
+  that by never naming those columns. Comments link to our content via
+  `inbox_posts.platform_post_id` → `content_stats.post_id` → `calendar_item_id`,
+  resolved at write time, **fill-only-if-null and retried every sweep** (a post
+  published minutes ago has no stats row yet). `parent_comment_id` is a platform id
+  **string, not a uuid FK**, because a reply's webhook can arrive before its parent is
+  mirrored. **TikTok has no comment API and no DMs in Zernio at all** — one of the four
+  brand channels is simply not covered, and the UI says so rather than showing an empty
+  list.
 
 - **A true engagement rate on reach** (migration 036, nullable `engagement_on_reach`).
   Despite its name, `engagement_reach` is interactions / **views** — migration 026's

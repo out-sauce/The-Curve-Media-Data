@@ -14,7 +14,7 @@ or both. For each channel present on the row it:
 
 The single is_self ("The Curve") competitor additionally has its posts upserted into
 content_stats (deduped on (platform, post_id)) over a wider window — EXCEPT Instagram,
-which ingestion/outstand.py now owns entirely (real OAuth Insights, retired here).
+which ingestion/zernio.py now owns entirely (real OAuth Insights, retired here).
 
 Reuses the existing Apify plumbing (ingestion/apify.run_actor) and APIFY_TOKEN /
 actor-id config — it does NOT touch the news flow or news_articles.
@@ -498,9 +498,9 @@ def _resolve_channels(competitor: dict) -> list[dict]:
     tiktok likewise. The handle comes from *_handle, falling back to parsing *_url.
 
     The is_self ("The Curve") row's Instagram channel is deliberately excluded —
-    ingestion/outstand.py is now the sole source for it (real OAuth Insights via
-    Outstand, retired the Apify public scrape for that one channel). Competitor
-    Instagram tracking is unaffected; Outstand can't reach accounts we don't own.
+    ingestion/zernio.py is now the sole source for it (real OAuth Insights via
+    Zernio, retired the Apify public scrape for that one channel). Competitor
+    Instagram tracking is unaffected; Zernio cannot reach accounts we don't own.
     """
     channels = []
     is_self = bool(competitor.get("is_self"))
@@ -721,7 +721,7 @@ def _run_channel(competitor_id, name: str, platform: str, handle: str, is_self: 
             # the two differ by orders of magnitude, so writing the profile-scrape
             # number would put a different metric in the same column (and inflate
             # engagement_reach past 100%). Omitting it lets skip-None keep whatever
-            # Outstand — the authoritative hourly source for our own posts — already
+            # Zernio — the authoritative hourly source for our own posts — already
             # stored; guest/collab posts get theirs from the single-post guest sweep,
             # whose payload does include videoPlayCount.
             views = post["view_count"] if post.get("view_count_is_plays", True) else None

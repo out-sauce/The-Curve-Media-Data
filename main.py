@@ -30,7 +30,7 @@ from filtering.filter import run_filtering
 from clustering.cluster import run_clustering
 from scoring.score import run_scoring
 from ingestion.competitors import run_competitors
-from ingestion.outstand import run_outstand_hourly
+from ingestion.zernio import run_zernio_hourly, run_zernio_daily
 
 DATE_STAGES = {"filter", "cluster", "score"}
 
@@ -40,7 +40,10 @@ STAGES = {
     "cluster":      run_clustering,
     "score":        run_scoring,
     "competitors":  run_competitors,
-    "outstand":     run_outstand_hourly,
+    # zernio = the hourly refresh (post analytics, account insights, follower series,
+    # stories); zernio-daily adds the once-a-day extras (audience demographics).
+    "zernio":       run_zernio_hourly,
+    "zernio-daily": run_zernio_daily,
 }
 
 

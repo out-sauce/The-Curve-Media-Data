@@ -24,37 +24,54 @@ APIFY_YOUTUBE_SHORTS_ACTOR       = os.getenv("APIFY_YOUTUBE_SHORTS_ACTOR",      
 APIFY_INSTAGRAM_TRANSCRIPT_ACTOR = os.getenv("APIFY_INSTAGRAM_TRANSCRIPT_ACTOR", "apple_yang~instagram-transcripts-scraper")
 APIFY_TIKTOK_TRANSCRIPT_ACTOR    = os.getenv("APIFY_TIKTOK_TRANSCRIPT_ACTOR",    "scrape-creators~best-tiktok-transcripts-scraper")
 
-# Outstand (outstand.so) — OAuth-connected self-account Insights (real shares/saves/
-# reach/accounts_engaged, which Apify's public IG scrape can never provide). Account
+# Zernio (zernio.com) — OAuth-connected self-account Insights (real shares/saves/
+# reach/accounts_engaged, which Apify's public IG scrape can never provide), plus the
+# comments/DM inbox (ingestion/inbox.py) that the move off Outstand was for. Account
 # connection happens in the Admin app; this pipeline only reads social_accounts.account_id
 # (populated there) and pulls analytics. Sole source for self Instagram (Apify's
 # self-Instagram scrape is retired — see ingestion/competitors.py's _resolve_channels);
 # competitor Instagram tracking is unaffected and stays on Apify. Content_stats/
 # competitor_posts window sizing reuses the existing SELF_CONTENT_STATS_*/COMPETITOR_*
 # constants below rather than introducing parallel ones.
-OUTSTAND_API_KEY = os.getenv("OUTSTAND_API_KEY", "")
-OUTSTAND_ORG_ID = os.getenv("OUTSTAND_ORG_ID", "")
-OUTSTAND_API_BASE = os.getenv("OUTSTAND_API_BASE", "https://api.outstand.so/v1")
-# Cap per incremental import call (steady-state, once a watermark exists) — the
-# endpoint bills per post, so keep this bounded; the watermark
-# (social_accounts.outstand_last_imported_at) keeps each call's `since` window small
-# in practice, so a handful of new posts per run is always enough.
-OUTSTAND_IMPORT_LIMIT = int(os.getenv("OUTSTAND_IMPORT_LIMIT", 20))
-# Only used the first time an account is seen (no watermark yet) — matches
-# SELF_CONTENT_STATS_LOOKBACK_DAYS so the one-off backfill doesn't under-cover
-# what the retired Apify self-Instagram scrape used to feed content_stats.
-OUTSTAND_INITIAL_BACKFILL_DAYS = int(os.getenv("OUTSTAND_INITIAL_BACKFILL_DAYS", 90))
-# The import endpoint returns the MOST RECENT posts within [since, now], not a
-# chronological page from `since` forward — so a small limit on the one-time initial
-# backfill silently truncates to only the newest few posts and never reaches the rest
-# of the 90-day window (confirmed live: a 20-post limit against 90 days of history
-# left everything older than ~3 weeks with no data, permanently, since the watermark
-# then advances past the gap). Outstand's own limit ceiling is 1000.
-OUTSTAND_INITIAL_BACKFILL_LIMIT = int(os.getenv("OUTSTAND_INITIAL_BACKFILL_LIMIT", 500))
-# Import jobs are observed to sit at status="running" indefinitely rather than ever
-# flipping to "completed" for small backfills, and appear to serialize one-at-a-time
-# per account — so polling must be bounded, not wait for "completed".
-OUTSTAND_IMPORT_POLL_TIMEOUT_SEC = int(os.getenv("OUTSTAND_IMPORT_POLL_TIMEOUT_SEC", 45))
+#
+# There is no import/watermark config any more: Outstand billed per imported post, so
+# it needed a metered incremental window. Zernio syncs each connected account's external
+# posts on its own background cycle (~90 min, ~12 months retained) and analytics are
+# plain reads, so there is nothing to bound.
+ZERNIO_API_KEY = os.getenv("ZERNIO_API_KEY", "")
+# Note the shape: the host is zernio.com and the API lives under /api, so paths in code
+# start with an explicit /v1. The docs' "https://api.zernio.com/v1" is a stale variant
+# and does not match the OpenAPI spec's declared server.
+ZERNIO_API_BASE = os.getenv("ZERNIO_API_BASE", "https://zernio.com/api")
+# Shared secret for verifying X-Zernio-Signature on the inbox webhook. When unset the
+# receiver fails closed — an unverified webhook is an open write endpoint.
+ZERNIO_WEBHOOK_SECRET = os.getenv("ZERNIO_WEBHOOK_SECRET", "")
+# Window for the daily follower-series gap-fill. 89 days is the documented ceiling on
+# Zernio's Instagram follower-history endpoint; follower-stats (what we actually call)
+# isn't documented as capped, but staying inside the same bound keeps the two
+# interchangeable if we ever switch.
+ZERNIO_FOLLOWER_HISTORY_DAYS = int(os.getenv("ZERNIO_FOLLOWER_HISTORY_DAYS", 89))
+
+# Inbox (ingestion/inbox.py) — the comments + DM mirror. The webhook is the fast path
+# but never the complete one: Meta replays up to 500 pre-connect conversations per
+# account with NO webhooks at all, dead-lettered events are gone after ~51h, and a
+# third party hiding/deleting/liking a comment is never evented. So a reconciliation
+# sweep is the source of completeness and the webhook is only latency.
+INBOX_SWEEP_LOOKBACK_DAYS = int(os.getenv("INBOX_SWEEP_LOOKBACK_DAYS", 30))
+INBOX_PAGE_LIMIT = int(os.getenv("INBOX_PAGE_LIMIT", 50))
+# Page cap per listing. Cursor pagination re-queries a live window on every page, so an
+# unbounded walk can chase a moving target; the incremental sweep runs every 15 minutes
+# and the nightly full pass is what guarantees coverage.
+INBOX_MAX_PAGES = int(os.getenv("INBOX_MAX_PAGES", 10))
+INBOX_FULL_MAX_PAGES = int(os.getenv("INBOX_FULL_MAX_PAGES", 60))
+# Re-open a post's comment thread when it is younger than this even if the comment
+# count hasn't moved (edits, hides and deletions don't change the count).
+INBOX_THREAD_REFRESH_DAYS = int(os.getenv("INBOX_THREAD_REFRESH_DAYS", 14))
+INBOX_EVENT_RETENTION_DAYS = int(os.getenv("INBOX_EVENT_RETENTION_DAYS", 30))
+# This service's own public base URL (Railway), used to register the webhook endpoint
+# with Zernio. Registration is an API call, not a dashboard setting, so the URL has to
+# come from the deployed environment or the subscription points at the wrong host.
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
 
 # Maximum articles to keep per source per run (0 = no limit)
 MAX_ARTICLES_PER_SOURCE = int(os.getenv("MAX_ARTICLES_PER_SOURCE", 50))
