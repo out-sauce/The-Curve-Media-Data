@@ -234,6 +234,56 @@ triggers stages over HTTP.
   days — and **~half of all messages have no `body`** (attachment-only story replies and
   shared posts, which is normal, not the field-mapping bug above).
 
+- **DM reply drafting** (`drafting/draft.py`, migration 040). Suggestions for the
+  operator; **this service never sends** — outbound stays with the Admin, which calls
+  Zernio directly, the same split `ingestion/inbox.py` already documents.
+  - **It targets the neglect TAIL, not the median.** Median reply to an incoming DM is
+    **0.3h**; p90 is **247.8h** (ten days). The inbox is bimodal, not slow, which is why
+    so many real replies open with "sorry it's taken us a while". Only threads already
+    past `DRAFT_MIN_AGE_HOURS` (24) are drafted — 49 qualify today out of 499. Drafting
+    everything would burn tokens on messages that get answered in eighteen minutes.
+  - **No fine-tuning and no retrieval, deliberately.** The usable corpus is ~111
+    (their message → our reply) pairs — about 10k tokens — so it fits in a cached prompt
+    prefix WHOLE. A vector index would be machinery maintained to retrieve 10 of 111.
+    Revisit only if the corpus outgrows the prefix. `VOYAGE_API_KEY` is not used here.
+  - **The exemplar block is the cache breakpoint**, so it is ordered `sent_at` ASC and
+    sliced from the end — a stable order. Prompt caching is a prefix match; reshuffling
+    it per run would silently buy a cache write instead of a cache read every time.
+    Everything thread-specific goes in the user message, after the prefix.
+  - **Pairs under `DRAFT_EXEMPLAR_MIN_REPLY_LEN` (80) are excluded.** 111 of the 473 raw
+    pairs are replies under 25 characters ("😂", "thank you!") — real replies, useless as
+    style examples; including them teaches the model to answer everything with an emoji.
+  - **One call per thread**, unlike the batched scoring/tagging stages: batching would
+    put several people's private threads in one request, and one long draft could
+    truncate the rest. With the corpus cached, isolation is worth more than the saving.
+    The `stop_reason` refusal/max_tokens check is the same standing gotcha as everywhere.
+  - **Drafts are DISPOSABLE and overwritten freely** — the operator copies into the
+    Admin's composer, edits, sends, which creates a normal `source='admin'` message row.
+    So `update_conversation_draft` overwrites unconditionally, in deliberate contrast to
+    `upsert_inbox_conversation`'s care around `is_read`/`read_at`/`read_by`. Nothing is
+    ever edited in place, so there is no operator state to protect and no widening of
+    `inbox_messages.source` was needed. "Was the draft used?" is **derivable** — an
+    outgoing message with `sent_at > draft_generated_at` — so it is not stored.
+  - **`draft_for_message_id` is load-bearing, not bookkeeping.** It gives staleness (a
+    draft written against message #7 still sitting there after #8 arrives) and
+    skip-if-current (a scheduled run over an unchanged inbox costs one listing query).
+    Same shape as `last_article_at` driving `_brief_is_current` (migration 031).
+  - **Two views, because PostgREST cannot express either.** `inbox_thread_latest`
+    (newest message per conversation — no "latest row per group") and
+    `inbox_reply_pairs` (the adjacency needs `lag()`); the pair view also projects
+    `incoming_len`/`ours_len` because PostgREST cannot filter on `length(col)`.
+  - **THE GATE IS CLASSIFIED BUT NOT ENFORCED.** `draft_category` is written and nothing
+    acts on it yet, by request. **~24% of substantive incoming DMs touch the fund or
+    investing**, and The Curve Investments is a licensed fund with a PDS — the corpus
+    contains concrete claims like "there is a new PDS coming into play on 1st August".
+    That is regulated territory and a confident AI draft about it is a real risk even
+    with a human pressing send. Enforcement is now a config change, not a re-run.
+  - `python -m drafting.backtest` scores drafts against replies the team actually sent,
+    with the held-out pairs **removed from the exemplars** (asserted — otherwise the
+    corpus is both the examples and the answer key). It judges voice and content
+    separately, since a draft that sounds perfect and invents a date is worse than a
+    clumsy one that defers, and counts ungrounded emails/URLs/dates mechanically.
+
 - **A true engagement rate on reach** (migration 036, nullable `engagement_on_reach`).
   Despite its name, `engagement_reach` is interactions / **views** — migration 026's
   proxy, chosen when reach wasn't available to us — and it stayed that way even after

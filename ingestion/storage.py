@@ -1074,6 +1074,142 @@ def upsert_inbox_comments(rows: list[dict[str, Any]]) -> int:
     return written
 
 
+def get_draft_exemplars(limit: int, min_reply_len: int,
+                        min_incoming_len: int) -> list[dict[str, Any]]:
+    """
+    The (their message -> our reply) pairs that teach the drafter our voice.
+
+    Reads the `inbox_reply_pairs` view (migration 040) — the adjacency needs lag(),
+    which PostgREST cannot express, and the length filters need length(), which it
+    cannot filter on either; both are projected by the view for that reason.
+
+    Ordered by sent_at ASCENDING and sliced from the END, so the set is the most recent
+    N in a STABLE order. Order matters beyond tidiness: this block is the cached prompt
+    prefix, and prompt caching is a prefix match — reordering it on every run would
+    silently cost a cache write instead of a cache read every time.
+    """
+    client = get_client()
+    try:
+        response = (
+            client.table("inbox_reply_pairs")
+            .select("incoming, ours, sent_at")
+            .gte("ours_len", min_reply_len)
+            .gte("incoming_len", min_incoming_len)
+            .order("sent_at", desc=False)
+            .execute()
+        )
+    except Exception as exc:
+        logger.warning("Could not load draft exemplars: %s", str(exc)[:200])
+        return []
+    rows = response.data or []
+    return rows[-limit:] if limit and len(rows) > limit else rows
+
+
+def get_threads_needing_drafts(min_age_hours: int, limit: int) -> list[dict[str, Any]]:
+    """
+    Threads whose newest message is theirs, has text, and has gone unanswered.
+
+    Two reads rather than a join: the `inbox_thread_latest` view (newest message per
+    conversation) and then the conversations themselves. PostgREST will not join a view
+    to a table without a declared relationship, and the set is small enough that it does
+    not matter.
+
+    A thread is SKIPPED when its draft already answers that same message — the
+    skip-if-current rule that stops a scheduled run redrafting the whole backlog every
+    time. Same shape as _brief_is_current (migration 031).
+
+    Attachment-only messages are skipped too: roughly half of all mirrored messages are
+    story replies and shared posts with no text at all, and there is nothing to draft a
+    reply to.
+    """
+    client = get_client()
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=min_age_hours)).isoformat()
+    try:
+        latest = (
+            client.table("inbox_thread_latest")
+            .select("conversation_id, last_message_id, last_body, last_sent_at")
+            .eq("last_direction", "incoming")
+            .lt("last_sent_at", cutoff)
+            .order("last_sent_at", desc=True)
+            .execute()
+        )
+    except Exception as exc:
+        logger.warning("Could not read thread tails: %s", str(exc)[:200])
+        return []
+
+    candidates = {
+        row["conversation_id"]: row
+        for row in latest.data or []
+        if (row.get("last_body") or "").strip()
+    }
+    if not candidates:
+        return []
+
+    threads: list[dict[str, Any]] = []
+    for chunk in _chunks(list(candidates), 100):
+        try:
+            response = (
+                client.table("inbox_conversations")
+                .select("id, platform, participant_name, participant_username, "
+                        "draft_for_message_id, ig_is_follower")
+                .in_("id", chunk)
+                .execute()
+            )
+        except Exception as exc:
+            logger.warning("Could not read conversations to draft: %s", str(exc)[:200])
+            continue
+        for row in response.data or []:
+            tail = candidates[row["id"]]
+            if row.get("draft_for_message_id") == tail["last_message_id"]:
+                continue          # draft already answers this exact message
+            threads.append({**row, **tail})
+
+    threads.sort(key=lambda t: t["last_sent_at"])   # oldest neglect first
+    return threads[:limit] if limit else threads
+
+
+def get_thread_messages(conversation_id: str, limit: int) -> list[dict[str, Any]]:
+    """The tail of one thread, oldest-first, for context in the drafting prompt."""
+    client = get_client()
+    try:
+        response = (
+            client.table("inbox_messages")
+            .select("direction, body, sent_at")
+            .eq("conversation_id", conversation_id)
+            .order("sent_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+    except Exception as exc:
+        logger.warning("Could not read thread %s: %s", conversation_id, str(exc)[:200])
+        return []
+    return list(reversed(response.data or []))
+
+
+def update_conversation_draft(conversation_id: str, draft: str | None,
+                              for_message_id: str | None, category: str | None) -> bool:
+    """
+    Stamp a draft onto a thread.
+
+    Overwrites unconditionally, and that is deliberate: the draft is a disposable
+    suggestion the operator copies out, never a document they edit in place, so there is
+    no operator state here to protect. Contrast upsert_inbox_conversation, which is
+    scrupulous about is_read/read_at/read_by.
+    """
+    client = get_client()
+    try:
+        client.table("inbox_conversations").update({
+            "draft_response": draft,
+            "draft_for_message_id": for_message_id,
+            "draft_generated_at": datetime.now(timezone.utc).isoformat(),
+            "draft_category": category,
+        }).eq("id", conversation_id).execute()
+        return True
+    except Exception as exc:
+        logger.warning("Could not write draft for %s: %s", conversation_id, str(exc)[:200])
+        return False
+
+
 def get_inbox_conversation_state() -> dict[str, dict[str, Any]]:
     """{zernio_conversation_id or uuid: {id, last_message_at, message_count}} — lets the
     sweep skip fetching messages for a thread that hasn't moved."""

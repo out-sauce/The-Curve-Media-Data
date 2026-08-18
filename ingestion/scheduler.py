@@ -28,6 +28,7 @@ from briefing.brief import run_briefing
 from ingestion.competitors import run_competitors
 from ingestion.guest_posts import run_guest_post_stats
 from ingestion.zernio import run_zernio_hourly, run_zernio_daily
+from drafting.draft import run_inbox_drafts
 from ingestion.inbox import run_inbox_sweep
 
 logger = logging.getLogger(__name__)
@@ -120,8 +121,17 @@ def start_scheduler() -> None:
         kwargs={"full": True},
         replace_existing=True,
     )
+    scheduler.add_job(
+        run_inbox_drafts,
+        # After the nightly full sweep at 04:30, so drafting sees a settled inbox — and
+        # once a day rather than hourly because it targets threads already neglected for
+        # DRAFT_MIN_AGE_HOURS. Nothing here is time-critical by construction.
+        CronTrigger(hour=5, minute=30, timezone="UTC"),
+        id="inbox_drafts",
+        replace_existing=True,
+    )
     logger.info(
         "Scheduler started — daily pipeline at 05:00 UTC, Zernio refresh hourly at :05, "
-        "inbox sweep every 15m (full at 04:30)"
+        "inbox sweep every 15m (full at 04:30), inbox drafts at 05:30"
     )
     scheduler.start()

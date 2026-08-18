@@ -55,6 +55,7 @@ from research.site_auth import (
 from ingestion.competitors import run_competitors
 from ingestion.guest_posts import run_guest_post_stats
 from ingestion.zernio import run_zernio_hourly, run_zernio_daily
+from drafting.draft import run_inbox_drafts
 from ingestion.inbox import (
     accept_webhook,
     process_webhook_event,
@@ -248,6 +249,30 @@ def run_inbox_sweep_endpoint(
     """
     _check_key(x_api_key)
     background_tasks.add_task(run_inbox_sweep, full)
+    return {"status": "started"}
+
+
+@app.post("/run/inbox-drafts")
+def run_inbox_drafts_endpoint(
+    background_tasks: BackgroundTasks,
+    limit: int = 0,
+    min_age_hours: int = 0,
+    x_api_key: str = Header(default=""),
+):
+    """
+    Draft replies for DM threads that have gone unanswered.
+
+    Suggestions only — this service never sends. The operator copies the draft into the
+    Admin's composer, edits it and sends from there, which is also what makes the drafts
+    safe to overwrite on every run.
+
+    ?limit= and ?min_age_hours= override the configured defaults; 0 means "use config",
+    so ?min_age_hours=1 is the way to sweep threads that only just went quiet.
+    """
+    _check_key(x_api_key)
+    background_tasks.add_task(
+        run_inbox_drafts, limit or None, min_age_hours or None,
+    )
     return {"status": "started"}
 
 

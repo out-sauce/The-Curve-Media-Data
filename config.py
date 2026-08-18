@@ -167,3 +167,19 @@ APIFY_LINKEDIN_POST_ACTOR = os.getenv("APIFY_LINKEDIN_POST_ACTOR", "apimaestro~l
 # competitor_posts card still uses COMPETITOR_POST_LIMIT / COMPETITOR_LOOKBACK_DAYS.
 SELF_CONTENT_STATS_LOOKBACK_DAYS = int(os.getenv("SELF_CONTENT_STATS_LOOKBACK_DAYS", 90))
 SELF_CONTENT_STATS_LIMIT = int(os.getenv("SELF_CONTENT_STATS_LIMIT", 100))
+
+# ── Inbox reply drafting (drafting/draft.py) ──────────────────────────────────
+# Drafting targets the NEGLECT TAIL, not the median. Median reply to an incoming DM is
+# 0.3h; p90 is 247.8h. Only threads already past DRAFT_MIN_AGE_HOURS are drafted.
+DRAFT_MODEL = os.getenv("DRAFT_MODEL", "claude-opus-5")
+DRAFT_MIN_AGE_HOURS = int(os.getenv("DRAFT_MIN_AGE_HOURS", 24))
+DRAFT_MAX_THREADS = int(os.getenv("DRAFT_MAX_THREADS", 40))
+# The exemplar corpus is the cached prompt prefix. ~111 pairs clear the length filters
+# today (~10k tokens), so the cap is headroom rather than a real limit.
+DRAFT_EXEMPLAR_LIMIT = int(os.getenv("DRAFT_EXEMPLAR_LIMIT", 150))
+# Below these lengths the pairs are "😂" / "thank you!" — real replies, useless as style
+# examples: 111 of the 473 raw pairs have replies under 25 characters.
+DRAFT_EXEMPLAR_MIN_REPLY_LEN = int(os.getenv("DRAFT_EXEMPLAR_MIN_REPLY_LEN", 80))
+DRAFT_EXEMPLAR_MIN_INCOMING_LEN = int(os.getenv("DRAFT_EXEMPLAR_MIN_INCOMING_LEN", 40))
+DRAFT_THREAD_CONTEXT_MESSAGES = int(os.getenv("DRAFT_THREAD_CONTEXT_MESSAGES", 12))
+DRAFT_MAX_TOKENS = int(os.getenv("DRAFT_MAX_TOKENS", 2000))
