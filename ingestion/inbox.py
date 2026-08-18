@@ -170,21 +170,36 @@ def _conversation_row(conversation: dict, account: dict, platform: str) -> dict:
 
 
 def _message_row(message: dict, conversation_uuid: str) -> dict:
-    return {
+    """
+    Normalise one message.
+
+    TWO payload shapes reach here and both must work. The REST listing uses Meta's own
+    flat naming (`message`, `senderId`, `senderName`); the webhook envelope nests a
+    `sender` object and calls the text `text`. Reading only the webhook shape is what
+    would have left every swept message with a NULL body and no sender.
+    """
+    sender = message.get("sender") or {}
+    row = {
         "conversation_id": conversation_uuid,
         "zernio_message_id": message.get("id"),
         "platform_message_id": message.get("platformMessageId"),
         "direction": message.get("direction") or "incoming",
-        "body": message.get("text"),
-        "sender_id": (message.get("sender") or {}).get("id"),
+        "body": message.get("message") or message.get("text"),
+        "sender_id": message.get("senderId") or sender.get("id"),
         "sender_name": (
-            (message.get("sender") or {}).get("name")
-            or (message.get("sender") or {}).get("username")
+            message.get("senderName") or sender.get("name") or sender.get("username")
         ),
         "attachments": _attachment_rows(message.get("attachments")),
         "sent_at": message.get("sentAt") or message.get("createdAt"),
         "story_reply": bool(message.get("storyReply") or message.get("isStoryReply")),
     }
+    # Mutable state, and only written when the payload actually carries it: skip-None
+    # keeps a None out of the write, but a False WOULD overwrite a True that a
+    # message.deleted/message.edited webhook had already established.
+    for key, column in (("isEdited", "is_edited"), ("isDeleted", "is_deleted")):
+        if message.get(key) is not None:
+            row[column] = bool(message[key])
+    return row
 
 
 def _post_row(post: dict, account: dict, platform: str) -> dict:
@@ -208,8 +223,20 @@ def _post_row(post: dict, account: dict, platform: str) -> dict:
 def _comment_row(comment: dict, post_uuid: str, platform: str,
                  account_username: str | None,
                  parent_id: str | None = None) -> dict:
-    author = comment.get("author") or {}
+    # TWO payload shapes, as in _message_row: the comment-thread endpoint returns
+    # Meta's naming (`message`, `from`, `parentId`) while the webhook envelope uses
+    # `text`/`author`/`parentCommentId`. Reading only the webhook shape is what mirrored
+    # 359 comments with a NULL body and no author at all (found live 2026-08-18).
+    author = comment.get("from") or comment.get("author") or {}
     author_username = author.get("username")
+    # The thread payload states ownership outright, which beats comparing usernames.
+    # The comparison stays as the fallback: the webhook shape carries no isOwner.
+    is_owner = author.get("isOwner")
+    if is_owner is None:
+        is_owner = bool(
+            author_username and account_username
+            and author_username.lstrip("@").lower() == account_username.lstrip("@").lower()
+        )
     return {
         "post_id": post_uuid,
         "platform": platform,
@@ -218,16 +245,15 @@ def _comment_row(comment: dict, post_uuid: str, platform: str,
         # ABSENT (not null) on top-level Facebook/Instagram entries, so .get() is the
         # only safe read, and nesting is the relationship those platforms actually
         # express.
-        "parent_comment_id": parent_id or comment.get("parentCommentId"),
-        "body": comment.get("text"),
+        "parent_comment_id": (
+            parent_id or comment.get("parentId") or comment.get("parentCommentId")
+        ),
+        "body": comment.get("message") or comment.get("text"),
         "author_id": author.get("id"),
         "author_username": author_username,
         "author_name": author.get("name"),
         "author_picture": author.get("picture"),
-        "author_is_owner": bool(
-            author_username and account_username
-            and author_username.lstrip("@").lower() == account_username.lstrip("@").lower()
-        ),
+        "author_is_owner": bool(is_owner),
         "like_count": comment.get("likeCount"),
         "reply_count": comment.get("replyCount"),
         "is_hidden": bool(comment.get("isHidden")),
@@ -489,7 +515,9 @@ def _sweep_conversations(full: bool) -> int:
                 > (_parse_dt(known.get("last_message_at")) or datetime.min.replace(tzinfo=timezone.utc))
             )
             if moved or full:
-                _sweep_messages(conversation_id, conversation_uuid)
+                _sweep_messages(
+                    conversation_id, conversation_uuid, item.get("accountId"), full,
+                )
 
         pagination = payload.get("pagination") or {}
         cursor = pagination.get("nextCursor")
@@ -500,25 +528,52 @@ def _sweep_conversations(full: bool) -> int:
     return written
 
 
-def _sweep_messages(zernio_conversation_id: str, conversation_uuid: str) -> None:
-    """One page of the newest messages in a thread. Descending, so the newest are
-    always covered; the nightly full pass is what backfills depth."""
-    try:
-        payload = zernio_get(
-            f"/v1/inbox/conversations/{zernio_conversation_id}/messages",
-            {"limit": INBOX_PAGE_LIMIT, "sortOrder": "desc"},
-        )
-    except Exception as exc:
-        logger.warning(
-            "Zernio messages fetch failed for %s: %s", zernio_conversation_id, str(exc)[:200],
-        )
+def _sweep_messages(zernio_conversation_id: str, conversation_uuid: str,
+                    account_id: str | None, full: bool = False) -> None:
+    """
+    Mirror a thread's messages, newest first.
+
+    `accountId` is REQUIRED here — omitting it returns 400 missing_required_field on
+    every call, which is precisely what happened: the mirror held a conversation whose
+    summary line came from the listing and not one message row behind it. The failure
+    was invisible because it is caught below as a warning while the sweep still logs ok.
+    Anything reading this table has to tolerate a thread with zero messages regardless.
+
+    Incremental takes one page (the newest 50) — enough to keep up. The nightly full
+    pass follows the cursor to exhaustion, which is what backfills a long thread and
+    Meta's replayed pre-connect history.
+    """
+    if not account_id:
         return
-    rows = []
-    for message in payload.get("data") or payload.get("messages") or []:
-        row = _message_row(message, conversation_uuid)
-        if row.get("sent_at"):
-            rows.append(row)
-    upsert_inbox_messages(rows)
+    max_pages = INBOX_FULL_MAX_PAGES if full else 1
+    cursor = None
+    for _ in range(max_pages):
+        params = {
+            "accountId": account_id,
+            "limit": INBOX_PAGE_LIMIT,
+            "sortOrder": "desc",
+        }
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            payload = zernio_get(
+                f"/v1/inbox/conversations/{zernio_conversation_id}/messages", params,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Zernio messages fetch failed for %s: %s",
+                zernio_conversation_id, str(exc)[:200],
+            )
+            return
+        items = payload.get("data") or payload.get("messages") or []
+        if not items:
+            break
+        rows = [_message_row(m, conversation_uuid) for m in items if isinstance(m, dict)]
+        upsert_inbox_messages([r for r in rows if r.get("sent_at")])
+        pagination = payload.get("pagination") or {}
+        cursor = pagination.get("nextCursor") or pagination.get("cursor")
+        if not pagination.get("hasMore") or not cursor:
+            break
 
 
 def _sweep_comments(full: bool) -> int:
@@ -589,7 +644,7 @@ def _sweep_comments(full: bool) -> int:
             if count_moved or recent or full:
                 _sweep_comment_thread(
                     key, item.get("accountId"), post_uuid, platform,
-                    item.get("accountUsername"),
+                    item.get("accountUsername"), full,
                 )
 
         pagination = payload.get("pagination") or {}
@@ -601,24 +656,54 @@ def _sweep_comments(full: bool) -> int:
 
 def _sweep_comment_thread(platform_post_id: str, account_id: str | None,
                           post_uuid: str, platform: str,
-                          account_username: str | None) -> None:
+                          account_username: str | None, full: bool = False) -> None:
+    """
+    Mirror one post's whole comment thread, following the cursor to the end.
+
+    NOTE THE PAGINATION KEY. Every listing endpoint here returns
+    `pagination.nextCursor`, but this one returns `pagination.cursor` while still
+    setting hasMore — so reading nextCursor yields None and silently caps a thread at
+    one page. That is what stored 50-of-184, 50-of-167 and 50-of-94 comments on three
+    posts (verified live 2026-08-18). Both keys are read so a vendor rename cannot
+    re-introduce the cap.
+
+    The page limit counts TOP-LEVEL comments only — replies ride along nested inside
+    their parent and are free — so 50 entries routinely flatten to more than 50 rows,
+    and a page count can never be compared against `commentCount` directly.
+    """
     if not account_id:
         return
-    try:
-        payload = zernio_get(
-            f"/v1/inbox/comments/{platform_post_id}",
-            {"accountId": account_id, "limit": INBOX_PAGE_LIMIT},
+    max_pages = INBOX_FULL_MAX_PAGES if full else INBOX_MAX_PAGES
+    cursor = None
+    seen: set[str] = set()
+    for _ in range(max_pages):
+        params = {"accountId": account_id, "limit": INBOX_PAGE_LIMIT}
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            payload = zernio_get(f"/v1/inbox/comments/{platform_post_id}", params)
+        except Exception as exc:
+            logger.warning(
+                "Zernio comment thread fetch failed for %s: %s",
+                platform_post_id, str(exc)[:200],
+            )
+            return
+        items = [i for i in payload.get("data") or payload.get("comments") or []
+                 if isinstance(i, dict) and i.get("id")]
+        if not items:
+            break
+        # The window is live, so a shifting page boundary can repeat an entry — dedupe
+        # top-level ids locally rather than trusting the cursor to be exact.
+        fresh = [i for i in items if i["id"] not in seen]
+        seen.update(i["id"] for i in items)
+        rows = _flatten_comments(fresh, post_uuid, platform, account_username)
+        upsert_inbox_comments(
+            [r for r in rows if r.get("platform_comment_id") and r.get("commented_at")]
         )
-    except Exception as exc:
-        logger.warning(
-            "Zernio comment thread fetch failed for %s: %s", platform_post_id, str(exc)[:200],
-        )
-        return
-    rows = _flatten_comments(
-        payload.get("data") or payload.get("comments") or [],
-        post_uuid, platform, account_username,
-    )
-    upsert_inbox_comments([r for r in rows if r.get("platform_comment_id") and r.get("commented_at")])
+        pagination = payload.get("pagination") or {}
+        cursor = pagination.get("cursor") or pagination.get("nextCursor")
+        if not pagination.get("hasMore") or not cursor:
+            break
 
 
 def run_inbox_sweep(full: bool = False) -> None:
