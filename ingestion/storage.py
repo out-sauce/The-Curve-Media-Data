@@ -1105,43 +1105,44 @@ def get_draft_exemplars(limit: int, min_reply_len: int,
     return rows[-limit:] if limit and len(rows) > limit else rows
 
 
-def get_threads_needing_drafts(min_age_hours: int, limit: int) -> list[dict[str, Any]]:
+def get_threads_to_triage(min_age_hours: int, limit: int) -> list[dict[str, Any]]:
     """
-    Threads whose newest message is theirs, has text, and has gone unanswered.
+    Threads whose newest message is theirs and hasn't been judged yet.
 
     Two reads rather than a join: the `inbox_thread_latest` view (newest message per
     conversation) and then the conversations themselves. PostgREST will not join a view
     to a table without a declared relationship, and the set is small enough that it does
     not matter.
 
-    A thread is SKIPPED when its draft already answers that same message — the
-    skip-if-current rule that stops a scheduled run redrafting the whole backlog every
-    time. Same shape as _brief_is_current (migration 031).
+    A thread is SKIPPED when the judgement already answers that same message —
+    skip-if-current, so a scheduled run over an unchanged inbox costs two listing queries
+    and nothing else. Same shape as _brief_is_current (migration 031). The marker read
+    here is `needs_reply_for_message_id`, NOT the draft's: a thread judged as needing no
+    reply has no draft, and keying on the draft would re-judge it forever.
 
-    Attachment-only messages are skipped too: roughly half of all mirrored messages are
-    story replies and shared posts with no text at all, and there is nothing to draft a
-    reply to.
+    ATTACHMENT-ONLY TAILS ARE INCLUDED, deliberately, where the old drafting query
+    excluded them. 64 of the 116 waiting threads end in an attachment with no text, and
+    excluding them left exactly those 64 sitting in the Admin's To-reply list with nothing
+    that could ever clear them. Judging costs one call and clears them for good — and the
+    handful that DO need an answer (a photo sent after a question) are only reachable this
+    way. `min_age_hours=0` means no age gate at all.
     """
     client = get_client()
-    cutoff = (datetime.now(timezone.utc) - timedelta(hours=min_age_hours)).isoformat()
     try:
-        latest = (
+        query = (
             client.table("inbox_thread_latest")
             .select("conversation_id, last_message_id, last_body, last_sent_at")
             .eq("last_direction", "incoming")
-            .lt("last_sent_at", cutoff)
-            .order("last_sent_at", desc=True)
-            .execute()
         )
+        if min_age_hours > 0:
+            cutoff = (datetime.now(timezone.utc) - timedelta(hours=min_age_hours)).isoformat()
+            query = query.lt("last_sent_at", cutoff)
+        latest = query.order("last_sent_at", desc=True).execute()
     except Exception as exc:
         logger.warning("Could not read thread tails: %s", str(exc)[:200])
         return []
 
-    candidates = {
-        row["conversation_id"]: row
-        for row in latest.data or []
-        if (row.get("last_body") or "").strip()
-    }
+    candidates = {row["conversation_id"]: row for row in latest.data or []}
     if not candidates:
         return []
 
@@ -1151,17 +1152,17 @@ def get_threads_needing_drafts(min_age_hours: int, limit: int) -> list[dict[str,
             response = (
                 client.table("inbox_conversations")
                 .select("id, platform, participant_name, participant_username, "
-                        "draft_for_message_id, ig_is_follower")
+                        "needs_reply_for_message_id, ig_is_follower")
                 .in_("id", chunk)
                 .execute()
             )
         except Exception as exc:
-            logger.warning("Could not read conversations to draft: %s", str(exc)[:200])
+            logger.warning("Could not read conversations to triage: %s", str(exc)[:200])
             continue
         for row in response.data or []:
             tail = candidates[row["id"]]
-            if row.get("draft_for_message_id") == tail["last_message_id"]:
-                continue          # draft already answers this exact message
+            if row.get("needs_reply_for_message_id") == tail["last_message_id"]:
+                continue          # already judged against this exact message
             threads.append({**row, **tail})
 
     threads.sort(key=lambda t: t["last_sent_at"])   # oldest neglect first
@@ -1186,27 +1187,41 @@ def get_thread_messages(conversation_id: str, limit: int) -> list[dict[str, Any]
     return list(reversed(response.data or []))
 
 
-def update_conversation_draft(conversation_id: str, draft: str | None,
-                              for_message_id: str | None, category: str | None) -> bool:
+def update_conversation_judgement(conversation_id: str, needs_reply: bool,
+                                  reason: str | None, for_message_id: str | None,
+                                  draft: str | None, category: str | None) -> bool:
     """
-    Stamp a draft onto a thread.
+    Stamp one thread's judgement and its draft, in a single update.
 
-    Overwrites unconditionally, and that is deliberate: the draft is a disposable
-    suggestion the operator copies out, never a document they edit in place, so there is
-    no operator state here to protect. Contrast upsert_inbox_conversation, which is
-    scrupulous about is_read/read_at/read_by.
+    ONE write, not two, and that is the point: `needs_reply_for_message_id` is what makes
+    the stage idempotent, so if it landed and the draft didn't, the thread would be
+    skipped forever holding a mark with no suggestion behind it. A single row update has
+    no such half-state.
+
+    Overwrites unconditionally. The draft is a disposable suggestion the operator copies
+    out, never a document they edit in place, so there is no operator state here to
+    protect — contrast upsert_inbox_conversation, which is scrupulous about
+    is_read/read_at/read_by. When the judgement is "no reply needed" the draft columns are
+    CLEARED rather than left alone: a leftover suggestion beside a "nothing to do here"
+    mark is a contradiction the operator has to resolve by reading both.
     """
     client = get_client()
+    now = datetime.now(timezone.utc).isoformat()
+    payload: dict[str, Any] = {
+        "needs_reply": needs_reply,
+        "needs_reply_reason": (reason or None),
+        "needs_reply_for_message_id": for_message_id,
+        "needs_reply_at": now,
+        "draft_response": draft if needs_reply else None,
+        "draft_for_message_id": for_message_id if needs_reply else None,
+        "draft_generated_at": now if needs_reply else None,
+        "draft_category": category if needs_reply else None,
+    }
     try:
-        client.table("inbox_conversations").update({
-            "draft_response": draft,
-            "draft_for_message_id": for_message_id,
-            "draft_generated_at": datetime.now(timezone.utc).isoformat(),
-            "draft_category": category,
-        }).eq("id", conversation_id).execute()
+        client.table("inbox_conversations").update(payload).eq("id", conversation_id).execute()
         return True
     except Exception as exc:
-        logger.warning("Could not write draft for %s: %s", conversation_id, str(exc)[:200])
+        logger.warning("Could not write judgement for %s: %s", conversation_id, str(exc)[:200])
         return False
 
 

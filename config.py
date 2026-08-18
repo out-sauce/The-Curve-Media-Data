@@ -168,12 +168,19 @@ APIFY_LINKEDIN_POST_ACTOR = os.getenv("APIFY_LINKEDIN_POST_ACTOR", "apimaestro~l
 SELF_CONTENT_STATS_LOOKBACK_DAYS = int(os.getenv("SELF_CONTENT_STATS_LOOKBACK_DAYS", 90))
 SELF_CONTENT_STATS_LIMIT = int(os.getenv("SELF_CONTENT_STATS_LIMIT", 100))
 
-# ── Inbox reply drafting (drafting/draft.py) ──────────────────────────────────
-# Drafting targets the NEGLECT TAIL, not the median. Median reply to an incoming DM is
-# 0.3h; p90 is 247.8h. Only threads already past DRAFT_MIN_AGE_HOURS are drafted.
+# ── Inbox reply triage + drafting (drafting/draft.py) ─────────────────────────
+# The stage judges every thread waiting on us and drafts a reply for the ones that need
+# one, so the work is bounded by "needs a human" rather than by age.
 DRAFT_MODEL = os.getenv("DRAFT_MODEL", "claude-opus-5")
-DRAFT_MIN_AGE_HOURS = int(os.getenv("DRAFT_MIN_AGE_HOURS", 24))
-DRAFT_MAX_THREADS = int(os.getenv("DRAFT_MAX_THREADS", 40))
+# 0 = no age gate: judge a thread as soon as it is waiting on us. This used to be 24,
+# from when the stage targeted only the neglect tail (median reply is 0.3h, p90 247.8h) —
+# with a judgement in front of the drafting that filter is doing the wrong job, but the
+# knob survives so reinstating it is a config change.
+DRAFT_MIN_AGE_HOURS = int(os.getenv("DRAFT_MIN_AGE_HOURS", 0))
+# A runaway backstop, not a policy. Sized to clear the whole standing backlog in one run
+# (116 waiting threads when the judgement was introduced) with headroom; a run that hits
+# it logs a warning rather than truncating quietly.
+DRAFT_MAX_THREADS = int(os.getenv("DRAFT_MAX_THREADS", 200))
 # The exemplar corpus is the cached prompt prefix. ~111 pairs clear the length filters
 # today (~10k tokens), so the cap is headroom rather than a real limit.
 DRAFT_EXEMPLAR_LIMIT = int(os.getenv("DRAFT_EXEMPLAR_LIMIT", 150))

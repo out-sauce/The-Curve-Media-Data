@@ -123,15 +123,18 @@ def start_scheduler() -> None:
     )
     scheduler.add_job(
         run_inbox_drafts,
-        # After the nightly full sweep at 04:30, so drafting sees a settled inbox — and
-        # once a day rather than hourly because it targets threads already neglected for
-        # DRAFT_MIN_AGE_HOURS. Nothing here is time-critical by construction.
-        CronTrigger(hour=5, minute=30, timezone="UTC"),
+        # Hourly at :35, where this used to be once a day at 05:30. It no longer waits for
+        # a thread to go stale (DRAFT_MIN_AGE_HOURS=0) — it judges whatever is waiting on
+        # us — and the Admin's To-reply list is only as good as the last run, so a daily
+        # cadence would leave a day of DMs unjudged. Cheap to repeat: skip-if-current means
+        # an unchanged inbox costs two listing queries and no model calls.
+        # :35 sits after the :15/:30 inbox sweeps, so it judges a settled mirror.
+        CronTrigger(minute=35, timezone="UTC"),
         id="inbox_drafts",
         replace_existing=True,
     )
     logger.info(
         "Scheduler started — daily pipeline at 05:00 UTC, Zernio refresh hourly at :05, "
-        "inbox sweep every 15m (full at 04:30), inbox drafts at 05:30"
+        "inbox sweep every 15m (full at 04:30), inbox triage + drafts hourly at :35"
     )
     scheduler.start()

@@ -234,14 +234,47 @@ triggers stages over HTTP.
   days — and **~half of all messages have no `body`** (attachment-only story replies and
   shared posts, which is normal, not the field-mapping bug above).
 
-- **DM reply drafting** (`drafting/draft.py`, migration 040). Suggestions for the
-  operator; **this service never sends** — outbound stays with the Admin, which calls
-  Zernio directly, the same split `ingestion/inbox.py` already documents.
-  - **It targets the neglect TAIL, not the median.** Median reply to an incoming DM is
-    **0.3h**; p90 is **247.8h** (ten days). The inbox is bimodal, not slow, which is why
-    so many real replies open with "sorry it's taken us a while". Only threads already
-    past `DRAFT_MIN_AGE_HOURS` (24) are drafted — 49 qualify today out of 499. Drafting
-    everything would burn tokens on messages that get answered in eighteen minutes.
+- **DM reply TRIAGE + drafting** (`drafting/draft.py`, migrations 040 + **041**).
+  Suggestions for the operator; **this service never sends** — outbound stays with the
+  Admin, which calls Zernio directly, the same split `ingestion/inbox.py` documents.
+  - **The stage now judges before it drafts, and the Admin's "To reply" list IS the set
+    it marks.** For each thread waiting on us, one call returns `needs_reply` + a one-line
+    `reason` + `category` + `draft`, and only a marked thread gets a draft. Judgement and
+    draft are written in **one** update (`update_conversation_judgement`), because
+    `needs_reply_for_message_id` is what makes the stage idempotent — if it landed and the
+    draft didn't, the thread would be skipped forever holding a mark with nothing behind it.
+  - **Why the judgement exists: "the newest message is theirs" is mostly wrong.** Of 116
+    such threads, **64 ended in an attachment with no text** — a story share, a reaction,
+    a photo. The old drafting query excluded exactly those (nothing to draft), which left
+    them sitting in the Admin's To-reply list with nothing that could ever clear them.
+    They are now judged, cleared, and stay cleared until the person writes again.
+    First live run over the standing backlog: **116 judged, 33 marked as needing a reply
+    (all 33 drafted), 83 cleared** — including a thread the old stage had drafted a
+    courtesy reply for after the member signed off "Oo okay exciting times! All good x".
+    Sanity-checked against SQL: **not one cleared thread has a question mark in its last
+    message.**
+  - **The judge sees attachment-only tails, where the drafting query excluded them, and
+    that is where it earns its keep.** 5 of the 33 it marked end in an attachment with no
+    text — a member who asked which account Sophie meant on the pod, one still waiting on
+    a course email, one who wrote a long message about the ethics of property investing
+    after buying her first home — each followed by a photo. The old `last_body` filter
+    dropped all five on the reasoning that there is nothing to draft a reply *to*, which
+    confused the last message with the conversation. 59 of the 83 clears are the case that
+    filter was really aimed at, and they cost one call each, once.
+  - **`needs_reply` is NULLABLE and NULL is load-bearing.** It means "not judged yet", and
+    the Admin falls back to the old derivation for those, so a DM arriving between runs is
+    never invisible. Three states, not two — do not give the column a default.
+  - **The age gate is off by default now** (`DRAFT_MIN_AGE_HOURS` 24 → **0**) and the job
+    runs **hourly at :35** rather than daily at 05:30. Median reply to an incoming DM is
+    still **0.3h** with p90 **247.8h** — the inbox is bimodal, not slow — but with a
+    judgement in front of the drafting, the work is bounded by "needs a human" instead of
+    by age, and a To-reply list is only as fresh as its last run. Cheap to repeat:
+    skip-if-current means an unchanged inbox costs two listing queries and no model calls.
+    `DRAFT_MAX_THREADS` is 200 (was 40) — a runaway backstop that **logs when it bites**.
+  - **A `None` from the per-thread call is never written.** An API or parse failure leaves
+    the thread unjudged for the next run; writing it would mark (and so permanently skip)
+    a thread on the strength of an error. "Needs a reply but produced no draft" is a
+    different case and keeps the mark — a failed draft is not a verdict of nothing-to-do.
   - **No fine-tuning and no retrieval, deliberately.** The usable corpus is ~111
     (their message → our reply) pairs — about 10k tokens — so it fits in a cached prompt
     prefix WHOLE. A vector index would be machinery maintained to retrieve 10 of 111.
@@ -259,15 +292,22 @@ triggers stages over HTTP.
     The `stop_reason` refusal/max_tokens check is the same standing gotcha as everywhere.
   - **Drafts are DISPOSABLE and overwritten freely** — the operator copies into the
     Admin's composer, edits, sends, which creates a normal `source='admin'` message row.
-    So `update_conversation_draft` overwrites unconditionally, in deliberate contrast to
+    So `update_conversation_judgement` overwrites unconditionally, in deliberate contrast to
     `upsert_inbox_conversation`'s care around `is_read`/`read_at`/`read_by`. Nothing is
     ever edited in place, so there is no operator state to protect and no widening of
     `inbox_messages.source` was needed. "Was the draft used?" is **derivable** — an
     outgoing message with `sent_at > draft_generated_at` — so it is not stored.
-  - **`draft_for_message_id` is load-bearing, not bookkeeping.** It gives staleness (a
-    draft written against message #7 still sitting there after #8 arrives) and
-    skip-if-current (a scheduled run over an unchanged inbox costs one listing query).
-    Same shape as `last_article_at` driving `_brief_is_current` (migration 031).
+  - **The `*_for_message_id` markers are load-bearing, not bookkeeping.** They give
+    staleness (a draft written against message #7 still sitting there after #8 arrives)
+    and skip-if-current. Same shape as `last_article_at` driving `_brief_is_current`
+    (migration 031). Note which one the eligibility query reads: **`needs_reply_for_
+    message_id`, not the draft's** — a thread judged as needing no reply has no draft, and
+    keying on the draft would re-judge it every run forever.
+  - **A cleared thread stops being fetched by the Admin.** `getInboxConversations` admits
+    the newest N plus everything that still owes a reply, so "no reply needed" is what
+    keeps 86 dead threads out of that second window rather than padding it permanently.
+    The Admin shows the `reason` beside the thread — a mark nobody can argue with is a
+    mark nobody will trust.
   - **Two views, because PostgREST cannot express either.** `inbox_thread_latest`
     (newest message per conversation — no "latest row per group") and
     `inbox_reply_pairs` (the adjacency needs `lag()`); the pair view also projects
@@ -280,7 +320,11 @@ triggers stages over HTTP.
     with a human pressing send. Enforcement is now a config change, not a re-run.
   - `python -m drafting.backtest` scores drafts against replies the team actually sent,
     with the held-out pairs **removed from the exemplars** (asserted — otherwise the
-    corpus is both the examples and the answer key). It judges voice and content
+    corpus is both the examples and the answer key). It now also measures TRIAGE, free:
+    every held-out pair is a message the team did answer, so `needs_reply` must be true,
+    and a miss is counted and printed rather than disappearing into "declined to draft".
+    It shares `_TRIAGE` with production — the schema demands a verdict, so a backtest
+    without the rubric would be scoring the model guessing at a rule it was never given. It judges voice and content
     separately, since a draft that sounds perfect and invents a date is worse than a
     clumsy one that defers, and counts ungrounded emails/URLs/dates mechanically.
 

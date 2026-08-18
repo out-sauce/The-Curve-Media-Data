@@ -1,12 +1,26 @@
 """
-DM reply drafting — suggestions for the operator, never sends.
+DM reply triage + drafting — suggestions for the operator, never sends.
 
-WHAT THIS IS FOR. Reply latency here is bimodal, not slow: the median reply to an
-incoming DM is 0.3 hours, but p90 is 247.8 hours — ten days. Most messages are answered
-almost immediately and a long tail rots, which is why so many real replies in the corpus
-open with "sorry it's taken us a while to come back to you". So this stage deliberately
-does NOT try to draft everything. It targets threads that have already gone unanswered
-past DRAFT_MIN_AGE_HOURS, which is the only part that is actually broken.
+TWO JOBS, ONE CALL. For each thread waiting on us the model decides whether it actually
+owes a reply, and if it does, writes one. Both halves land in inbox_conversations
+(migrations 040 + 041) and the Admin's "To reply" list IS the set this stage marks.
+
+WHY THE JUDGEMENT EXISTS. "Waiting on us" used to mean "the newest message is theirs",
+which sounds right and mostly isn't: of 116 such threads, 64 ended in an attachment with
+no text — a story share, a reaction, a photo. Those are not requests, so the To-reply list
+was mostly noise, and worse, nothing could ever clear them. A judgement per thread both
+shrinks the list to what a human should act on and, being stamped against a specific
+message id, stays cleared until they write again. `needs_reply` is NULLABLE upstream:
+until this stage has seen a thread the Admin falls back to the old derivation, so a DM
+arriving between runs is never invisible.
+
+WHY IT DRAFTS EVERYTHING IT MARKS, NOT JUST THE TAIL. This stage used to target threads
+already neglected past DRAFT_MIN_AGE_HOURS, on the reasoning that the median reply is 0.3h
+and drafting the rest is waste. The gate is now off by default (DRAFT_MIN_AGE_HOURS=0) —
+every thread the model marks gets a draft — because with the judgement in front of it the
+work is bounded by "needs a human" rather than by age, and a draft waiting for the
+operator when they open a thread is worth more than one that arrives a day late. The knob
+survives, so reinstating the gate is a config change.
 
 NO FINE-TUNING, AND NO RETRIEVAL. The house voice is taught by example, in the prompt.
 The whole usable corpus is ~111 (their message -> our reply) pairs, roughly 10k tokens —
@@ -20,8 +34,8 @@ here is ever edited in place, so drafts are overwritten freely and regenerating 
 safe. This module never sends anything: outbound belongs to the Admin app, which calls
 Zernio directly (see ingestion/inbox.py's note on the same split).
 
-THE GATE IS NOT ENFORCED YET, ON PURPOSE. `category` is classified and written but
-nothing acts on it. About 24% of substantive incoming DMs touch the fund or investing,
+THE CATEGORY GATE IS NOT ENFORCED YET, ON PURPOSE. `category` is classified and written
+but nothing acts on it. About 24% of substantive incoming DMs touch the fund or investing,
 and The Curve Investments is a licensed fund with a PDS — replies in the corpus make
 concrete claims like "there is a new PDS coming into play on 1st August". That is
 regulated territory, and an operator reading a confident AI draft about it is a real
@@ -51,9 +65,9 @@ from config import (
 from ingestion.storage import (
     get_draft_exemplars,
     get_thread_messages,
-    get_threads_needing_drafts,
+    get_threads_to_triage,
     log_source_run,
-    update_conversation_draft,
+    update_conversation_judgement,
 )
 
 logger = logging.getLogger(__name__)
@@ -73,15 +87,44 @@ CATEGORIES = (
     "other",
 )
 
+# needs_reply and reason come FIRST in the property order on purpose: the model fills the
+# object in order, so it commits to the judgement (and says why) before it starts writing,
+# rather than justifying a draft it has already produced.
 DRAFT_SCHEMA = {
     "type": "object",
     "properties": {
+        "needs_reply": {"type": "boolean"},
+        "reason": {"type": "string"},
         "category": {"type": "string", "enum": list(CATEGORIES)},
         "draft": {"type": "string"},
     },
-    "required": ["category", "draft"],
+    "required": ["needs_reply", "reason", "category", "draft"],
     "additionalProperties": False,
 }
+
+_TRIAGE = """First decide whether this thread owes a reply at all, then write one only if it does.
+
+You are looking at the newest message, which is theirs. The question is not "could something be said" — something can always be said. It is "would the team be letting someone down by never answering this".
+
+NEEDS A REPLY when their last message:
+- asks a question, however small
+- raises a problem, a complaint, or something that has gone wrong
+- makes a request, an offer, a pitch or a partnership approach
+- is waiting on something the team said it would do earlier in the thread
+- is substantive about their own money situation, even without a question mark — someone who has just told you something personal is waiting to be heard
+
+DOES NOT NEED A REPLY when their last message:
+- is an attachment with no text and nothing pending — a shared post, a story reply, a photo. This is the common case and leaving it is not rudeness; nobody expects an answer to a story share.
+- is a reaction or a sign-off: an emoji, "haha", "love this", "thank you!!" once the thing they are thanking you for is already done
+- closes out a conversation the team already answered — they got what they came for
+- is spam, a bot, a bulk promotional pitch, or a follow-for-follow message
+
+When it is genuinely a close call, say it NEEDS a reply. A human reads this list and can dismiss a thread in a second; a member who wrote something real and got silence is the expensive mistake.
+
+Put your reasoning in `reason` as ONE short sentence, in plain words, addressed to the operator — "story share, nothing pending", or "asking when the next cohort opens". It is shown beside the thread and it is how they decide whether to trust the mark.
+
+If it does not need a reply, return an empty `draft` and stop there. Do not write a courtesy message to fill the field."""
+
 
 _VOICE = """You draft Instagram DM replies for The Curve, a New Zealand money and \
 investing platform for women, founded by Sophie and Vic. You are writing a SUGGESTION \
@@ -179,12 +222,21 @@ def _thread_block(messages: list[dict], name: str | None) -> str:
     return "\n".join(lines)
 
 
-def _draft_one(client: anthropic.Anthropic, system: list[dict],
-               thread: dict) -> tuple[str, str] | None:
+def _judge_and_draft_one(client: anthropic.Anthropic, system: list[dict],
+                         thread: dict) -> dict | None:
     """
-    Draft a reply for one thread. Returns (category, draft) or None.
+    Judge one thread and draft a reply if it needs one.
 
-    One call per thread rather than the batched shape the scoring/tagging stages use.
+    Returns {needs_reply, reason, category, draft}, or None when the call failed and the
+    thread must be left for the next run — a None is never written, or a thread would get
+    marked (and so skipped forever) on the strength of an API error.
+
+    ONE call for both halves rather than a cheap triage pass feeding an expensive drafting
+    pass. The judgement needs the same thread tail the draft does, the exemplar prefix is
+    a cache read either way, and splitting it would leave two prompts free to disagree
+    about what the last message is asking for.
+
+    One call per THREAD rather than the batched shape the scoring/tagging stages use.
     Batching would put several people's private threads in one request and one long
     draft could truncate the rest; with the exemplar corpus cached, the per-thread cost
     is small enough that the isolation is worth more than the saving.
@@ -200,7 +252,8 @@ def _draft_one(client: anthropic.Anthropic, system: list[dict],
         f"{' (a follower)' if thread.get('ig_is_follower') else ''}, "
         f"oldest message first:\n\n"
         f"{_thread_block(messages, first_name)}\n\n"
-        "Their last message is the one to answer. Classify it, then write the reply."
+        "Their last message is the one in question. Decide whether it needs a reply, say "
+        "why in one sentence, classify it, then write the reply if one is needed."
     )
 
     try:
@@ -215,13 +268,13 @@ def _draft_one(client: anthropic.Anthropic, system: list[dict],
             },
         )
     except Exception as exc:
-        logger.warning("Draft API error for %s: %s", thread["id"], str(exc)[:200])
+        logger.warning("Triage API error for %s: %s", thread["id"], str(exc)[:200])
         return None
 
     # The standing gotcha for every per-item Claude stage in this repo: a truncated or
     # refused response must fail loudly, never be half-parsed.
     if message.stop_reason == "refusal":
-        logger.warning("Draft refused for thread %s", thread["id"])
+        logger.warning("Triage refused for thread %s", thread["id"])
         return None
     if message.stop_reason == "max_tokens":
         logger.warning(
@@ -233,24 +286,33 @@ def _draft_one(client: anthropic.Anthropic, system: list[dict],
         raw = next(b.text for b in message.content if b.type == "text")
         data = json.loads(raw)
     except (StopIteration, json.JSONDecodeError, TypeError) as exc:
-        logger.warning("Could not parse draft for %s: %s", thread["id"], str(exc)[:200])
+        logger.warning("Could not parse triage for %s: %s", thread["id"], str(exc)[:200])
         return None
 
     category = str(data.get("category") or "other")
-    draft = str(data.get("draft") or "").strip()
     if category not in CATEGORIES:
         category = "other"
-    return category, draft
+    return {
+        "needs_reply": bool(data.get("needs_reply")),
+        # Trimmed rather than validated: it is prose shown to a human, and the column is
+        # text, but an unbounded model string should not become an unbounded row.
+        "reason": str(data.get("reason") or "").strip()[:400],
+        "category": category,
+        "draft": str(data.get("draft") or "").strip(),
+    }
 
 
 def run_inbox_drafts(limit: int | None = None, min_age_hours: int | None = None) -> None:
     """
-    Draft replies for neglected DM threads. Never raises.
+    Judge every thread waiting on us, and draft a reply for the ones that need one.
+    Never raises.
 
-    Skips a thread whose draft already answers its newest message, so a scheduled run
-    over an unchanged inbox costs one listing query and nothing else.
+    Skips a thread already judged against its newest message, so a scheduled run over an
+    unchanged inbox costs two listing queries and nothing else.
     """
     name = "The Curve (inbox drafts)"
+    judged = 0
+    marked = 0
     drafted = 0
     try:
         if not ANTHROPIC_API_KEY:
@@ -258,14 +320,22 @@ def run_inbox_drafts(limit: int | None = None, min_age_hours: int | None = None)
             log_source_run(name, _RUN_CATEGORY, "error", 0, "ANTHROPIC_API_KEY not set")
             return
 
-        threads = get_threads_needing_drafts(
+        cap = limit if limit is not None else DRAFT_MAX_THREADS
+        threads = get_threads_to_triage(
             min_age_hours if min_age_hours is not None else DRAFT_MIN_AGE_HOURS,
-            limit if limit is not None else DRAFT_MAX_THREADS,
+            cap,
         )
         if not threads:
-            logger.info("Inbox drafting: nothing to draft")
+            logger.info("Inbox drafting: nothing to judge")
             log_source_run(name, _RUN_CATEGORY, "ok", 0)
             return
+        # The cap is a runaway backstop, not a policy, so say when it bites — a silently
+        # truncated run looks identical to a finished one, and the remainder would only be
+        # picked up on the next scheduled pass.
+        if len(threads) >= cap:
+            logger.warning(
+                "Inbox drafting: hit the %d-thread cap — the rest wait for the next run", cap,
+            )
 
         exemplars = get_draft_exemplars(
             DRAFT_EXEMPLAR_LIMIT,
@@ -277,11 +347,12 @@ def run_inbox_drafts(limit: int | None = None, min_age_hours: int | None = None)
             log_source_run(name, _RUN_CATEGORY, "error", 0, "no exemplars")
             return
 
-        # Voice rules then examples, with the cache breakpoint at the end of the block.
-        # Everything that varies per thread is in the user message, AFTER this prefix,
-        # so the prefix stays byte-identical across every call in the run and each one
-        # after the first is a cache read.
+        # Triage rubric, then voice rules, then examples, with the cache breakpoint at the
+        # end of the block. Everything that varies per thread is in the user message,
+        # AFTER this prefix, so the prefix stays byte-identical across every call in the
+        # run and each one after the first is a cache read.
         system = [
+            {"type": "text", "text": _TRIAGE},
             {"type": "text", "text": _VOICE},
             {
                 "type": "text",
@@ -295,23 +366,45 @@ def run_inbox_drafts(limit: int | None = None, min_age_hours: int | None = None)
 
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         logger.info(
-            "Inbox drafting: %d threads, %d exemplars", len(threads), len(exemplars),
+            "Inbox drafting: %d threads to judge, %d exemplars", len(threads), len(exemplars),
         )
         for thread in threads:
-            result = _draft_one(client, system, thread)
-            if not result:
+            result = _judge_and_draft_one(client, system, thread)
+            # None is an API/parse failure, NOT a verdict: leave the thread unjudged so the
+            # next run retries it. Anything else gets stamped, including "no reply needed",
+            # which is the whole point — that mark is what clears a thread off the
+            # operator's list for good.
+            if result is None:
                 continue
-            category, draft = result
-            if not draft:
-                # An empty draft is a real answer — the model declined to write one.
-                # Stamp it anyway so the thread is not retried every run.
-                logger.info("No usable draft for thread %s (%s)", thread["id"], category)
-            if update_conversation_draft(
-                thread["id"], draft or None, thread["last_message_id"], category,
+            needs_reply = result["needs_reply"]
+            draft = result["draft"]
+            if needs_reply and not draft:
+                # It said the thread needs answering and then wrote nothing. That is a
+                # failed draft, not a verdict of "nothing to do", so the mark still
+                # stands and the operator sees the thread with no suggestion behind it.
+                logger.info(
+                    "Thread %s needs a reply but no draft was produced (%s)",
+                    thread["id"], result["category"],
+                )
+            if not update_conversation_judgement(
+                thread["id"],
+                needs_reply,
+                result["reason"],
+                thread["last_message_id"],
+                draft or None,
+                result["category"],
             ):
-                drafted += 1
+                continue
+            judged += 1
+            if needs_reply:
+                marked += 1
+                if draft:
+                    drafted += 1
 
-        logger.info("Inbox drafting: wrote %d drafts", drafted)
+        logger.info(
+            "Inbox drafting: judged %d, marked %d as needing a reply, wrote %d drafts",
+            judged, marked, drafted,
+        )
         log_source_run(name, _RUN_CATEGORY, "ok", drafted)
     except Exception as exc:
         logger.warning("Inbox drafting failed: %s", str(exc)[:300])

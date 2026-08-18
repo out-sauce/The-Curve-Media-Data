@@ -260,14 +260,19 @@ def run_inbox_drafts_endpoint(
     x_api_key: str = Header(default=""),
 ):
     """
-    Draft replies for DM threads that have gone unanswered.
+    Judge which DM threads owe a reply, and draft one for each that does.
+
+    Marks inbox_conversations.needs_reply (+ a one-line reason) and writes a draft only for
+    the threads it marks — the Admin's "To reply" list is exactly this set. Threads already
+    judged against their newest message are skipped, so re-running is cheap and safe.
 
     Suggestions only — this service never sends. The operator copies the draft into the
     Admin's composer, edits it and sends from there, which is also what makes the drafts
     safe to overwrite on every run.
 
     ?limit= and ?min_age_hours= override the configured defaults; 0 means "use config",
-    so ?min_age_hours=1 is the way to sweep threads that only just went quiet.
+    and the configured age gate is itself 0 (judge as soon as a thread is waiting on us),
+    so ?min_age_hours=24 is how to narrow a run back to the neglect tail.
     """
     _check_key(x_api_key)
     background_tasks.add_task(

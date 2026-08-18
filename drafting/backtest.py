@@ -45,7 +45,7 @@ from config import (
     DRAFT_EXEMPLAR_MIN_INCOMING_LEN,
     DRAFT_MAX_TOKENS,
 )
-from drafting.draft import DRAFT_SCHEMA, _VOICE, _exemplar_block
+from drafting.draft import DRAFT_SCHEMA, _TRIAGE, _VOICE, _exemplar_block
 from ingestion.storage import get_client
 
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
@@ -148,7 +148,11 @@ def main() -> int:
     assert not leaked, f"LEAK: {len(leaked)} held-out replies are in the exemplars"
 
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    # The same stack production uses. _TRIAGE has to be here now that the schema requires
+    # a needs_reply verdict: without the rubric the model still has to fill the field, and
+    # it would be guessing at a rule this file never states.
     system = [
+        {"type": "text", "text": _TRIAGE},
         {"type": "text", "text": _VOICE},
         {"type": "text",
          "text": "Here is how the team has replied to real messages. Match this voice.\n\n"
@@ -158,17 +162,29 @@ def main() -> int:
 
     print(f"{len(exemplars)} exemplars, {len(held_out)} held out, model={DRAFT_MODEL}\n")
     rows, voice_scores, content_scores, verdicts, ungrounded_total = [], [], [], {}, 0
+    # Every held-out pair is a message the team DID answer, so the triage verdict has a
+    # ground truth here for free: needs_reply must be true. A miss is counted and printed
+    # rather than skipped, because a triage quietly saying "no reply needed" about real
+    # traffic is a worse failure than a clumsy draft, and it would otherwise vanish into
+    # the "declined to draft" line.
+    triage_misses = 0
 
     for i, pair in enumerate(held_out, 1):
         prompt = (
             "Conversation, oldest message first:\n\n"
             f"THEM: {pair['incoming'].strip()}\n\n"
-            "Their last message is the one to answer. Classify it, then write the reply."
+            "Their last message is the one in question. Decide whether it needs a reply, "
+            "say why in one sentence, classify it, then write the reply if one is needed."
         )
         try:
             drafted = _call(client, system, prompt, DRAFT_SCHEMA, DRAFT_MAX_TOKENS)
         except Exception as exc:
             print(f"[{i}] draft failed: {str(exc)[:120]}")
+            continue
+        if not drafted.get("needs_reply"):
+            triage_misses += 1
+            print(f"[{i}] TRIAGE MISS - said no reply needed, but the team replied: "
+                  f"{(drafted.get('reason') or '')[:100]}")
             continue
         draft = (drafted.get("draft") or "").strip()
         if not draft:
@@ -215,6 +231,9 @@ def main() -> int:
         count = verdicts.get(verdict, 0)
         print(f"  {verdict:<11} {count:>3}  ({100*count/n:.0f}%)")
     print(f"  ungrounded claims: {ungrounded_total}")
+    if triage_misses:
+        print(f"  ⚠ triage missed {triage_misses} of {len(held_out)} — said no reply "
+              f"needed on a message the team answered")
     usable = verdicts.get("send_as_is", 0) + verdicts.get("light_edit", 0)
     print(f"\n  usable without a rewrite: {100*usable/n:.0f}%")
     if verdicts.get("unsafe"):
@@ -229,7 +248,8 @@ def main() -> int:
         f"# Drafter backtest — {n} held-out pairs, {DRAFT_MODEL}",
         "",
         f"voice {sum(voice_scores)/n:.2f}/5 · content {sum(content_scores)/n:.2f}/5 · "
-        f"usable {100*usable/n:.0f}% · ungrounded {ungrounded_total}",
+        f"usable {100*usable/n:.0f}% · ungrounded {ungrounded_total} · "
+        f"triage misses {triage_misses}/{len(held_out)}",
         "",
     ]
     for i, category, judged, bad, draft, real in rows:
