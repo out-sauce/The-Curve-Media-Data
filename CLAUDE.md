@@ -172,6 +172,35 @@ triggers stages over HTTP.
   mirrored. **TikTok has no comment API and no DMs in Zernio at all** — one of the four
   brand channels is simply not covered, and the UI says so rather than showing an empty
   list.
+  **Three defects found on the first live Instagram sync (2026-08-18) and fixed.**
+  All three were silent — the sweep logged `ok` throughout.
+  - **`/v1/inbox/conversations/{id}/messages` REQUIRES `accountId`.** Without it every
+    call is a 400 `missing_required_field`, caught by `_sweep_messages`' own
+    `except` and logged as a warning, so NOT ONE message was mirrored while the
+    conversation still rendered a summary line — `inbox_conversations.last_message`
+    comes from the conversation LISTING, not from a message row. A thread with zero
+    messages is therefore always a possible read.
+  - **The REST endpoints use Meta's field names; the webhook envelope does not.**
+    Threads return `message`/`from{id,name,username,isOwner}`/`parentId`; the webhook
+    sends `text`/`author`/`parentCommentId`, and messages come back flat
+    (`senderId`/`senderName`) rather than nesting a `sender`. The normalisers read only
+    the webhook shape, so all 359 first-sync comments stored a NULL body, NULL author
+    and `author_is_owner = false` — our own replies included. `_comment_row`/
+    `_message_row` now accept **both** shapes; keep it that way. The thread payload's
+    explicit `isOwner` is preferred over comparing usernames.
+  - **The comment-thread endpoint paginates on `pagination.cursor`, NOT
+    `nextCursor`** — every other listing here uses `nextCursor`, so reading that key
+    returned None while `hasMore` stayed true and capped each thread at one page
+    (50-of-184, 50-of-167, 50-of-94 on three posts). Both keys are read now. The page
+    limit counts **top-level comments only** — replies arrive nested inside their parent
+    and don't consume it — so a page count can never be compared with `commentCount`.
+  Backfill: 359 → 654 comments, bodies and authors populated, DMs mirrored.
+  **Selection rule, for reference:** comments come from posts whose **publish date** is
+  inside `INBOX_SWEEP_LOOKBACK_DAYS` (30) with `minComments >= 1`, organic only
+  (`isAd` skipped), platform in instagram/facebook/youtube/linkedin. `since` filters the
+  POST, not the comment — a new comment on a 31-day-old post is invisible to the sweep.
+  Conversations have no date filter at all; the lookback only decides when to stop
+  paging.
 
 - **A true engagement rate on reach** (migration 036, nullable `engagement_on_reach`).
   Despite its name, `engagement_reach` is interactions / **views** — migration 026's
