@@ -23,3 +23,6 @@ env/
 
 # Misc
 .DS_Store
+
+# Backtest output — a snapshot of one run, not source.
+backtest-report*.md

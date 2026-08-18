@@ -29,6 +29,7 @@ confidently wrong date about a PDS is not a style problem.
 """
 
 import argparse
+import io
 import json
 import logging
 import re
@@ -126,6 +127,8 @@ def _call(client, system, prompt, schema, max_tokens):
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--n", type=int, default=20, help="held-out pairs to test")
+    parser.add_argument("--out", default="backtest-report.md",
+                        help="where to write the full side-by-side report")
     args = parser.parse_args()
 
     if not ANTHROPIC_API_KEY:
@@ -197,7 +200,7 @@ def main() -> int:
         verdicts[judged["verdict"]] = verdicts.get(judged["verdict"], 0) + 1
         rows.append((i, drafted.get("category"), judged, bad, draft, pair["ours"]))
         print(f"[{i}] voice={judged['voice']} content={judged['content']} "
-              f"{judged['verdict']:<11} {judged['note'][:70]}"
+              f"{judged['verdict']:<11} {judged['note']}"
               + (f"  UNGROUNDED:{bad}" if bad else ""))
 
     if not voice_scores:
@@ -216,6 +219,34 @@ def main() -> int:
     print(f"\n  usable without a rewrite: {100*usable/n:.0f}%")
     if verdicts.get("unsafe"):
         print(f"  ⚠ {verdicts['unsafe']} judged UNSAFE — inspect before shipping")
+
+    # Write the report EVERY run. Sampling is not deterministic — a case can score
+    # rewrite on one run and light_edit on the next, and at n=20 the verdict split
+    # carries a couple of cases of jitter either way. So re-drafting later to find out
+    # what a past run objected to hands you a DIFFERENT draft, not the one you asked
+    # about. Persist it while it exists.
+    lines = [
+        f"# Drafter backtest — {n} held-out pairs, {DRAFT_MODEL}",
+        "",
+        f"voice {sum(voice_scores)/n:.2f}/5 · content {sum(content_scores)/n:.2f}/5 · "
+        f"usable {100*usable/n:.0f}% · ungrounded {ungrounded_total}",
+        "",
+    ]
+    for i, category, judged, bad, draft, real in rows:
+        lines += [
+            f"## {i}. {judged['verdict']} "
+            f"(voice {judged['voice']}, content {judged['content']}) — {category}",
+            "",
+            f"> {judged['note']}",
+            "",
+        ]
+        if bad:
+            lines += [f"**Ungrounded:** {bad}", ""]
+        lines += ["**Team sent:**", "", real.strip(), "",
+                  "**Draft:**", "", draft.strip(), "", "---", ""]
+    with io.open(args.out, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines))
+    print(f"\n  full side-by-side report: {args.out}")
     return 0
 
 
