@@ -201,6 +201,38 @@ triggers stages over HTTP.
   POST, not the comment — a new comment on a 31-day-old post is invisible to the sweep.
   Conversations have no date filter at all; the lookback only decides when to stop
   paging.
+  **Sweeps are serialised, and the writes are batched** (added once Meta's replay
+  landed 499 threads / 5,101 messages and the naive per-row writers fell over).
+  - **`run_inbox_sweep` holds a process-local `threading.Lock`** and returns early if a
+    pass is already running. A full pass over 499 threads takes far longer than the
+    `*/15` tick, so runs used to stack: duplicated fetches, doubled write load, and
+    Supabase refusing connections — `Could not upsert inbox message: Server
+    disconnected` — which the never-raise discipline swallowed as a warning while
+    silently dropping rows. One thread was left with 0 of its 7 messages that way. A
+    process-local lock is only sufficient because the service is **single replica**;
+    that must become a Postgres advisory lock if it is ever scaled out.
+  - **`inbox_comments` batches through a real PostgREST upsert; `inbox_messages`
+    CANNOT.** `inbox_comments_key` is a FULL unique index so ON CONFLICT can infer it.
+    Both `inbox_messages` indexes (and both `inbox_conversations` ones) are **PARTIAL**
+    (`WHERE ... IS NOT NULL`), and Postgres refuses to infer a partial index unless the
+    statement repeats its predicate — which PostgREST cannot emit (verified: `42P10`).
+    So messages use a hand-rolled grouped SELECT → bulk INSERT → UPDATE-only-if-changed.
+    **Do not "tidy" the two paths into one shape** — the difference is forced by the
+    schema.
+  - **Batches are bucketed by exact key set** (`_key_buckets`). PostgREST rejects a
+    batch whose objects don't share keys, and the obvious fix — padding rows to a common
+    key set — would be destructive here: these rows are built with skip-None, so an
+    ABSENT key means "leave that column alone", not "write NULL".
+  - Only `body`/`delivery_status`/`is_edited`/`is_deleted`/`sender_name`/`attachments`
+    are compared to decide whether a mirrored message needs rewriting; everything else
+    about a message is immutable. Re-sweeping a mirrored inbox costs a few SELECTs and
+    zero writes. Measured on a 184-comment thread: 368 round trips → 9.
+  - `upsert_inbox_conversation` takes a `known_id`; the sweep already holds every uuid
+    from `get_inbox_conversation_state()`, so resolving each thread again was ~1,500
+    wasted SELECTs per full pass.
+  **DM history reaches back to 2021-03-14** — far deeper than the comment sweep's 30
+  days — and **~half of all messages have no `body`** (attachment-only story replies and
+  shared posts, which is normal, not the field-mapping bug above).
 
 - **A true engagement rate on reach** (migration 036, nullable `engagement_on_reach`).
   Despite its name, `engagement_reach` is interactions / **views** — migration 026's

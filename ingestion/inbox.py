@@ -35,6 +35,7 @@ Never raises — failures log and skip, matching the rest of ingestion/.
 import hashlib
 import hmac
 import logging
+import threading
 from datetime import datetime, timedelta, timezone
 
 from config import (
@@ -69,6 +70,16 @@ from ingestion.storage import (
 logger = logging.getLogger(__name__)
 
 _RUN_CATEGORY = "zernio_inbox"
+
+# One sweep at a time. A full pass over a 500-thread account takes far longer than the
+# */15 incremental tick, so without this the scheduler stacks runs on top of each other:
+# they duplicate every fetch, double the write load, and exhaust Supabase connections
+# ("Server disconnected"), which this module's never-raise discipline then swallows as a
+# warning while silently dropping rows. A process-local lock is sufficient precisely
+# because the service is pinned to a SINGLE REPLICA — the same assumption the site-auth
+# session registry already relies on. If that ever changes this needs to become an
+# advisory lock in Postgres.
+_sweep_lock = threading.Lock()
 
 # Events we subscribe to and act on. Anything else is acknowledged and ignored — an
 # unknown event must never produce a non-2xx, because 10 consecutive delivery failures
@@ -502,12 +513,14 @@ def _sweep_conversations(full: bool) -> int:
             row["last_message_at"] = item.get("updatedTime")
             row["unread_count"] = item.get("unreadCount") or 0
             row["permalink"] = item.get("url")
-            conversation_uuid = upsert_inbox_conversation(row)
+            known = state.get(conversation_id)
+            conversation_uuid = upsert_inbox_conversation(
+                row, known_id=(known or {}).get("id"),
+            )
             if not conversation_uuid:
                 continue
             written += 1
 
-            known = state.get(conversation_id)
             moved = (
                 not known
                 or not known.get("last_message_at")
@@ -714,6 +727,10 @@ def run_inbox_sweep(full: bool = False) -> None:
     to exhaustion and is what finds Meta's replayed pre-connect history — run it nightly
     and immediately after connecting an account. Never raises.
     """
+    if not _sweep_lock.acquire(blocking=False):
+        logger.info("Zernio inbox sweep already in progress — skipping this tick")
+        return
+
     name = "The Curve (inbox, zernio)"
     total = 0
     try:
@@ -731,6 +748,8 @@ def run_inbox_sweep(full: bool = False) -> None:
     except Exception as exc:
         logger.warning("Zernio inbox sweep failed: %s", str(exc)[:300])
         log_source_run(name, _RUN_CATEGORY, "error", 0, str(exc)[:500])
+    finally:
+        _sweep_lock.release()
 
 
 def run_inbox_sweep_full() -> None:

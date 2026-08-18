@@ -762,15 +762,21 @@ def find_inbox_conversation(platform: str, account_id: str,
     return None
 
 
-def upsert_inbox_conversation(row: dict[str, Any]) -> str | None:
+def upsert_inbox_conversation(row: dict[str, Any],
+                              known_id: str | None = None) -> str | None:
     """
     Insert or refresh one conversation, returning our uuid.
 
     Skip-None on update, so a sparse webhook payload never blanks what a full sweep
     established. is_read/read_at/read_by are never named here — they are the admin's.
+
+    Pass `known_id` when the caller already knows our uuid. The sweep does — it loads
+    every conversation up front via get_inbox_conversation_state() — so re-resolving each
+    thread costs up to THREE extra SELECTs for nothing, about 1,500 wasted round trips
+    across a 500-thread account.
     """
     client = get_client()
-    existing = find_inbox_conversation(
+    existing = known_id or find_inbox_conversation(
         row["platform"], row["account_id"],
         row.get("participant_id"),
         row.get("zernio_conversation_id"),
@@ -798,53 +804,151 @@ def mark_conversation_unread(conversation_id: str) -> None:
     ).eq("id", conversation_id).execute()
 
 
-def upsert_inbox_messages(rows: list[dict[str, Any]]) -> int:
+def _key_buckets(rows: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
     """
-    Insert or refresh messages, deduped on the vendor id and then the platform id.
+    Group rows by their exact key set.
 
-    An admin-sent message is already in the table (written optimistically the moment
-    Zernio accepted it), so the matching row is UPDATEd rather than duplicated — which
-    is exactly why both id columns are unique-indexed. source/sent_by are left alone on
-    update so an admin row keeps its authorship.
+    PostgREST rejects a batch whose objects do not all carry the same keys, and every row
+    here is built with skip-None — so an ABSENT key means "leave that column alone", never
+    "write NULL". Padding a batch out to a common key set would therefore blank real data.
+    Bucketing preserves skip-None exactly while still collapsing hundreds of round trips
+    into a handful, because rows from one sweep nearly always share a shape.
+    """
+    buckets: dict[frozenset, list[dict[str, Any]]] = {}
+    for row in rows:
+        buckets.setdefault(frozenset(row.keys()), []).append(row)
+    return list(buckets.values())
+
+
+def _chunks(items: list[Any], size: int):
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
+# Fields that can legitimately change after a message is first mirrored. Everything else
+# about a message is immutable, so an unchanged row needs no write at all — which is what
+# makes re-sweeping an already-mirrored inbox nearly free.
+_MESSAGE_MUTABLE = ("body", "delivery_status", "is_edited", "is_deleted",
+                    "sender_name", "attachments")
+
+
+def _upsert_messages_individually(rows: list[dict[str, Any]]) -> int:
+    """
+    Per-row fallback, and the only path for a message with no vendor id — that one has to
+    be matched on (conversation_id, platform_message_id) instead.
     """
     if not rows:
         return 0
     client = get_client()
+    now = datetime.now(timezone.utc).isoformat()
     written = 0
-    for row in rows:
+    for values in rows:
         try:
             existing = None
-            if row.get("zernio_message_id"):
+            if values.get("zernio_message_id"):
                 response = (
-                    client.table("inbox_messages")
-                    .select("id")
-                    .eq("zernio_message_id", row["zernio_message_id"])
-                    .limit(1)
-                    .execute()
+                    client.table("inbox_messages").select("id")
+                    .eq("zernio_message_id", values["zernio_message_id"])
+                    .limit(1).execute()
                 )
                 existing = response.data[0]["id"] if response.data else None
-            if not existing and row.get("platform_message_id"):
+            if not existing and values.get("platform_message_id"):
                 response = (
-                    client.table("inbox_messages")
-                    .select("id")
-                    .eq("conversation_id", row["conversation_id"])
-                    .eq("platform_message_id", row["platform_message_id"])
-                    .limit(1)
-                    .execute()
+                    client.table("inbox_messages").select("id")
+                    .eq("conversation_id", values["conversation_id"])
+                    .eq("platform_message_id", values["platform_message_id"])
+                    .limit(1).execute()
                 )
                 existing = response.data[0]["id"] if response.data else None
-            values = {k: v for k, v in row.items() if v is not None}
+            payload = {**values, "updated_at": now}
             if existing:
-                values.pop("source", None)
-                values.pop("sent_by", None)
-                values["updated_at"] = datetime.now(timezone.utc).isoformat()
-                client.table("inbox_messages").update(values).eq("id", existing).execute()
+                client.table("inbox_messages").update(payload).eq("id", existing).execute()
             else:
-                client.table("inbox_messages").insert(values).execute()
+                client.table("inbox_messages").insert(payload).execute()
             written += 1
         except Exception as exc:
             logger.warning("Could not upsert inbox message: %s", str(exc)[:200])
     return written
+
+
+def upsert_inbox_messages(rows: list[dict[str, Any]]) -> int:
+    """
+    Insert or refresh messages, deduped on the vendor id and then the platform id.
+
+    NOT a PostgREST upsert. Both unique indexes on this table are PARTIAL
+    (`WHERE ... IS NOT NULL`), and Postgres will not infer a partial index for ON CONFLICT
+    unless the statement repeats its predicate — which PostgREST has no way to emit
+    (verified: 42P10, "no unique or exclusion constraint matching the ON CONFLICT
+    specification"). So the batching is done by hand: one grouped SELECT, one bulk INSERT
+    for what is genuinely new, and an UPDATE only for a row whose mutable fields actually
+    moved. Re-sweeping an already-mirrored inbox therefore costs a few SELECTs and no
+    writes at all, rather than the two round trips per message this used to spend — which
+    is what exhausted Supabase connections ("Server disconnected") on the 500-thread
+    backfill and silently dropped rows.
+
+    An admin-sent message is already in the table (written optimistically the moment
+    Zernio accepted it), so the matching row is UPDATEd rather than duplicated — which is
+    why both id columns are unique-indexed. source/sent_by are never written from here, so
+    an admin row keeps its authorship.
+    """
+    if not rows:
+        return 0
+    client = get_client()
+    now = datetime.now(timezone.utc).isoformat()
+
+    prepared = []
+    for row in rows:
+        values = {k: v for k, v in row.items() if v is not None}
+        values.pop("source", None)
+        values.pop("sent_by", None)
+        prepared.append(values)
+
+    keyed = [v for v in prepared if v.get("zernio_message_id")]
+    unkeyed = [v for v in prepared if not v.get("zernio_message_id")]
+
+    existing_rows: dict[str, dict[str, Any]] = {}
+    columns = "id, zernio_message_id, " + ", ".join(_MESSAGE_MUTABLE)
+    for chunk in _chunks([v["zernio_message_id"] for v in keyed], 100):
+        try:
+            response = (
+                client.table("inbox_messages").select(columns)
+                .in_("zernio_message_id", chunk).execute()
+            )
+            for found in response.data or []:
+                existing_rows[found["zernio_message_id"]] = found
+        except Exception as exc:
+            logger.warning("Could not read existing inbox messages: %s", str(exc)[:200])
+            return _upsert_messages_individually(prepared)
+
+    fresh: list[dict[str, Any]] = []
+    changed: list[tuple[str, dict[str, Any]]] = []
+    for values in keyed:
+        found = existing_rows.get(values["zernio_message_id"])
+        if not found:
+            fresh.append({**values, "updated_at": now})
+        elif any(values.get(f) != found.get(f) for f in _MESSAGE_MUTABLE if f in values):
+            changed.append((found["id"], {**values, "updated_at": now}))
+
+    written = 0
+    for bucket in _key_buckets(fresh):
+        try:
+            client.table("inbox_messages").insert(bucket).execute()
+            written += len(bucket)
+        except Exception as exc:
+            logger.warning(
+                "Batch message insert failed for %d rows, retrying individually: %s",
+                len(bucket), str(exc)[:200],
+            )
+            written += _upsert_messages_individually(bucket)
+
+    for row_id, values in changed:
+        try:
+            client.table("inbox_messages").update(values).eq("id", row_id).execute()
+            written += 1
+        except Exception as exc:
+            logger.warning("Could not update inbox message: %s", str(exc)[:200])
+
+    return written + _upsert_messages_individually(unkeyed)
 
 
 def upsert_inbox_post(row: dict[str, Any]) -> str | None:
@@ -914,41 +1018,59 @@ def resolve_inbox_post_link(post_uuid: str, platform: str, platform_post_id: str
         return False
 
 
+def _upsert_comments_individually(rows: list[dict[str, Any]]) -> int:
+    """Per-row fallback — one bad row must not cost the whole batch."""
+    client = get_client()
+    written = 0
+    for values in rows:
+        try:
+            client.table("inbox_comments").upsert(
+                values, on_conflict="platform,platform_comment_id",
+            ).execute()
+            written += 1
+        except Exception as exc:
+            logger.warning("Could not upsert inbox comment: %s", str(exc)[:200])
+    return written
+
+
 def upsert_inbox_comments(rows: list[dict[str, Any]]) -> int:
     """
     Insert or refresh comments, deduped on (platform, platform_comment_id).
 
+    Batched, unlike upsert_inbox_messages: `inbox_comments_key` is a FULL unique index,
+    so PostgREST can infer it for ON CONFLICT. The message table's indexes are PARTIAL
+    and cannot be — see that function for the workaround. Do not "tidy" the two into one
+    shape; the difference is forced by the schema.
+
     handled_at/handled_by are never named, so an operator's triage survives every
-    re-sync; source/sent_by are dropped on update so a reply the admin wrote keeps its
-    authorship when the sweep later sees it come back from the platform.
+    re-sync; source/sent_by are never written from here either, so a reply the admin
+    wrote keeps its authorship when the sweep sees it come back from the platform.
     """
     if not rows:
         return 0
     client = get_client()
-    written = 0
+    now = datetime.now(timezone.utc).isoformat()
+    prepared = []
     for row in rows:
+        values = {k: v for k, v in row.items() if v is not None}
+        values.pop("source", None)
+        values.pop("sent_by", None)
+        values["updated_at"] = now
+        prepared.append(values)
+
+    written = 0
+    for bucket in _key_buckets(prepared):
         try:
-            existing = (
-                client.table("inbox_comments")
-                .select("id")
-                .eq("platform", row["platform"])
-                .eq("platform_comment_id", row["platform_comment_id"])
-                .limit(1)
-                .execute()
-            )
-            values = {k: v for k, v in row.items() if v is not None}
-            if existing.data:
-                values.pop("source", None)
-                values.pop("sent_by", None)
-                values["updated_at"] = datetime.now(timezone.utc).isoformat()
-                client.table("inbox_comments").update(values).eq(
-                    "id", existing.data[0]["id"]
-                ).execute()
-            else:
-                client.table("inbox_comments").insert(values).execute()
-            written += 1
+            client.table("inbox_comments").upsert(
+                bucket, on_conflict="platform,platform_comment_id",
+            ).execute()
+            written += len(bucket)
         except Exception as exc:
-            logger.warning("Could not upsert inbox comment: %s", str(exc)[:200])
+            logger.warning(
+                "Batch comment upsert failed for %d rows, retrying individually: %s",
+                len(bucket), str(exc)[:200],
+            )
+            written += _upsert_comments_individually(bucket)
     return written
 
 
