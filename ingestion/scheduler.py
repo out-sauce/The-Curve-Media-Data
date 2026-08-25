@@ -116,7 +116,24 @@ def start_scheduler() -> None:
         # Meta's pre-connect replay: those arrive in the background, emit no webhooks,
         # and keep their original timestamps, so they sort into date order rather than
         # to the top where an incremental pass would see them.
-        CronTrigger(hour=4, minute=30, timezone="UTC"),
+        #
+        # HOURLY, where this was once a day at 04:30. The incremental pass stops as soon
+        # as a whole page of threads is older than INBOX_SWEEP_LOOKBACK_DAYS, so it walks
+        # a couple of pages, not the whole list — measured live, 612 conversations exist
+        # and the incremental reaches roughly the newest 100. Everything past that was
+        # being reconciled exactly once a day, which is a 24-hour blind spot over most of
+        # the inbox and the reason a late Meta replay could sit invisible until morning.
+        #
+        # Affordable because the `full` flag's deep per-thread pagination costs almost
+        # nothing on this data: only 5 of 612 threads exceed one 50-message page (longest
+        # is 273). A run is ~13 conversation pages + ~612 message requests + 42 comment
+        # posts, so the bill is roughly one extra request per thread per hour.
+        #
+        # :00 IS DELIBERATE. The drafting stage runs at :35 and is placed after the
+        # sweeps so it judges a settled mirror; a full pass starting at :30 could still
+        # be running then. Starting on the hour leaves it half an hour of headroom, and
+        # _sweep_lock makes the :15 incremental skip harmlessly if this overruns.
+        CronTrigger(minute=0, timezone="UTC"),
         id="inbox_sweep_full",
         kwargs={"full": True},
         replace_existing=True,
@@ -135,6 +152,6 @@ def start_scheduler() -> None:
     )
     logger.info(
         "Scheduler started — daily pipeline at 05:00 UTC, Zernio refresh hourly at :05, "
-        "inbox sweep every 15m (full at 04:30), inbox triage + drafts hourly at :35"
+        "inbox sweep every 15m (full hourly at :00), inbox triage + drafts hourly at :35"
     )
     scheduler.start()
