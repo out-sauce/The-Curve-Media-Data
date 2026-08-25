@@ -35,6 +35,7 @@ Never raises — failures log and skip, matching the rest of ingestion/.
 import hashlib
 import hmac
 import logging
+import re
 import threading
 from datetime import datetime, timedelta, timezone
 
@@ -180,6 +181,32 @@ def _conversation_row(conversation: dict, account: dict, platform: str) -> dict:
     }
 
 
+# A Zernio vendor id is a Mongo ObjectId: exactly 24 lowercase hex characters. Meta's
+# message ids are long base64 blobs, so the two are never confusable in practice.
+_OBJECT_ID_RE = re.compile(r"^[0-9a-f]{24}$")
+
+
+def _split_message_ids(message: dict) -> tuple[str | None, str | None]:
+    """
+    Decide which id column each identifier belongs in.
+
+    Keyed off the SHAPE of the id rather than the shape of the surrounding payload:
+    "is this a Zernio ObjectId" is the question actually being asked, and answering it
+    directly survives the envelope gaining or losing a sibling field. A value that is
+    not an ObjectId is Meta's, and Meta's id is the stronger dedupe key of the two
+    anyway — it is the one both delivery paths always carry.
+    """
+    raw_id = message.get("id")
+    platform_id = message.get("platformMessageId")
+    if platform_id:
+        # REST shape: both ids present and already in the right places.
+        return (raw_id if raw_id and _OBJECT_ID_RE.match(raw_id) else None), platform_id
+    if raw_id and _OBJECT_ID_RE.match(raw_id):
+        return raw_id, None
+    # Webhook shape: the only id we were given is Meta's.
+    return None, raw_id
+
+
 def _message_row(message: dict, conversation_uuid: str) -> dict:
     """
     Normalise one message.
@@ -188,12 +215,21 @@ def _message_row(message: dict, conversation_uuid: str) -> dict:
     flat naming (`message`, `senderId`, `senderName`); the webhook envelope nests a
     `sender` object and calls the text `text`. Reading only the webhook shape is what
     would have left every swept message with a NULL body and no sender.
+
+    The shapes also disagree about what `id` MEANS, which is subtler and did real
+    damage: in the REST listing `id` is Zernio's own ObjectId and Meta's id arrives
+    separately as `platformMessageId`, but in the webhook envelope `id` IS Meta's id
+    and there is no `platformMessageId` at all. Trusting `id` blindly therefore filed
+    Meta's id in the zernio_message_id column for every webhook-delivered message, so
+    the row the sweep wrote later shared no key with it and both survived — 494 threads
+    ended up showing every message twice. See _split_message_ids.
     """
     sender = message.get("sender") or {}
+    vendor_id, platform_id = _split_message_ids(message)
     row = {
         "conversation_id": conversation_uuid,
-        "zernio_message_id": message.get("id"),
-        "platform_message_id": message.get("platformMessageId"),
+        "zernio_message_id": vendor_id,
+        "platform_message_id": platform_id,
         "direction": message.get("direction") or "incoming",
         "body": message.get("message") or message.get("text"),
         "sender_id": message.get("senderId") or sender.get("id"),

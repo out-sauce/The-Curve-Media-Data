@@ -875,6 +875,12 @@ def upsert_inbox_messages(rows: list[dict[str, Any]]) -> int:
     """
     Insert or refresh messages, deduped on the vendor id and then the platform id.
 
+    BOTH keys are load-bearing and the second one is not optional. A message delivered
+    by webhook is keyed only by Meta's id (the envelope has no Zernio ObjectId), while
+    the same message swept over REST carries both — so a vendor-id-only match finds
+    nothing, inserts, and the thread renders the message twice. That is exactly what
+    happened to 494 threads before this.
+
     NOT a PostgREST upsert. Both unique indexes on this table are PARTIAL
     (`WHERE ... IS NOT NULL`), and Postgres will not infer a partial index for ON CONFLICT
     unless the statement repeats its predicate — which PostgREST has no way to emit
@@ -907,7 +913,8 @@ def upsert_inbox_messages(rows: list[dict[str, Any]]) -> int:
     unkeyed = [v for v in prepared if not v.get("zernio_message_id")]
 
     existing_rows: dict[str, dict[str, Any]] = {}
-    columns = "id, zernio_message_id, " + ", ".join(_MESSAGE_MUTABLE)
+    columns = ("id, zernio_message_id, platform_message_id, conversation_id, "
+               + ", ".join(_MESSAGE_MUTABLE))
     for chunk in _chunks([v["zernio_message_id"] for v in keyed], 100):
         try:
             response = (
@@ -920,13 +927,45 @@ def upsert_inbox_messages(rows: list[dict[str, Any]]) -> int:
             logger.warning("Could not read existing inbox messages: %s", str(exc)[:200])
             return _upsert_messages_individually(prepared)
 
+    # Second lookup, on the platform id, for anything the vendor id did not find.
+    #
+    # This is not belt-and-braces: it is the half that stops a webhook row and a swept
+    # row for ONE message becoming two. The webhook envelope carries only Meta's id, so
+    # its row has no zernio_message_id to match on, and the sweep's row — which does —
+    # would sail past it into an INSERT. Matching on the id BOTH paths always carry is
+    # what collapses them onto one row. _upsert_messages_individually has always done
+    # this; the batched path silently did not, despite its docstring claiming otherwise.
+    by_platform: dict[tuple[str, str], dict[str, Any]] = {}
+    unmatched = [
+        v for v in keyed
+        if v["zernio_message_id"] not in existing_rows and v.get("platform_message_id")
+    ]
+    for chunk in _chunks([v["platform_message_id"] for v in unmatched], 100):
+        try:
+            response = (
+                client.table("inbox_messages").select(columns)
+                .in_("platform_message_id", chunk).execute()
+            )
+            for found in response.data or []:
+                by_platform[(found["conversation_id"], found["platform_message_id"])] = found
+        except Exception as exc:
+            logger.warning("Could not read inbox messages by platform id: %s", str(exc)[:200])
+
     fresh: list[dict[str, Any]] = []
     changed: list[tuple[str, dict[str, Any]]] = []
     for values in keyed:
         found = existing_rows.get(values["zernio_message_id"])
+        if not found and values.get("platform_message_id"):
+            found = by_platform.get(
+                (values["conversation_id"], values["platform_message_id"])
+            )
         if not found:
             fresh.append({**values, "updated_at": now})
-        elif any(values.get(f) != found.get(f) for f in _MESSAGE_MUTABLE if f in values):
+        elif (any(values.get(f) != found.get(f) for f in _MESSAGE_MUTABLE if f in values)
+              or not found.get("zernio_message_id")):
+            # The `or` backfills the vendor id onto a row the webhook created without
+            # one, so the next sweep matches on the cheap key and stops paying for the
+            # second lookup.
             changed.append((found["id"], {**values, "updated_at": now}))
 
     written = 0
