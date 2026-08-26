@@ -365,12 +365,25 @@ def _fetch_follower_series(zernio_account_id: str) -> tuple[dict, list[tuple[dat
 
 def _fetch_post_analytics(zernio_account_id: str, platform: str) -> list[dict]:
     """
-    GET /v1/analytics?source=external — every post the platform published for this
-    account inside the content_stats lookback, with its metrics.
+    GET /v1/analytics?source=all — every post on this account inside the content_stats
+    lookback, with its metrics.
 
-    source=external is the important parameter: it selects posts published directly on
-    the platform (which is all of ours today) rather than only those authored through
-    Zernio. Paginated; each page is at most 100.
+    source MUST be "all". The valid values are all|late|external ("late" is Zernio's
+    former name, and still the vendor's word for a post AUTHORED THROUGH IT). This
+    asked for `external` on the theory, true when written, that every Curve post was
+    published straight to the platform and Zernio only ever observed it.
+
+    That stopped being true the moment the Admin app scheduled its first post through
+    Zernio, and the failure is silent: `external` EXCLUDES anything carrying a
+    latePostId, so a post we published ourselves never appears here, never reaches
+    content_stats, and nothing anywhere reports a gap — the call still returns 200 with
+    every older post, so metrics keep refreshing and only the newest work goes missing.
+    Measured on the day it first bit: 22 posts under `external`, 23 under `all`, the
+    one difference being the only post ever scheduled through Zernio.
+
+    Note `isExternal` on the payload is NOT this flag — the carousel that exposed this
+    carries isExternal: true and was still filtered out. The discriminator is authorship
+    (a latePostId), not the media. Paginated; each page is at most 100.
     """
     until = datetime.now(timezone.utc).date()
     since = until - timedelta(days=SELF_CONTENT_STATS_LOOKBACK_DAYS)
@@ -378,7 +391,7 @@ def _fetch_post_analytics(zernio_account_id: str, platform: str) -> list[dict]:
     page = 1
     while page <= _ANALYTICS_MAX_PAGES:
         payload = _get("/v1/analytics", {
-            "source": "external",
+            "source": "all",
             "accountId": zernio_account_id,
             "platform": platform,
             "fromDate": _iso_date(since),
