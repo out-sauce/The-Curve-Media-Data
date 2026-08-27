@@ -56,6 +56,51 @@ triggers stages over HTTP.
 
 ## Recent changes
 
+- **Spotify for Creators podcast analytics via the extension** (`ingestion/podcast.py`,
+  migration 043, extension 1.2.0). Spotify has no public analytics API, so the Curve
+  Auth extension gained a **"Send podcast stats"** button (shown only on
+  `creators.spotify.com`/`podcasters.spotify.com`): it injects
+  `chrome-extension/spotify-collector.js` into the operator's logged-in dashboard tab,
+  calls the dashboard's own JSON endpoints with the live session, and POSTs batches of
+  ≤25 episodes to `POST /podcast/import` (processed **inline**, like the other two
+  interactive imports — the popup renders per-batch results). Recent-10/25/50 per press,
+  full backfill behind a confirm; upserts are idempotent so retries/interrupts heal.
+  - **The endpoint table in `spotify-collector.js` is UNVERIFIED candidates** (the
+    Zernio/Apify lesson, designed-for this time): discovery notes sit at the top of the
+    file, every reader in `podcast.py` accepts multiple key spellings via `_pick`, and
+    each episode's raw vendor blob is kept in `platform_specific.vendor_raw` (~50KB cap)
+    so a field-name fix is a re-parse, not a re-fetch.
+  - **Where it lands.** `content_stats` platform `'spotify'` (043 widens the platform
+    CHECK; `post_id` = Spotify episode id; `views`=plays, `reach`=listeners, both
+    `_nz`-guarded — Spotify reports 0 for a metric it can't serve yet; Spotify-only
+    vocabulary in `platform_specific`; no `engagement_*`/likes/comments/shares, and no
+    `calendar_item_id` — podcast calendar titles are planning names that can't be
+    matched safely). Also the Admin's **`podcast_episodes`** row (the screen the
+    operator actually looks at): `plays_spotify` / `spotify_avg_listen_minutes` /
+    `spotify_completion_pct` are **overwritten** when a real value is present
+    (operator-confirmed — plays is monotone, the stale hand-entered figure is an
+    undercount), never with None/0. Matching is exact normalised title (HTML-unescaped —
+    live titles carry `&#39;`) + pub_date within `PODCAST_EPISODE_MATCH_WINDOW_DAYS`
+    (3); a miss or ambiguity skips the link with a warning, never guesses.
+    `content_stats.podcast_episode_id` (column pre-existed, Admin-created) is handled
+    exactly like `calendar_item_id`: set on insert, fill-only-if-null on update.
+  - **Demographics are refused until the collector declares `value_type`.** Whether
+    Spotify serves counts or percentages is a discovery fact; `demographicsValueType`
+    in the collector stays `null` until read off the live payload, and the server skips
+    the write with a warning rather than corrupt `audience_demographics`. No collision
+    with the hand-entered podcast rows: those sit at `platform=NULL,
+    social_account_id=NULL` and the natural-key index is NULLS NOT DISTINCT, so
+    `platform='spotify'` + the account uuid occupies disjoint keys.
+  - `follower_snapshots`: today's row only via the standard one-row-per-UTC-day upsert —
+    the 12 hand-entered monthly spotify rows are untouchable by construction. The
+    spotify `social_accounts` row is resolved by new `get_social_account_by_platform`;
+    `get_self_social_accounts()` was deliberately NOT widened (it feeds the Apify sweep,
+    which has no spotify scraper).
+  - No new `content_stats` columns → the `_content_stats_column_set()` cache imposes no
+    deploy-ordering constraint; pre-043 the failure is a clean 23514.
+    `podcast_episode_daily_plays` and the per-episode gender/age pct columns are
+    phase 2, once discovery confirms their payload shapes.
+
 - **Outstand → Zernio (migrations 037/038/039).** `ingestion/outstand.py` is GONE,
   replaced by `ingestion/zernio.py` (analytics) + `ingestion/inbox.py` (comments/DMs).
   The move was for the **comments and DM APIs Outstand simply did not have**; Zernio

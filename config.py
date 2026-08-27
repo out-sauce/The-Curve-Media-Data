@@ -168,6 +168,12 @@ APIFY_LINKEDIN_POST_ACTOR = os.getenv("APIFY_LINKEDIN_POST_ACTOR", "apimaestro~l
 SELF_CONTENT_STATS_LOOKBACK_DAYS = int(os.getenv("SELF_CONTENT_STATS_LOOKBACK_DAYS", 90))
 SELF_CONTENT_STATS_LIMIT = int(os.getenv("SELF_CONTENT_STATS_LIMIT", 100))
 
+# Podcast import (ingestion/podcast.py) — Spotify for Creators analytics pushed by the
+# Chrome extension. An imported episode is linked to the Admin's podcast_episodes row
+# only on an exact normalised-title match whose pub_date is within this many days of
+# Spotify's release date; anything looser risks attaching stats to the wrong episode.
+PODCAST_EPISODE_MATCH_WINDOW_DAYS = int(os.getenv("PODCAST_EPISODE_MATCH_WINDOW_DAYS", 3))
+
 # ── Inbox reply triage + drafting (drafting/draft.py) ─────────────────────────
 # The stage judges every thread waiting on us and drafts a reply for the ones that need
 # one, so the work is bounded by "needs a human" rather than by age.

@@ -349,6 +349,11 @@ def upsert_self_content_stats(rows: list[dict[str, Any]]) -> int:
     never auto-link to The Curve's own scrape, so the link travels with the write).
     It lands on insert, and on update only fills a NULL — an existing admin/human
     link is never overwritten. Rows without the key behave exactly as before.
+
+    podcast_episode_id gets the same treatment for the same reason: the Spotify
+    import (ingestion/podcast.py) resolves an episode's Admin podcast_episodes row
+    by title+date at write time, and a link a human corrected in the Admin must
+    never be stolen back by a later sweep.
     """
     if not rows:
         return 0
@@ -365,10 +370,11 @@ def upsert_self_content_stats(rows: list[dict[str, Any]]) -> int:
             continue
         scraped = {k: row.get(k) for k in allowed}
         calendar_item_id = row.get("calendar_item_id")
+        podcast_episode_id = row.get("podcast_episode_id")
         try:
             existing = (
                 client.table("content_stats")
-                .select("id, calendar_item_id")
+                .select("id, calendar_item_id, podcast_episode_id")
                 .eq("platform", platform)
                 .eq("post_id", post_id)
                 .limit(1)
@@ -379,6 +385,8 @@ def upsert_self_content_stats(rows: list[dict[str, Any]]) -> int:
                 changed = {k: v for k, v in scraped.items() if v is not None}
                 if calendar_item_id and not existing.data[0].get("calendar_item_id"):
                     changed["calendar_item_id"] = calendar_item_id
+                if podcast_episode_id and not existing.data[0].get("podcast_episode_id"):
+                    changed["podcast_episode_id"] = podcast_episode_id
                 client.table("content_stats").update(
                     {**changed, "stats_synced_at": now_iso, "updated_at": now_iso}
                 ).eq("id", existing.data[0]["id"]).execute()
@@ -387,6 +395,7 @@ def upsert_self_content_stats(rows: list[dict[str, Any]]) -> int:
                     "platform": platform,
                     "post_id": post_id,
                     "calendar_item_id": calendar_item_id,
+                    "podcast_episode_id": podcast_episode_id,
                     "stats_synced_at": now_iso,
                     **scraped,
                 }).execute()
@@ -418,6 +427,26 @@ def get_self_social_accounts() -> dict[str, str]:
     for row in response.data or []:
         accounts.setdefault(row["platform"], row["id"])
     return accounts
+
+
+def get_social_account_by_platform(platform: str) -> dict[str, Any] | None:
+    """
+    The social_accounts row for one platform ({id, follower_count} or None).
+
+    Exists so ingestion/podcast.py can resolve the spotify row without widening
+    get_self_social_accounts() — that helper's platform list feeds the Apify
+    competitor flow, and adding spotify there would make the daily sweep try to
+    snapshot a channel it has no scraper for.
+    """
+    client = get_client()
+    response = (
+        client.table("social_accounts")
+        .select("id, follower_count")
+        .eq("platform", platform)
+        .limit(1)
+        .execute()
+    )
+    return response.data[0] if response.data else None
 
 
 def get_self_competitor_id() -> str | None:

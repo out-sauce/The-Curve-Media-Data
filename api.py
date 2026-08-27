@@ -54,6 +54,7 @@ from research.site_auth import (
 )
 from ingestion.competitors import run_competitors
 from ingestion.guest_posts import run_guest_post_stats
+from ingestion.podcast import import_podcast_payload
 from ingestion.zernio import run_zernio_hourly, run_zernio_daily
 from drafting.draft import run_inbox_drafts
 from ingestion.inbox import (
@@ -398,6 +399,17 @@ class ResearchImport(BaseModel):
     queue_id: int | None = None
 
 
+class PodcastImport(BaseModel):
+    # Deliberately loose dicts, not nested models: the field names inside come from
+    # Spotify's undocumented dashboard API and WILL drift — a strict schema would 422
+    # the whole batch on the first renamed key. ingestion/podcast.py's normalisers
+    # are the validator, and unparsed blobs are kept for re-parsing.
+    source: str = "spotify"
+    show: dict | None = None    # {name?, followers?, demographics?, raw?}
+    episodes: list[dict] = []   # [{episode_id, url?, title?, release_date?, duration_sec?, metrics?, retention?, raw?, error?}]
+    batch: dict | None = None   # {index, total, mode: "recent"|"backfill"}
+
+
 @app.post("/site-auth/import")
 def site_auth_import(payload: SiteAuthImport, x_api_key: str = Header(default="")):
     """
@@ -513,3 +525,20 @@ def research_import(payload: ResearchImport, x_api_key: str = Header(default="")
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc))
     return complete_from_html(queue_id, article_id, payload.html)
+
+
+@app.post("/podcast/import")
+def podcast_import(payload: PodcastImport, x_api_key: str = Header(default="")):
+    """
+    Land one batch of Spotify for Creators analytics collected by the extension's
+    "Send podcast stats" button (see ingestion/podcast.py for where it all goes).
+
+    Processed inline rather than on BackgroundTasks — the same deliberate deviation
+    as /research/import and /site-auth/import: the popup renders the per-batch result
+    ("Batch 3/18 — 25 episodes, 24 matched"), batches are ≤25 episodes, and the work
+    is a few seconds of DB writes. import_podcast_payload never raises.
+    """
+    _check_key(x_api_key)
+    if not payload.episodes and not payload.show:
+        raise HTTPException(status_code=400, detail="episodes or show is required")
+    return import_podcast_payload(payload.model_dump())

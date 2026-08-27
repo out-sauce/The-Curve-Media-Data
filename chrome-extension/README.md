@@ -53,6 +53,32 @@ server matches it to the pipeline article (you'll get an error if the page isn't
 runs the same extract + summarise path, and closes any outstanding queue request for that
 article. No Admin round-trip, no background tab.
 
+## Podcast analytics (Spotify for Creators)
+
+Spotify has no public analytics API, so this extension pulls per-episode numbers the
+same way it grabs articles: from **your logged-in browser**. Open your show's dashboard
+on https://creators.spotify.com (the popup's podcast section appears only on
+`creators.spotify.com` / `podcasters.spotify.com`), click **Send podcast stats**, and it
+calls the dashboard's own JSON endpoints with your live session, then POSTs the
+collected analytics to `<base>/podcast/import` in batches of 25.
+
+- **Episodes per run** — most recent 10/25/50 (repeat runs keep numbers fresh; every
+  write is an idempotent upsert).
+- **Full backfill** — every episode, once, behind a confirm. ~4 requests per episode,
+  so it takes a while: **keep the popup open** until the batch counter finishes. If it
+  is interrupted, already-sent batches are kept; just run it again.
+- **First run = discovery.** The Spotify endpoint paths in `spotify-collector.js` are
+  historical candidates, not verified — if the first press reports failures, follow the
+  discovery notes at the top of that file (DevTools → Network on the dashboard, correct
+  the table). Demographics are additionally held back server-side until
+  `demographicsValueType` in that table is set to `"count"` or `"percent"` from the
+  live response — writing one as the other would corrupt the table.
+
+Server-side the data lands in `content_stats` (platform `spotify`), the matched
+`podcast_episodes` row, `audience_demographics` and `follower_snapshots` — see
+`ingestion/podcast.py`. Migration 043 must be applied first or every episode write is
+rejected with a check violation.
+
 ## Notes / limits
 
 - **Re-run when it expires.** Subscriber sessions lapse (~7–30 days); just capture again.

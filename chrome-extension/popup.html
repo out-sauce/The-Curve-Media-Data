@@ -22,8 +22,24 @@
 
     <button id="capture" disabled>Capture &amp; send</button>
     <button id="sendArticle" disabled>Send article content</button>
+
+    <!-- Shown only on creators.spotify.com / podcasters.spotify.com -->
+    <div id="podcastSection" style="display: none">
+      <button id="sendPodcast" disabled>Send podcast stats</button>
+      <label for="podcastLookback">Episodes per run</label>
+      <select id="podcastLookback">
+        <option value="10">Most recent 10</option>
+        <option value="25">Most recent 25</option>
+        <option value="50">Most recent 50</option>
+      </select>
+      <div style="margin-top: 6px; font-size: 12px">
+        <a id="podcastBackfill">Full backfill (every episode — slow)</a>
+      </div>
+    </div>
+
     <div id="status"></div>
 
+    <script src="spotify-collector.js"></script>
     <script src="popup.js"></script>
   </body>
 </html>
