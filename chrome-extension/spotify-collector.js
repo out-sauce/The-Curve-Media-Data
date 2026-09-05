@@ -517,25 +517,19 @@ async function collectSpotifyShow(graph, showId) {
   try {
     const g = await spotifyGraph(graph, SPOTIFY_GRAPH.ops.showGeo,
       { ...vars, metricType: "METRIC_TYPE_PLAYS" }, errors);
-    const geos = findDeep(g, "geos");
-    if (Array.isArray(geos) && geos.length) {
-      // Probe first: record the raw shape of a few entries so the ISO-2 field can be
-      // identified from stored data if the derivation below misses.
-      out.raw.geo_probe = geos.slice(0, 3);
-      const iso = (e) => {
-        const m = String(e.flagUrl || "").match(/([a-zA-Z]{2})\.(?:svg|png|jpg)(?:$|\?)/);
-        if (m) return m[1].toUpperCase();
-        if (typeof e.navigationName === "string" && /^[a-zA-Z]{2}$/.test(e.navigationName)) {
-          return e.navigationName.toUpperCase();
-        }
-        return null;
-      };
-      const rows = geos
-        .map((e) => ({ country: iso(e), count: e.value }))
-        .filter((r) => r.country && r.count != null);
-      // All-or-nothing: a partial map would silently drop countries from the totals.
-      if (rows.length === geos.length) out.demographics.country = rows;
-      else errors.push(`country: ISO-2 derivable for only ${rows.length}/${geos.length} — not written, probe stored`);
+    // Same parsing as the per-episode path — one implementation, not two. geos[] carries
+    // country NAMES and fractional shares, so the show's own play total is the
+    // denominator. That total comes from the gender breakdown, which is an absolute count.
+    const showTotal = (out.demographics.gender || []).reduce((a, r) => a + (r.count || 0), 0) || null;
+    const { rows, probe, mode } = geoRows(g, showTotal);
+    if (probe) out.raw.geo_probe = { entries: probe, mode: mode || null, showTotal };
+    if (rows) {
+      // Buckets are NZ/AU/GB/US/ROW — matching the hand-entered podcast country rows
+      // already in audience_demographics, rather than Instagram's full ISO-2 set. Those
+      // are separate key spaces (platform differs), so the two never collide.
+      const merged = {};
+      for (const r of rows) merged[r.country] = (merged[r.country] || 0) + r.count;
+      out.demographics.country = Object.entries(merged).map(([country, count]) => ({ country, count }));
     }
   } catch (e) {
     errors.push(`geo: ${e.message}`);
