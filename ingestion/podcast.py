@@ -346,6 +346,13 @@ def _episode_row(
 # ── Per-episode demographics -> podcast_episodes.spotify_* (migration 044) ────
 
 _AGE_COLUMNS = {
+    "age_18_22": "spotify_age_18_22_pct",
+    "age_23_27": "spotify_age_23_27_pct",
+    "age_28_34": "spotify_age_28_34_pct",
+    "age_35_44": "spotify_age_35_44_pct",
+    "age_45_59": "spotify_age_45_59_pct",
+    "age_60_plus": "spotify_age_60plus_pct",
+    "60plus": "spotify_age_60plus_pct",
     "18-22": "spotify_age_18_22_pct",
     "23-27": "spotify_age_23_27_pct",
     "28-34": "spotify_age_28_34_pct",
@@ -353,17 +360,26 @@ _AGE_COLUMNS = {
     "45-59": "spotify_age_45_59_pct",
     "60+": "spotify_age_60plus_pct",
 }
+# Spotify sends MALE / FEMALE / NON_BINARY / NOT_SPECIFIED. Aliases are listed because
+# an unmapped bucket is DROPPED and the rest renormalise — which produces a plausible
+# wrong number rather than a visible failure: missing NOT_SPECIFIED once turned a true
+# 90.1% female into 94.0%. _pct_columns now warns on any bucket it cannot place.
 _GENDER_COLUMNS = {
     "female": "spotify_gender_female_pct",
     "male": "spotify_gender_male_pct",
     "non_binary": "spotify_gender_non_binary_pct",
+    "nonbinary": "spotify_gender_non_binary_pct",
+    "not_specified": "spotify_gender_not_specified_pct",
+    "notspecified": "spotify_gender_not_specified_pct",
     "unknown": "spotify_gender_not_specified_pct",
+    "unspecified": "spotify_gender_not_specified_pct",
 }
 _GEO_COLUMNS = {"NZ": "spotify_geo_plays_nz", "AU": "spotify_geo_plays_au",
                 "GB": "spotify_geo_plays_gb", "US": "spotify_geo_plays_us"}
 
 
-def _pct_columns(rows: Any, mapping: dict[str, str], key: str) -> dict[str, float]:
+def _pct_columns(rows: Any, mapping: dict[str, str], key: str,
+                 warnings: list[str] | None = None) -> dict[str, float]:
     """Counts -> percentages over the MAPPED buckets only.
 
     Spotify returns eight age brackets; podcast_episodes has six columns — no home for
@@ -375,6 +391,7 @@ def _pct_columns(rows: Any, mapping: dict[str, str], key: str) -> dict[str, floa
     if not isinstance(rows, list):
         return {}
     totals: dict[str, float] = {}
+    unmapped: list[str] = []
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -383,6 +400,12 @@ def _pct_columns(rows: Any, mapping: dict[str, str], key: str) -> dict[str, floa
         column = mapping.get(bucket) or mapping.get(bucket.replace(" ", ""))
         if column and count is not None:
             totals[column] = totals.get(column, 0.0) + count
+        elif count:
+            # Never drop a populated bucket in silence: the renormalisation below would
+            # quietly redistribute its share across the others.
+            unmapped.append(f"{key}={bucket!r} ({count:g})")
+    if unmapped and warnings is not None:
+        warnings.append(f"unmapped demographic buckets dropped: {', '.join(unmapped)}")
     base = sum(totals.values())
     if base <= 0:
         return {}
@@ -419,8 +442,8 @@ def _demographic_columns(episode: dict, warnings: list[str]) -> dict[str, Any]:
     if not isinstance(demo, dict):
         return {}
     fields: dict[str, Any] = {}
-    fields.update(_pct_columns(demo.get("gender"), _GENDER_COLUMNS, "gender"))
-    fields.update(_pct_columns(demo.get("age"), _AGE_COLUMNS, "age"))
+    fields.update(_pct_columns(demo.get("gender"), _GENDER_COLUMNS, "gender", warnings))
+    fields.update(_pct_columns(demo.get("age"), _AGE_COLUMNS, "age", warnings))
     fields.update(_geo_columns(demo.get("geo")))
     return fields
 

@@ -378,7 +378,14 @@ async function enrichSpotifyEpisode(graph, ep) {
       ["age", SPOTIFY_GRAPH.ops.episodeAge, ageRows],
       ["geo", SPOTIFY_GRAPH.ops.episodeGeo, null],
     ]) {
-      for (const win of ["WINDOW_ALL_TIME"]) {
+      // Gender and age answer WINDOW_ALL_TIME (read off the dashboard's request). Geo
+      // returns an EMPTY geos[] for that window, so it is tried across the others —
+      // same per-operation window quirk, which surfaces as empty data rather than an
+      // error. Whichever produces entries wins; the probe records which.
+      const windows = key === "geo"
+        ? ["WINDOW_ALL_TIME", "WINDOW_LAST_THIRTY_DAYS", "WINDOW_SINCE_PUBLISHED", "WINDOW_LAST_NINETY_DAYS"]
+        : ["WINDOW_ALL_TIME"];
+      for (const win of windows) {
         await spotifySleep(200);
         try {
           const r = await spotifyGraph(graph, op,
