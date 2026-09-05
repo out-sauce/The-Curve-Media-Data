@@ -129,3 +129,70 @@ chrome.runtime.onStartup.addListener(ensureAlarm);
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === POLL_ALARM) poll();
 });
+
+// ── Spotify for Creators bearer capture ──────────────────────────────────────
+// We observe the Authorization header the dashboard already sends, rather than
+// injecting a fetch patch into the page.
+//
+// WHY NOT INJECTION: a content script patching window.fetch must run in the page's
+// MAIN world before Spotify's transport binds its own fetch reference. Chrome accepted
+// `world: "MAIN"` BOTH in the manifest and via chrome.scripting.registerContentScripts
+// and ran the script in the ISOLATED world regardless — no error either time (verified
+// live 2026-09-04: the script's DOM marker appeared while window.fetch stayed native).
+// An isolated-world patch is invisible to the page, so it can never see the header.
+//
+// chrome.webRequest observation has none of those failure modes: it is not subject to
+// world semantics, cannot lose a race against page scripts, and needs no injection.
+// MV3 removed *blocking* webRequest; observation is still supported.
+//
+// STORAGE: chrome.storage.session, not a module variable. An MV3 service worker is
+// terminated after ~30s idle, which would wipe a plain `let` between the dashboard
+// loading and the operator pressing the button — the failure looks identical to "never
+// captured". storage.session is memory-backed (never written to disk) and cleared when
+// the browser closes, so the bearer still never rests anywhere, but it survives the
+// service-worker lifecycle. The token expires in ~1h (expires_in 3600); anything older
+// than SPOTIFY_BEARER_MAX_AGE_MS is treated as absent so a stale 401 is impossible.
+const SPOTIFY_GRAPH_URL = "https://creators-graph.spotify.com/*";
+const SPOTIFY_BEARER_KEY = "spotifyBearer";
+const SPOTIFY_BEARER_MAX_AGE_MS = 50 * 60 * 1000;
+
+try {
+  chrome.webRequest.onSendHeaders.addListener(
+    (details) => {
+      for (const h of details.requestHeaders || []) {
+        if (h.name.toLowerCase() === "authorization" && /^Bearer\s+\S+/i.test(h.value || "")) {
+          chrome.storage.session
+            .set({ [SPOTIFY_BEARER_KEY]: { value: h.value, at: Date.now() } })
+            .catch(() => {});
+          break;
+        }
+      }
+    },
+    { urls: [SPOTIFY_GRAPH_URL] },
+    ["requestHeaders", "extraHeaders"]
+  );
+} catch (e) {
+  console.error("[curve] webRequest listener failed:", e);
+}
+
+async function readSpotifyBearer() {
+  try {
+    const got = await chrome.storage.session.get(SPOTIFY_BEARER_KEY);
+    const rec = got[SPOTIFY_BEARER_KEY];
+    if (!rec || !rec.value) return { bearer: null, ageSec: null };
+    const age = Date.now() - rec.at;
+    if (age > SPOTIFY_BEARER_MAX_AGE_MS) return { bearer: null, ageSec: Math.round(age / 1000), stale: true };
+    return { bearer: rec.value, ageSec: Math.round(age / 1000) };
+  } catch (e) {
+    return { bearer: null, ageSec: null, error: String(e) };
+  }
+}
+
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg && msg.type === "curve:getSpotifyBearer") {
+    // async response — must return true to keep the channel open
+    readSpotifyBearer().then(sendResponse);
+    return true;
+  }
+  return false;
+});

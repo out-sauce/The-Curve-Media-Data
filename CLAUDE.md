@@ -57,49 +57,90 @@ triggers stages over HTTP.
 ## Recent changes
 
 - **Spotify for Creators podcast analytics via the extension** (`ingestion/podcast.py`,
-  migration 043, extension 1.2.0). Spotify has no public analytics API, so the Curve
-  Auth extension gained a **"Send podcast stats"** button (shown only on
-  `creators.spotify.com`/`podcasters.spotify.com`): it injects
-  `chrome-extension/spotify-collector.js` into the operator's logged-in dashboard tab,
-  calls the dashboard's own JSON endpoints with the live session, and POSTs batches of
-  ≤25 episodes to `POST /podcast/import` (processed **inline**, like the other two
-  interactive imports — the popup renders per-batch results). Recent-10/25/50 per press,
-  full backfill behind a confirm; upserts are idempotent so retries/interrupts heal.
-  - **The endpoint table in `spotify-collector.js` is UNVERIFIED candidates** (the
-    Zernio/Apify lesson, designed-for this time): discovery notes sit at the top of the
-    file, every reader in `podcast.py` accepts multiple key spellings via `_pick`, and
-    each episode's raw vendor blob is kept in `platform_specific.vendor_raw` (~50KB cap)
-    so a field-name fix is a re-parse, not a re-fetch.
-  - **Where it lands.** `content_stats` platform `'spotify'` (043 widens the platform
-    CHECK; `post_id` = Spotify episode id; `views`=plays, `reach`=listeners, both
-    `_nz`-guarded — Spotify reports 0 for a metric it can't serve yet; Spotify-only
-    vocabulary in `platform_specific`; no `engagement_*`/likes/comments/shares, and no
-    `calendar_item_id` — podcast calendar titles are planning names that can't be
-    matched safely). Also the Admin's **`podcast_episodes`** row (the screen the
-    operator actually looks at): `plays_spotify` / `spotify_avg_listen_minutes` /
-    `spotify_completion_pct` are **overwritten** when a real value is present
-    (operator-confirmed — plays is monotone, the stale hand-entered figure is an
-    undercount), never with None/0. Matching is exact normalised title (HTML-unescaped —
-    live titles carry `&#39;`) + pub_date within `PODCAST_EPISODE_MATCH_WINDOW_DAYS`
-    (3); a miss or ambiguity skips the link with a warning, never guesses.
-    `content_stats.podcast_episode_id` (column pre-existed, Admin-created) is handled
-    exactly like `calendar_item_id`: set on insert, fill-only-if-null on update.
-  - **Demographics are refused until the collector declares `value_type`.** Whether
-    Spotify serves counts or percentages is a discovery fact; `demographicsValueType`
-    in the collector stays `null` until read off the live payload, and the server skips
-    the write with a warning rather than corrupt `audience_demographics`. No collision
-    with the hand-entered podcast rows: those sit at `platform=NULL,
-    social_account_id=NULL` and the natural-key index is NULLS NOT DISTINCT, so
-    `platform='spotify'` + the account uuid occupies disjoint keys.
-  - `follower_snapshots`: today's row only via the standard one-row-per-UTC-day upsert —
-    the 12 hand-entered monthly spotify rows are untouchable by construction. The
-    spotify `social_accounts` row is resolved by new `get_social_account_by_platform`;
-    `get_self_social_accounts()` was deliberately NOT widened (it feeds the Apify sweep,
-    which has no spotify scraper).
-  - No new `content_stats` columns → the `_content_stats_column_set()` cache imposes no
-    deploy-ordering constraint; pre-043 the failure is a clean 23514.
-    `podcast_episode_daily_plays` and the per-episode gender/age pct columns are
-    phase 2, once discovery confirms their payload shapes.
+  migrations 043 + 044, extension 1.8.0). Spotify has no public analytics API, so the
+  Curve Auth extension pulls from the operator's logged-in Creators session. Everything
+  below was verified live 2026-09-04/05; the original REST design in this file's history
+  was **entirely fictional** and none of it existed.
+  - **It is GraphQL persisted queries, not REST.** One endpoint,
+    `POST https://creators-graph.spotify.com/v2/graph-pq`, body
+    `{operationName, variables, extensions:{persistedQuery:{version:1, sha256Hash}}}`.
+    Only REGISTERED hashes are accepted. **Hashes must be the full 64 hex chars** — a
+    truncated one does not error, the server matches nothing and returns an empty `data`
+    object that looks exactly like "this show has no data". `spotifyGraph` asserts the
+    length for that reason. Dashboard URLs are `/dash/show/{id}` and
+    `/analytics/show/{id}/…`; ids are addressed as `spotify:show:…` / `spotify:episode:…`.
+  - **DISCOVERY IS FREE — read Spotify's own bundle.** Their JS ships the complete
+    GraphQL ASTs: `__meta__:{hash:"…"}` followed by the OperationDefinition, its
+    variableDefinitions and its selection set. Fetch the page's scripts and regex those
+    out and you have every operation's name, hash, variables and response fields without
+    clicking anything. That is how the catalogue (52 episode-level, 89 show-level ops)
+    was built. Do this FIRST next time.
+  - **Auth: observe the bearer, never mint or inject it.** The dashboard authenticates
+    via OAuth authorization_code + PKCE at `accounts.spotify.com/api/token` — a redirect
+    flow no extension can reproduce — and the token is NOT in web storage.
+    `background.js` uses `chrome.webRequest.onSendHeaders` to read the `Authorization`
+    header off the dashboard's own requests, holding it in `chrome.storage.session`
+    (memory-backed; an MV3 worker dies after ~30s idle, so a module variable silently
+    loses it). **Injection was tried and abandoned**: Chrome accepted `world: "MAIN"`
+    both in the manifest and via `chrome.scripting.registerContentScripts` and ran the
+    script in the ISOLATED world anyway, with no error either time — an isolated-world
+    `fetch` patch is inert. A late MAIN-world patch cannot work regardless, because the
+    dashboard binds its own `fetch` reference at module init.
+  - **Requests run IN THE TAB, and without `credentials`.** A popup-context fetch sends
+    `Origin: chrome-extension://…` and gets 403; the transport is injected into the
+    dashboard tab (isolated world is fine — we no longer patch anything) so it carries
+    `Origin: https://creators.spotify.com`. And `credentials: "include"` is fatal:
+    Spotify answers the preflight with a wildcard origin, which the browser refuses to
+    pair with a credentialed request, so the call fails as an opaque "Failed to fetch".
+  - **⚠️ Some series are cumulative, some are per-day.** `playsDaily`/`audienceDaily`
+    are cumulative running totals (proved: `audienceTotal` equals the LAST point, not the
+    sum) — take the last point. `episodeStreamsDaily` is per-day — sum it. `seriesTotal`
+    detects which by monotonicity rather than assuming, and records the verdict in
+    `vendor_raw`. Getting this backwards is a silent order-of-magnitude error.
+  - **Completion comes from `percentiles`, at the 95% mark.** `getEpisodePerformance-
+    AllTime` returns the retention curve; Spotify defines "completion rate" as reaching
+    **95%** of the episode, not 100% (the 100 bucket reads ~20 points lower). Verified
+    against the UI: 80/69/60 quartiles and 51% completion reproduced exactly.
+    `medianCompletionSeconds` is NOT a completion rate — it is where retention crosses
+    half, i.e. a legitimate **median** listen time (it lands in
+    `spotify_avg_listen_minutes`, whose name says "avg"; Spotify publishes only a median).
+    An earlier median/duration formula wrote 95% where the truth was 51%.
+  - **Field shapes that are not what they look like:** `publishedOn` is
+    `{seconds: <epoch>}` (a protobuf Timestamp, not a date string); duration lives at
+    `asset.durationMs`, not top level; the listing carries no description or shareUrl.
+    `starts` == plays (~1 day behind the per-episode call); `streams` is a distinct,
+    lower metric. Spotify's own typo `explict` is in the payload.
+  - **The window enum is NOT interchangeable across operations.** `getEpisodePerformance-
+    Stats` wants `WINDOW_SINCE_PUBLISHED`; `getEpisodeStreams` and the demographic ops
+    answer `WINDOW_ALL_TIME`. An operation given a window it does not serve returns the
+    full structure with `totalValue: 0` — indistinguishable from "no data". That cost
+    three runs. Read the window off the dashboard's own request rather than inferring it.
+  - **Per-episode demographics → `podcast_episodes.spotify_*` (migration 044).**
+    `getEpisodePlaysByGender` / `getEpisodePlaysByAge` / `getEpisodeSpotifyPlaysByCountry`,
+    all `{episodeUri, dateRangeWindow: "WINDOW_ALL_TIME"}`. 044 **adds** `spotify_`-
+    prefixed columns and copies the hand-entered history across; it does NOT rename,
+    because `podcast_episodes` is the Admin app's table and renaming would break that
+    repo's UI. The pipeline writes BOTH prefixed and unprefixed columns until Admin
+    switches its reads; only then should a later migration drop the old ones.
+    Age percentages renormalise over the six columns that exist (Spotify returns eight
+    brackets — `0-17` and `unknown` have no home and are dropped, never folded into a
+    neighbour), matching the existing rows which sum to exactly 100.
+  - **Show-level demographics land in `audience_demographics`** at `platform='spotify'`.
+    `demographicsValueType` is resolved: `genderBreakdown.counts[]` carries BOTH `count`
+    and `percent`, so we write counts and nothing is inferred. Note these are **plays**,
+    not people — Instagram's rows in the same table count followers, so percentages are
+    comparable across platforms but absolute values are not (1.67M plays vs 49k humans).
+    Spotify also returns a `non_binary` bucket the rest of the system does not use.
+  - **FOLLOWERS ARE NOT AVAILABLE.** No operation and no selection-set field containing
+    "follow" exists in any bundle on the show audience page (32 scripts scanned). Spotify
+    `follower_snapshots` stay hand-entered. Do not go looking again.
+  - Country is derived to ISO-2 from `flagUrl` (`…/nz.svg`) and written **all-or-nothing**:
+    `audience_demographics` stores ISO-2 and its natural key includes `bucket`, so a
+    partial map would drop countries and display names would make country ungroupable.
+  - **Deploy ordering bit us:** the extension is loaded from disk and updates instantly,
+    but `ingestion/podcast.py` runs on Railway. A collector change that sends a NEW block
+    does nothing until the server is pushed — the endpoint ignores unknown keys silently.
+    Per-episode demographics appeared to fail for three rounds for exactly this reason.
 
 - **Outstand → Zernio (migrations 037/038/039).** `ingestion/outstand.py` is GONE,
   replaced by `ingestion/zernio.py` (analytics) + `ingestion/inbox.py` (comments/DMs).

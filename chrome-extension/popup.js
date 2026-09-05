@@ -8,7 +8,8 @@
 //
 // "Send podcast stats" (shown only on creators.spotify.com / podcasters.spotify.com)
 // injects spotify-collector.js's collector into the tab, where it calls the Creators
-// dashboard's own JSON endpoints with your live session, and POSTs the collected
+// GraphQL API (creators-graph.spotify.com/v2/graph-pq) reusing the dashboard's own
+// bearer token, and POSTs the collected
 // per-episode analytics to <apiBase>/podcast/import in batches. The popup must stay
 // open while it runs — closing it stops the loop (already-sent batches are kept;
 // re-running is idempotent, so just press it again).
@@ -179,22 +180,71 @@ async function sendArticle() {
 }
 
 // ── Spotify for Creators podcast analytics ──────────────────────────────────
-// Two-phase: one injection lists the show's episodes, then batches of 25 are
-// re-injected to collect analytics and POSTed to /podcast/import. Sequential and
-// popup-bound on purpose — the operator watches the batch counter; if a backfill
-// ever proves too long for an open popup, the loop moves to background.js (the
-// research queue pattern), not to parallel fetches Spotify might rate-limit.
+// The calls run HERE, in the popup, not injected into the page: extension-context
+// fetches carry `<all_urls>` host permissions so CORS does not apply, and there is no
+// MAIN/ISOLATED world to lose to (see background.js for that whole saga). The bearer is
+// observed by background.js via chrome.webRequest.
+//
+// The popup must stay open while it runs — closing it stops the loop. Already-sent
+// batches are kept and the server upserts are idempotent, so re-running heals gaps.
 
 const SPOTIFY_HOSTS = ["creators.spotify.com", "podcasters.spotify.com"];
 const PODCAST_BATCH_SIZE = 25;
 
-async function injectCollector(cfg) {
-  const [{ result } = {}] = await chrome.scripting.executeScript({
-    target: { tabId: activeTab.id },
-    func: collectSpotifyAnalytics,
-    args: [{ endpoints: SPOTIFY_ENDPOINTS, ...cfg }],
-  });
-  return result || { error: "Injection returned nothing (page blocked scripting?)" };
+async function getSpotifyBearer() {
+  const resp = await chrome.runtime.sendMessage({ type: "curve:getSpotifyBearer" });
+  if (resp && resp.stale) return { bearer: null, stale: true };
+  return { bearer: (resp && resp.bearer) || null, stale: false };
+}
+
+// GraphQL transport. The fetch runs in the dashboard TAB (default isolated world — we
+// only ever needed MAIN to patch fetch, which we no longer do) so the request carries
+// Origin: https://creators.spotify.com. A popup-context fetch sends
+// Origin: chrome-extension://<id> and Spotify answers 403.
+function makeGraphTransport(tabId, bearer) {
+  return async (op, variables) => {
+    const [{ result } = {}] = await chrome.scripting.executeScript({
+      target: { tabId },
+      args: [{
+        endpoint: SPOTIFY_GRAPH.endpoint,
+        bearer,
+        operationName: op.name,
+        hash: op.hash,
+        variables,
+      }],
+      func: async (cfg) => {
+        try {
+          // NO `credentials: "include"`. Spotify answers the preflight with a wildcard
+          // Access-Control-Allow-Origin, which the browser refuses to pair with a
+          // credentialed request — the fetch is blocked before it is ever sent, surfacing
+          // only as "Failed to fetch". Verified live 2026-09-04: same request WITH
+          // credentials -> blocked; WITHOUT -> HTTP 401 from Spotify (dummy token).
+          // Auth is the bearer, not cookies, so nothing is lost by omitting them.
+          const r = await fetch(cfg.endpoint, {
+            method: "POST",
+            headers: { "content-type": "application/json", authorization: cfg.bearer },
+            body: JSON.stringify({
+              operationName: cfg.operationName,
+              variables: cfg.variables,
+              extensions: { persistedQuery: { version: 1, sha256Hash: cfg.hash } },
+            }),
+          });
+          const raw = await r.text();
+          let body = null;
+          try { body = JSON.parse(raw); } catch (e) { /* keep raw for the error message */ }
+          return { status: r.status, body, raw: body ? "" : raw.slice(0, 300) };
+        } catch (e) {
+          return { status: 0, error: String(e && e.message ? e.message : e) };
+        }
+      },
+    });
+    return result || { status: 0, error: "injection returned nothing" };
+  };
+}
+
+function showIdFromUrl(url) {
+  const m = String(url || "").match(/\/dash\/show\/([^/?#]+)/);
+  return m ? m[1] : null;
 }
 
 async function sendPodcastStats(fullBackfill) {
@@ -204,59 +254,99 @@ async function sendPodcastStats(fullBackfill) {
     const lookback = parseInt($("podcastLookback").value, 10) || 10;
     chrome.storage.local.set({ podcastLookback: lookback });
 
-    setStatus("Listing episodes…");
-    const listing = await injectCollector({ phase: "list" });
-    if (listing.error) {
-      setStatus(`Episode list failed: ${listing.error}`, "err");
+    const showId = showIdFromUrl(activeTab.url);
+    if (!showId) {
+      setStatus("Open your show's dashboard first (the URL should contain /dash/show/…).", "err");
       return;
     }
-    let episodes = (listing.episodes || []).filter((e) => e.episode_id);
+    const { bearer, stale } = await getSpotifyBearer();
+    if (!bearer) {
+      setStatus(
+        stale
+          ? "Spotify session is over an hour old — reload the dashboard tab, then press again."
+          : "No Spotify session seen yet — reload the dashboard tab, let it load, then press again.",
+        "err"
+      );
+      return;
+    }
+
+    const graph = makeGraphTransport(activeTab.id, bearer);
+
+    setStatus("Listing episodes…");
+    let listing;
+    try {
+      listing = await listSpotifyEpisodes(graph, showId, (page, total, count) => {
+        setStatus(`Listing episodes… page ${page}/${total} (${count} so far)`);
+      });
+    } catch (e) {
+      setStatus(`Episode list failed: ${e.message}`, "err");
+      return;
+    }
+    let episodes = listing.episodes;
     if (!episodes.length) {
-      setStatus("No episodes found — check the endpoint table in spotify-collector.js (see its discovery notes).", "err");
+      setStatus("No episodes found — the endpoint table may be stale (see spotify-collector.js).", "err");
       return;
     }
     if (!fullBackfill) episodes = episodes.slice(0, lookback);
 
-    const batches = [];
-    for (let i = 0; i < episodes.length; i += PODCAST_BATCH_SIZE) {
-      batches.push(episodes.slice(i, i + PODCAST_BATCH_SIZE));
-    }
+    const warnings = [...listing.errors];
+    let written = 0, matched = 0;
 
-    let written = 0;
-    let matched = 0;
-    const warnings = [];
-    for (let i = 0; i < batches.length; i++) {
-      setStatus(
-        `Batch ${i + 1}/${batches.length} — collecting ${batches[i].length} episodes…\n(keep this popup open)`
-      );
-      // Show-level data (followers, demographics) rides on the first batch only.
-      const collected = await injectCollector({
-        phase: "collect",
-        episodes: batches[i],
-        includeShow: i === 0,
-      });
-      warnings.push(...(collected.errors || []));
+    for (let i = 0; i < episodes.length; i += PODCAST_BATCH_SIZE) {
+      const slice = episodes.slice(i, i + PODCAST_BATCH_SIZE);
+      const batchNo = Math.floor(i / PODCAST_BATCH_SIZE) + 1;
+      const batchTotal = Math.ceil(episodes.length / PODCAST_BATCH_SIZE);
+      const collected = [];
+      for (let j = 0; j < slice.length; j++) {
+        setStatus(`Batch ${batchNo}/${batchTotal} — episode ${j + 1}/${slice.length}…\n(keep this popup open)`);
+        const { episode, errors } = await enrichSpotifyEpisode(graph, slice[j]);
+        collected.push(episode);
+        warnings.push(...errors);
+      }
+
+      // Show-level demographics ride on the first batch only.
+      let showBlock = null;
+      if (i === 0) {
+        setStatus(`Batch ${batchNo}/${batchTotal} — show demographics…`);
+        try {
+          const res = await collectSpotifyShow(graph, showId);
+          warnings.push(...res.errors);
+          // The server persists EPISODE raw only, so park the show probe on the first
+          // episode either way — otherwise it disappears precisely when the show block
+          // IS written, which is when a skipped dimension still needs explaining.
+          if (res.show && collected[0]) {
+            collected[0].raw = { ...(collected[0].raw || {}), show_probe: res.show.raw };
+          }
+          if (res.probeOnly) {
+            warnings.push("show demographics: no breakdown returned — probe attached to first episode raw");
+          } else {
+            showBlock = res.show;
+          }
+        } catch (e) {
+          warnings.push(`show demographics: ${e.message}`);
+        }
+      }
 
       const resp = await fetch(`${apiBase}/podcast/import`, {
         method: "POST",
         headers: { "content-type": "application/json", "x-api-key": apiKey },
         body: JSON.stringify({
           source: "spotify",
-          show: collected.show || null,
-          episodes: collected.episodes || [],
-          batch: { index: i + 1, total: batches.length, mode: fullBackfill ? "backfill" : "recent" },
+          show: showBlock,
+          episodes: collected,
+          batch: { index: batchNo, total: batchTotal, mode: fullBackfill ? "backfill" : "recent" },
         }),
       });
       const body = await resp.json().catch(() => ({}));
       if (!resp.ok) {
         // Report and continue — server upserts are idempotent, a re-run heals gaps.
-        warnings.push(`batch ${i + 1} failed (${resp.status}): ${body.detail || resp.statusText}`);
+        warnings.push(`batch ${batchNo} failed (${resp.status}): ${body.detail || resp.statusText}`);
         continue;
       }
       written += body.episodes_written || 0;
       matched += body.episodes_matched || 0;
       warnings.push(...(body.warnings || []));
-      setStatus(`Batch ${i + 1}/${batches.length} — ${written} episodes written, ${matched} matched.`);
+      setStatus(`Batch ${batchNo}/${batchTotal} — ${written} written, ${matched} matched.`);
     }
 
     const summary = `✓ ${written} episodes written, ${matched} matched to podcast_episodes.`;
@@ -278,7 +368,7 @@ $("capture").addEventListener("click", capture);
 $("sendArticle").addEventListener("click", sendArticle);
 $("sendPodcast").addEventListener("click", () => sendPodcastStats(false));
 $("podcastBackfill").addEventListener("click", () => {
-  if (confirm("Collect analytics for EVERY episode? ~4 requests per episode — takes a while, keep the popup open.")) {
+  if (confirm("Collect analytics for EVERY episode? Takes a few minutes — keep the popup open.")) {
     sendPodcastStats(true);
   }
 });

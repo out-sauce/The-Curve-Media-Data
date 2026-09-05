@@ -321,10 +321,108 @@ def _episode_row(
             "spotify_completion_pct": completion_pct if completion_pct else None,
         }
         fields = {k: v for k, v in fields.items() if v is not None}
+        # Demographics land in the spotify_-prefixed columns (044). The unprefixed ones
+        # are ALSO written for now: the Admin app still reads those, and this repo cannot
+        # see that repo to know when it has switched over. Drop this second write — and
+        # the old columns — only once Admin reads spotify_*.
+        # Demographics are LAST-30-DAYS (the only window Spotify serves per episode), so
+        # they are NOT interchangeable with the hand-entered lifetime values already in
+        # this table. The collector only sends them for episodes under 90 days old, where
+        # 30 days is most of the episode's listening; anything older is skipped there.
+        # Everything below the extension's gate is therefore a recent episode, and the
+        # write is a fill, not a correction.
+        demographics = _demographic_columns(episode, warnings)
+        fields.update(demographics)
+        for column, value in demographics.items():
+            legacy = column[len("spotify_"):]
+            if legacy.startswith("geo_plays_") or legacy.startswith("age_") or legacy.startswith("gender_"):
+                fields[legacy] = value
         if fields:
             episode_update = {"id": matched_id, **fields}
     return stats_row, episode_update
 
+
+
+# ── Per-episode demographics -> podcast_episodes.spotify_* (migration 044) ────
+
+_AGE_COLUMNS = {
+    "18-22": "spotify_age_18_22_pct",
+    "23-27": "spotify_age_23_27_pct",
+    "28-34": "spotify_age_28_34_pct",
+    "35-44": "spotify_age_35_44_pct",
+    "45-59": "spotify_age_45_59_pct",
+    "60+": "spotify_age_60plus_pct",
+}
+_GENDER_COLUMNS = {
+    "female": "spotify_gender_female_pct",
+    "male": "spotify_gender_male_pct",
+    "non_binary": "spotify_gender_non_binary_pct",
+    "unknown": "spotify_gender_not_specified_pct",
+}
+_GEO_COLUMNS = {"NZ": "spotify_geo_plays_nz", "AU": "spotify_geo_plays_au",
+                "GB": "spotify_geo_plays_gb", "US": "spotify_geo_plays_us"}
+
+
+def _pct_columns(rows: Any, mapping: dict[str, str], key: str) -> dict[str, float]:
+    """Counts -> percentages over the MAPPED buckets only.
+
+    Spotify returns eight age brackets; podcast_episodes has six columns — no home for
+    '0-17' or 'unknown'. The existing 378 hand-entered rows sum to exactly 100.0 across
+    the six, so the established convention is to renormalise over what fits rather than
+    leave the row summing to 99.75. Unmapped buckets are dropped, not folded into a
+    neighbour: putting 0-17 into 18-22 would invent listeners in a bracket.
+    """
+    if not isinstance(rows, list):
+        return {}
+    totals: dict[str, float] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        bucket = str(row.get(key) or "").strip().lower()
+        count = _to_float(row.get("count"))
+        column = mapping.get(bucket) or mapping.get(bucket.replace(" ", ""))
+        if column and count is not None:
+            totals[column] = totals.get(column, 0.0) + count
+    base = sum(totals.values())
+    if base <= 0:
+        return {}
+    return {col: round(val * 100 / base, 2) for col, val in totals.items()}
+
+
+def _geo_columns(rows: Any) -> dict[str, int]:
+    """ISO-2 play counts -> the five geo columns; everything unlisted becomes ROW."""
+    if not isinstance(rows, list):
+        return {}
+    out: dict[str, int] = {}
+    row_total = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        code = str(row.get("country") or "").upper()
+        count = _to_int(row.get("count"))
+        if count is None:
+            continue
+        column = _GEO_COLUMNS.get(code)
+        if column:
+            out[column] = out.get(column, 0) + count
+        else:
+            row_total += count
+    if not out and not row_total:
+        return {}
+    out["spotify_geo_plays_row"] = row_total
+    return out
+
+
+def _demographic_columns(episode: dict, warnings: list[str]) -> dict[str, Any]:
+    """The spotify_* demographic columns for one episode, or {} when unavailable."""
+    demo = episode.get("demographics")
+    if not isinstance(demo, dict):
+        return {}
+    fields: dict[str, Any] = {}
+    fields.update(_pct_columns(demo.get("gender"), _GENDER_COLUMNS, "gender"))
+    fields.update(_pct_columns(demo.get("age"), _AGE_COLUMNS, "age"))
+    fields.update(_geo_columns(demo.get("geo")))
+    return fields
 
 # ── Show-level writers ─────────────────────────────────────────────────────────
 

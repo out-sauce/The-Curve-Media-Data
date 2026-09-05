@@ -1,10 +1,20 @@
 {
   "manifest_version": 3,
   "name": "Curve Auth Capture",
-  "version": "1.2.0",
+  "version": "1.8.0",
   "description": "Capture the current publisher's logged-in session (cookies + localStorage), grab full article text, and pull Spotify for Creators podcast analytics from your real browser for The Curve pipeline.",
-  "permissions": ["cookies", "scripting", "activeTab", "tabs", "alarms", "storage"],
-  "host_permissions": ["<all_urls>"],
+  "permissions": [
+    "cookies",
+    "scripting",
+    "activeTab",
+    "tabs",
+    "alarms",
+    "storage",
+    "webRequest"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
   "background": {
     "service_worker": "background.js"
   },
