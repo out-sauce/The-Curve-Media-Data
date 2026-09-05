@@ -136,22 +136,41 @@ function ageRows(payload) {
   return rows.length && rows.some((r) => r.count > 0) ? rows : null;
 }
 
-// ISO-2 from flagUrl (…/nz.svg) or a 2-char navigationName. Returns null unless EVERY
-// entry resolves — a partial map would silently drop countries out of the totals.
-function geoRows(payload) {
+// Geo entries are NOT what they look like (verified against the live response):
+//   {displayName: "Australia", flagUrl: ".../geo_2/australia.png", value: 0.1371499}
+// - flagUrl carries a country NAME, not an ISO-2 code. An earlier regex pulled the last
+//   two letters before ".png", which turns "Australia" into "IA". There is no code
+//   anywhere in the payload.
+// - `value` is a FRACTION of plays (0.137 = 13.7%), not a count. podcast_episodes'
+//   geo_plays_* columns are bigint counts, so it is multiplied by the episode's plays.
+// Only four countries have columns, so a full name->ISO map is unnecessary: everything
+// else folds into ROW, which is exactly what the schema wants.
+const GEO_NAME_TO_CODE = {
+  "new zealand": "NZ",
+  "australia": "AU",
+  "united kingdom": "GB",
+  "united states": "US",
+};
+
+function geoRows(payload, totalPlays) {
   const geos = findDeep(payload, "geos");
   if (!Array.isArray(geos) || !geos.length) return { rows: null, probe: null };
-  const iso = (e) => {
-    const m = String(e.flagUrl || "").match(/([a-zA-Z]{2})\.(?:svg|png|jpg)(?:$|\?)/);
-    if (m) return m[1].toUpperCase();
-    if (typeof e.navigationName === "string" && /^[a-zA-Z]{2}$/.test(e.navigationName)) {
-      return e.navigationName.toUpperCase();
-    }
-    return null;
-  };
-  const rows = geos.map((e) => ({ country: iso(e), count: e.value }))
-                   .filter((r) => r.country && r.count != null);
-  return { rows: rows.length === geos.length ? rows : null, probe: geos.slice(0, 3) };
+  const values = geos.map((e) => Number(e.value)).filter((v) => !Number.isNaN(v));
+  if (!values.length) return { rows: null, probe: geos.slice(0, 3) };
+  // Detect fractions vs counts rather than assuming: every value <= 1 means shares.
+  const areFractions = values.every((v) => v <= 1);
+  if (areFractions && !totalPlays) return { rows: null, probe: geos.slice(0, 3) };
+  const rows = geos
+    .map((e) => {
+      const v = Number(e.value);
+      if (Number.isNaN(v)) return null;
+      return {
+        country: GEO_NAME_TO_CODE[String(e.displayName || "").trim().toLowerCase()] || "ROW",
+        count: areFractions ? Math.round(v * totalPlays) : Math.round(v),
+      };
+    })
+    .filter(Boolean);
+  return { rows: rows.length ? rows : null, probe: geos.slice(0, 3), mode: areFractions ? "fraction" : "count" };
 }
 
 const spotifySleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -416,7 +435,8 @@ async function enrichSpotifyEpisode(graph, ep) {
             break;
           }
           if (key === "geo") {
-            const g = geoRows(r);
+            const g = geoRows(r, metrics.plays);
+            if (g.mode) probe[key].valueMode = g.mode;
             if (g.rows) { demo.geo = g.rows; break; }
             if (g.probe) probe.geo_entries = g.probe;
           } else {
