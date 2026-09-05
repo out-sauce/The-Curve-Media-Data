@@ -170,7 +170,19 @@ function geoRows(payload, totalPlays) {
       };
     })
     .filter(Boolean);
-  return { rows: rows.length ? rows : null, probe: geos.slice(0, 3), mode: areFractions ? "fraction" : "count" };
+  // A renamed country ("United States of America", "UK") stops matching and its plays
+  // move into ROW silently — a wrong number, not an error. Nothing outside the mapped
+  // four should hold a big share on this show, so flag any that does.
+  const suspicious = geos
+    .filter((e) => !GEO_NAME_TO_CODE[String(e.displayName || "").trim().toLowerCase()])
+    .filter((e) => (areFractions ? Number(e.value) : Number(e.value) / (totalPlays || 1)) > 0.05)
+    .map((e) => `${e.displayName} (${(Number(e.value) * 100).toFixed(1)}%)`);
+  return {
+    rows: rows.length ? rows : null,
+    probe: geos.slice(0, 3),
+    mode: areFractions ? "fraction" : "count",
+    unmappedLarge: suspicious.length ? suspicious : null,
+  };
 }
 
 const spotifySleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -437,6 +449,10 @@ async function enrichSpotifyEpisode(graph, ep) {
           if (key === "geo") {
             const g = geoRows(r, metrics.plays);
             if (g.mode) probe[key].valueMode = g.mode;
+            if (g.unmappedLarge) {
+              probe[key].unmappedLarge = g.unmappedLarge;
+              errors.push(`geo: large unmapped country, name may have changed: ${g.unmappedLarge.join(", ")}`);
+            }
             if (g.rows) { demo.geo = g.rows; break; }
             if (g.probe) probe.geo_entries = g.probe;
           } else {
@@ -521,7 +537,8 @@ async function collectSpotifyShow(graph, showId) {
     // country NAMES and fractional shares, so the show's own play total is the
     // denominator. That total comes from the gender breakdown, which is an absolute count.
     const showTotal = (out.demographics.gender || []).reduce((a, r) => a + (r.count || 0), 0) || null;
-    const { rows, probe, mode } = geoRows(g, showTotal);
+    const { rows, probe, mode, unmappedLarge } = geoRows(g, showTotal);
+    if (unmappedLarge) errors.push(`geo: large unmapped country: ${unmappedLarge.join(", ")}`);
     if (probe) out.raw.geo_probe = { entries: probe, mode: mode || null, showTotal };
     if (rows) {
       // Buckets are NZ/AU/GB/US/ROW — matching the hand-entered podcast country rows
