@@ -134,9 +134,21 @@ triggers stages over HTTP.
   - **FOLLOWERS ARE NOT AVAILABLE.** No operation and no selection-set field containing
     "follow" exists in any bundle on the show audience page (32 scripts scanned). Spotify
     `follower_snapshots` stay hand-entered. Do not go looking again.
-  - Country is derived to ISO-2 from `flagUrl` (`…/nz.svg`) and written **all-or-nothing**:
-    `audience_demographics` stores ISO-2 and its natural key includes `bucket`, so a
-    partial map would drop countries and display names would make country ungroupable.
+  - **Geo is not what it looks like.** Entries are
+    `{displayName:"Australia", flagUrl:".../geo_2/australia.png", value:0.1371}`.
+    `flagUrl` carries a country NAME — there is **no ISO-2 anywhere in the payload**, and
+    an earlier regex taking the last two letters before `.png` turned "Australia" into
+    "IA". And `value` is a **FRACTION of plays**, not a count, while `geo_plays_*` are
+    bigint counts — so it is multiplied by the episode's play total (fractions are
+    detected by `every value <= 1`, not assumed). Only NZ/AU/GB/US have columns, so a
+    four-entry name map plus ROW replaces ISO-2 derivation entirely; that also matches
+    the hand-entered podcast country rows. A renamed country would stop matching and
+    inflate ROW silently, so anything unmapped above 5% raises a warning.
+  - **An unmapped bucket is DROPPED and the rest renormalise to 100** — which yields a
+    plausible wrong number, not a visible failure. Spotify sends gender as
+    `MALE / FEMALE / NON_BINARY / NOT_SPECIFIED`; a map that only knew `unknown` turned a
+    true 90.1% female into 94.0% by excluding 103 not-specified plays. `_pct_columns` now
+    warns on any populated bucket it cannot place. Add aliases, never assume a spelling.
   - **Deploy ordering bit us:** the extension is loaded from disk and updates instantly,
     but `ingestion/podcast.py` runs on Railway. A collector change that sends a NEW block
     does nothing until the server is pushed — the endpoint ignores unknown keys silently.
