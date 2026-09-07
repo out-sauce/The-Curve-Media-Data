@@ -154,6 +154,54 @@ triggers stages over HTTP.
     does nothing until the server is pushed — the endpoint ignores unknown keys silently.
     Per-episode demographics appeared to fail for three rounds for exactly this reason.
 
+- **RSS download analytics via OP3** (`ingestion/podcast_rss.py`, migrations 045 + 046).
+  Every enclosure in the Flightcast feed is already wrapped in the OP3 prefix
+  (`https://op3.dev/e/episode.flightcast.com/<ulid>.mp3`), and OP3 is a plain public REST
+  API with a bearer token — so unlike the Spotify path this runs **server-side on the
+  scheduler**: no extension, no OAuth, nothing to reverse-engineer.
+  `POST /run/podcast-rss?start=` on demand; daily after the social stages.
+  - **FLIGHTCAST IS THE MASTER FOR PLAYS; OP3 IS FOR DIMENSIONS.** OP3 only counts
+    downloads made *after* the prefix went on the feed, so an episode published before
+    that shows its back-catalogue trickle rather than its real total — understated, and
+    plausibly so. Those rows are flagged `rss_partial`. **Never sum `rss_downloads_all`
+    into a lifetime figure.** Flightcast reports every platform on one basis for the
+    show's whole history; that is what `plays_*` / `total_plays` are for.
+  - **A prefix cannot see listening.** No completion, no retention, no listen time, and
+    OP3 by design never collects age or gender. What it gives that nothing else does per
+    episode is **country, app and device**. Age/gender for the RSS audience does not
+    exist anywhere short of Apple Podcasts Connect.
+  - **Spotify and YouTube plays never appear here** — both ingest the feed once to their
+    own CDN and serve from that copy. Verified live 2026-09-07: **zero** Spotify entries
+    across 32 apps and 77,911 downloads, of which Apple Podcasts is **87.5%**. So the
+    three sources measure **disjoint** audiences and add rather than overlap.
+  - **The join is in two parts.** `/queries/episode-download-counts` returns `itemGuid`
+    matching `podcast_episodes.guid` exactly — but it only covers the ~8 most recent
+    episodes. The RAW rows (`/downloads/show/{uuid}`) identify the episode by audio URL,
+    and **the file ULID is NOT the guid ULID**: they share a timestamp prefix and differ
+    in the random suffix on **422 of 424** episodes. The RSS feed is the only mapping
+    between them, so the stage parses it into `{file_ulid -> guid}` (128/128 mapped on
+    the first live run).
+  - **⚠️ PAGING IS BY `startAfter`, NOT a continuation token.** Rows come back ascending
+    from `start`, capped at `limit`, and **no `continuationToken` is ever returned**
+    despite the parameter existing — a loop waiting for one stops after a single page and
+    silently under-counts (`-7d` returns exactly 1000 rows covering only the oldest ~24h).
+    Walk forward from the last row's timestamp instead.
+  - **A truncated sweep must never be written.** These are totals written by overwrite, so
+    a run that stopped early would replace a correct figure with a smaller one — a silent
+    undercount that reads as a genuine drop. `_aggregate_downloads` returns a `complete`
+    flag; the stage refuses to write anything when it is False. Deep pages do time out
+    (seen live on a full-history sweep), so `_get` retries with backoff first.
+  - **`rss_partial` is derived from an independent lookup**, not from the sweep window: a
+    bounded run (`-30d`) would otherwise report its own window edge as the tracking start
+    and mislabel every episode.
+  - Show-level country/app/device land in `audience_demographics` at **`platform='rss'`**,
+    disjoint from the Spotify, Instagram and hand-entered rows sharing that table. 046
+    widens the dimension CHECK to allow `app`/`device` — without it those rows are
+    rejected with a 23514 while the country rows still write, so the failure is partial
+    and quiet. These count **downloads, not people**, same caution as the Spotify rows.
+  - `OP3_TOKEN` — `preview07ce` is OP3's own sample token and works for previewing; get a
+    real one from op3.dev (free, we own the prefix). No token → the stage skips.
+
 - **Outstand → Zernio (migrations 037/038/039).** `ingestion/outstand.py` is GONE,
   replaced by `ingestion/zernio.py` (analytics) + `ingestion/inbox.py` (comments/DMs).
   The move was for the **comments and DM APIs Outstand simply did not have**; Zernio

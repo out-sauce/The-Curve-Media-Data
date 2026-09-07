@@ -174,6 +174,20 @@ SELF_CONTENT_STATS_LIMIT = int(os.getenv("SELF_CONTENT_STATS_LIMIT", 100))
 # Spotify's release date; anything looser risks attaching stats to the wrong episode.
 PODCAST_EPISODE_MATCH_WINDOW_DAYS = int(os.getenv("PODCAST_EPISODE_MATCH_WINDOW_DAYS", 3))
 
+# RSS download analytics (ingestion/podcast_rss.py) via OP3 (op3.dev), the open-source
+# prefix already wrapped around every enclosure in the Flightcast feed. A plain public
+# REST API with a bearer token, so this stage runs server-side — no extension, no OAuth.
+# `preview07ce` is OP3's own sample token: it works for previewing but get a real one
+# from op3.dev (free; we own the prefix). OP3 is for DIMENSIONS ONLY — country, app and
+# device per episode. Flightcast is the source of truth for play counts.
+OP3_TOKEN = os.getenv("OP3_TOKEN", "")
+PODCAST_RSS_FEED_URL = os.getenv(
+    "PODCAST_RSS_FEED_URL", "https://rss2.flightcast.com/v989ec3snkmnhawvn76byemy.xml"
+)
+# Raw download rows are paged 1000 at a time; the cap is a runaway backstop that logs
+# when it bites rather than silently truncating the aggregate.
+OP3_MAX_PAGES = int(os.getenv("OP3_MAX_PAGES", 400))
+
 # ── Inbox reply triage + drafting (drafting/draft.py) ─────────────────────────
 # The stage judges every thread waiting on us and drafts a reply for the ones that need
 # one, so the work is bounded by "needs a human" rather than by age.

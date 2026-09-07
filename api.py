@@ -55,6 +55,7 @@ from research.site_auth import (
 from ingestion.competitors import run_competitors
 from ingestion.guest_posts import run_guest_post_stats
 from ingestion.podcast import import_podcast_payload
+from ingestion.podcast_rss import run_podcast_rss
 from ingestion.zernio import run_zernio_hourly, run_zernio_daily
 from drafting.draft import run_inbox_drafts
 from ingestion.inbox import (
@@ -525,6 +526,26 @@ def research_import(payload: ResearchImport, x_api_key: str = Header(default="")
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc))
     return complete_from_html(queue_id, article_id, payload.html)
+
+
+@app.post("/run/podcast-rss")
+def run_podcast_rss_endpoint(
+    background_tasks: BackgroundTasks,
+    start: str = "2020-01-01",
+    x_api_key: str = Header(default=""),
+):
+    """
+    Pull OP3 (op3.dev) RSS download analytics into podcast_episodes and, show-level,
+    audience_demographics at platform='rss'.
+
+    Dimensions only — country, app, device. OP3 is a download prefix, so it has no
+    completion, retention or listen time, and never collects age or gender. It also
+    counts nothing before the prefix went on the feed, which is why pre-prefix episodes
+    are flagged rss_partial and why Flightcast, not this, is the master for plays.
+    """
+    _check_key(x_api_key)
+    background_tasks.add_task(run_podcast_rss, start)
+    return {"status": "started"}
 
 
 @app.post("/podcast/import")

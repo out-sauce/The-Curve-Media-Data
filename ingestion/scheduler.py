@@ -27,6 +27,7 @@ from research.research import run_research
 from briefing.brief import run_briefing
 from ingestion.competitors import run_competitors
 from ingestion.guest_posts import run_guest_post_stats
+from ingestion.podcast_rss import run_podcast_rss
 from ingestion.zernio import run_zernio_hourly, run_zernio_daily
 from drafting.draft import run_inbox_drafts
 from ingestion.inbox import run_inbox_sweep
@@ -84,6 +85,10 @@ def run_daily_pipeline() -> None:
         logger.info("Full competitor sweep skipped — runs weekly on Mondays; scanning own channels only")
         _run("competitors", run_competitors, self_only=True)
     _run("guest_posts",  run_guest_post_stats)
+    # RSS download analytics (OP3). Dimensions only — country, app and device per
+    # episode; Flightcast remains the master for play counts. Runs after the social
+    # stages because it is independent of them and slower (it pages raw download rows).
+    _run("podcast_rss", run_podcast_rss)
     _run("zernio",       run_zernio_daily)
     logger.info("=== Daily pipeline complete ===")
 
