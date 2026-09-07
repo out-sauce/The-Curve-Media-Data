@@ -82,11 +82,20 @@ from ingestion.storage import (
 logger = logging.getLogger(__name__)
 
 _RUN_CATEGORY = "zernio"
-# Scope: Instagram only, as the Outstand pilot was. The account-insights, demographics
-# and stories endpoints below are Instagram-specific by design (Zernio exposes separate
-# per-platform equivalents); the post-analytics and follower-stats paths are generic and
-# will work unchanged for tiktok/linkedin/youtube once those channels are connected.
-_PLATFORMS = ("instagram",)
+# The account-insights, demographics and stories endpoints below are Instagram-specific
+# by design (Zernio exposes separate per-platform equivalents) and every call site is
+# guarded on `platform == "instagram"`; the post-analytics and follower-stats paths are
+# generic, which is what lets a second platform be a one-line addition here.
+#
+# YouTube added 2026-09-07, once the channel was connected. Verified live before enabling:
+# Zernio serves it with the identical envelope (platforms[].platformPostId, analytics,
+# syncStatus) and returns real `views` and engagement. It does NOT return watch time,
+# retention or demographics — `igReelsAvgWatchTime` and friends are Instagram fields that
+# come back 0, and `impressions`/`reach`/`videoDurationSeconds` are empty. So this fills
+# content_stats views/likes/comments for YouTube and NOTHING ELSE; youtube_avg_view_minutes
+# and youtube_completion_pct still need the YouTube Analytics API (OAuth as channel owner).
+# TikTok and LinkedIn remain off until someone checks what Zernio actually serves for them.
+_PLATFORMS = ("instagram", "youtube")
 # Stories are a different surface from feed posts — different metrics, 24h life, and an
 # order-of-magnitude different reach — so they get their own platform value rather than
 # polluting feed-post averages on every chart that groups by platform.

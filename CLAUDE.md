@@ -154,6 +154,27 @@ triggers stages over HTTP.
     does nothing until the server is pushed — the endpoint ignores unknown keys silently.
     Per-episode demographics appeared to fail for three rounds for exactly this reason.
 
+- **YouTube enabled in the Zernio stage** (`ingestion/zernio.py`, 2026-09-07, one line).
+  The channel was connected in the Admin app, and the module was written for this: every
+  Instagram-specific call site (account insights, demographics, stories, competitor card)
+  is guarded on `platform == "instagram"`, so adding `"youtube"` to `_PLATFORMS` runs only
+  the generic post-analytics and follower-stats paths. 55 rows landed in `content_stats`
+  at `platform='youtube'`, avg 336 views.
+  - **Verified before enabling, not after:** Zernio serves YouTube with the identical
+    envelope (`platforms[].platformPostId`, `analytics`, `syncStatus`) and returns real
+    `views`, `likes`, `comments`, `engagementRate`.
+  - **It does NOT return watch time, retention or demographics.** `igReelsAvgWatchTime`
+    and its siblings are Instagram fields that come back `0` for YouTube, and
+    `impressions`/`reach`/`videoDurationSeconds` are empty. So `youtube_avg_view_minutes`
+    and `youtube_completion_pct` on `podcast_episodes` still need the YouTube **Analytics**
+    API (OAuth as channel owner) — Zernio is not a route to them.
+  - **`plays_youtube` is deliberately NOT written from here.** Flightcast is the master
+    for play counts; this feeds `content_stats` only. See the source-of-truth split above.
+  - TikTok and LinkedIn stay off until someone checks what Zernio actually serves for
+    them — the guard pattern makes each a one-line addition, but only after verifying.
+  - Scale, for judging how much further to invest: the channel is **35 videos, 2,010
+    subscribers, a few hundred views each**, against 424 podcast episodes.
+
 - **RSS download analytics via OP3** (`ingestion/podcast_rss.py`, migrations 045 + 046).
   Every enclosure in the Flightcast feed is already wrapped in the OP3 prefix
   (`https://op3.dev/e/episode.flightcast.com/<ulid>.mp3`), and OP3 is a plain public REST
