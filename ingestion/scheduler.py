@@ -18,7 +18,7 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from ingestion.fetcher import fetch_all_sources
-from ingestion.storage import upsert_articles
+from ingestion.storage import upsert_articles, log_source_run
 from filtering.filter import run_filtering
 from clustering.cluster import run_clustering
 from scoring.score import run_scoring
@@ -70,6 +70,14 @@ def run_daily_pipeline() -> None:
             fn(*args, **kwargs)
         except Exception as exc:
             logger.error("Pipeline stage '%s' failed: %s", name, exc, exc_info=True)
+            # Record it where someone actually looks. A stage failure used to exist only
+            # in the Railway logs, which is why the 2026-09-28 Anthropic outage ran for
+            # eight days while source_runs showed nothing worse than the usual Barron's
+            # 403. Category 'pipeline_stage' keeps these rows out of the per-source
+            # fetch results; log_source_run never raises, so this cannot mask the
+            # original failure.
+            log_source_run(f"pipeline:{name}", "pipeline_stage", "error",
+                           error_message=str(exc)[:1000])
 
     logger.info("=== Daily pipeline started (processing %s) ===", today)
     _run("ingest",       run_ingestion)

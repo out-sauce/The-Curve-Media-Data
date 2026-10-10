@@ -144,15 +144,31 @@ def run_tagging(run_date: str | None = None) -> None:
     # Each batch is independent — a batch that fails to parse only loses its own
     # tags, not the whole day's.
     results: dict[str, tuple[list, list]] = {}
+    batches = 0
+    failed_batches = 0
     for i in range(0, len(clusters), TAG_BATCH_SIZE):
         batch = clusters[i: i + TAG_BATCH_SIZE]
         batch_results = _call_claude(batch, articles_by_cluster, available_tags, available_geo_tags)
+        batches += 1
         if not batch_results:
+            failed_batches += 1
             logger.warning(
                 "Tagging: batch %d–%d returned no results — those clusters left untagged",
                 i, i + len(batch),
             )
         results.update(batch_results)
+
+    # Canary. Unlike scoring, tagging already fails safe — it writes nothing, and
+    # `tags`/`geo_tags` are NOT NULL DEFAULT '{}', so an untagged cluster is simply
+    # empty. But a quiet `return` is invisible: during the 2026-09-28 outage this stage
+    # logged a warning and exited cleanly every day for eight days while the whole
+    # account was dead. Raise so the scheduler records a stage failure.
+    if batches and failed_batches == batches:
+        raise RuntimeError(
+            f"Tagging failed on all {batches} batch(es) for {target_date} "
+            f"({len(clusters)} clusters) — nothing written. "
+            "Check ANTHROPIC_API_KEY, the account balance and the model id."
+        )
 
     if not results:
         logger.warning("Tagging: no results returned — clusters left untagged")

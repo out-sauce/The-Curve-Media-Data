@@ -398,11 +398,16 @@ def _call_continuation(articles: list[dict], candidates: list[dict]) -> dict[int
     return merged
 
 
-def _call_new_clustering(articles: list[dict], system_prompt: str) -> list[dict]:
+def _call_new_clustering(articles: list[dict], system_prompt: str) -> tuple[list[dict], bool]:
     """
     Call 2: group remaining articles into new named clusters.
-    Returns [{name, description, article_ids}] — only multi-article groups.
+    Returns ([{name, description, article_ids}], ok) — only multi-article groups.
     Articles not mentioned become singletons.
+
+    `ok` is False only when the call itself failed. An empty list with ok=True is a
+    legitimate answer ("nothing groups today"); an empty list with ok=False means we
+    learned nothing, and the two are indistinguishable downstream — both would turn
+    every article into a singleton.
     """
     article_lines = "\n".join(
         f'id: {a["id"]} | {a["title"]} — {(a.get("summary") or "").strip()}'
@@ -412,10 +417,10 @@ def _call_new_clustering(articles: list[dict], system_prompt: str) -> list[dict]
     try:
         return _call_claude_groups(
             system_prompt, article_lines, NEW_CLUSTER_MAX_TOKENS, "New clustering"
-        )
+        ), True
     except Exception as exc:
         logger.warning("New clustering call failed: %s", exc)
-        return []
+        return [], False
 
 
 # ---------------------------------------------------------------------------
@@ -539,7 +544,21 @@ def run_clustering(run_date: str | None = None) -> None:
     new_clusters: list[tuple[str, list, str]] = []
     if remaining:
         logger.info("New clustering: grouping %d remaining articles", len(remaining))
-        for group in _call_new_clustering(remaining, cluster_prompt):
+        groups, ok = _call_new_clustering(remaining, cluster_prompt)
+        # Canary. If the grouping call failed, every remaining article would be written
+        # as its own singleton — rows that look like a real (if fragmented) day, leave
+        # the articles with a cluster_id so a re-run cannot see them again, and make
+        # continuation impossible from here on. Eight days of the 2026-09-28 outage
+        # looked exactly like this. Raise before writing anything: the articles keep
+        # cluster_id NULL and the next run picks them up untouched. Extensions from
+        # Call 1 are already committed and are real work — they stay.
+        if not ok:
+            raise RuntimeError(
+                f"New clustering call failed for {target_date} — refusing to write "
+                f"{len(remaining)} articles as singletons. Check ANTHROPIC_API_KEY, "
+                "the account balance and the model id."
+            )
+        for group in groups:
             name = (group.get("name") or "").strip()
             description = (group.get("description") or "").strip()
             ids = list(dict.fromkeys(

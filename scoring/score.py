@@ -127,11 +127,13 @@ def _build_batch_prompt(clusters: list[dict[str, Any]], articles_by_cluster: dic
 
 
 def _call_claude_batch(clusters: list[dict[str, Any]], articles_by_cluster: dict[str, list],
-                       audience_doc: str) -> dict[str, tuple[float, str]]:
+                       audience_doc: str) -> tuple[dict[str, tuple[float, str]], bool]:
     """
     Score all clusters in one Claude call.
-    Returns dict of cluster_id -> (score, reason).
-    Falls back to score=0.0 for any cluster that can't be parsed.
+    Returns (cluster_id -> (score, reason), ok) where ok is False if the call or the
+    parse failed outright and every score in the batch is the 0.0 fallback. The caller
+    needs that flag: a 0.0 is indistinguishable from a genuinely irrelevant story once
+    it is in the DB, so a day where *no* batch succeeded must not be written at all.
     """
     prompt = _build_batch_prompt(clusters, articles_by_cluster)
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -183,7 +185,7 @@ def _call_claude_batch(clusters: list[dict[str, Any]], articles_by_cluster: dict
                 logger.warning("Cluster %s missing from scoring response", cluster["cluster_id"])
                 results[cluster["cluster_id"]] = (0.0, "Scoring failed — missing from response")
 
-        return results
+        return results, True
 
     except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
         logger.warning("Could not parse batch scoring response: %s", exc)
@@ -191,7 +193,7 @@ def _call_claude_batch(clusters: list[dict[str, Any]], articles_by_cluster: dict
         logger.warning("Scoring API error: %s", exc)
 
     # Full fallback — mark everything as failed
-    return {c["cluster_id"]: (0.0, "Scoring failed") for c in clusters}
+    return {c["cluster_id"]: (0.0, "Scoring failed") for c in clusters}, False
 
 
 # ---------------------------------------------------------------------------
@@ -228,9 +230,35 @@ def run_scoring(run_date: str | None = None) -> None:
     # One Claude call per batch so the JSON response can't overflow max_tokens.
     # A batch that fails only falls back to 0.0 for its own clusters.
     results: dict[str, tuple[float, str]] = {}
+    batches = 0
+    failed_batches = 0
     for i in range(0, len(clusters), SCORE_BATCH_SIZE):
         batch = clusters[i: i + SCORE_BATCH_SIZE]
-        results.update(_call_claude_batch(batch, articles_by_cluster, audience_doc))
+        batch_results, ok = _call_claude_batch(batch, articles_by_cluster, audience_doc)
+        batches += 1
+        if not ok:
+            failed_batches += 1
+        results.update(batch_results)
+
+    # Canary. One failed batch is a bad batch; EVERY batch failing is a broken client —
+    # a dead API key, an exhausted balance, a retired model — not a day of irrelevant
+    # news. Writing the 0.0 fallback then is actively harmful: the clusters leave
+    # 'pending' for 'scored', so a re-run skips them, nothing clears the research
+    # threshold, no story can ever be extended (candidates need >= CANDIDATE_MIN_SCORE),
+    # and the day reads as complete. That is exactly how the 2026-09-28 outage stayed
+    # invisible for eight days. Raise instead: the clusters stay 'pending' and
+    # re-runnable, and the scheduler logs a stage failure someone can see.
+    if batches and failed_batches == batches:
+        raise RuntimeError(
+            f"Scoring failed on all {batches} batch(es) for {target_date} "
+            f"({len(clusters)} clusters) — refusing to write 0.0 scores. "
+            "Check ANTHROPIC_API_KEY, the account balance and the model id."
+        )
+    if failed_batches:
+        logger.error(
+            "Scoring: %d of %d batches failed — those clusters carry a 0.0 fallback",
+            failed_batches, batches,
+        )
 
     supabase = get_client()
     for cluster_id, (score, reason) in results.items():
