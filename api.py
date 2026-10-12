@@ -104,7 +104,15 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    # Which build is running and whether the Out Sauce portal pair is present (12 Oct 2026):
+    # the two things a redeploy question comes down to, readable without Railway access.
+    import os
+    from config import PORTAL_API_URL, PORTAL_API_TOKEN
+    return {
+        "status": "ok",
+        "commit": (os.getenv("RAILWAY_GIT_COMMIT_SHA") or "")[:7] or None,
+        "portal": bool(PORTAL_API_URL and PORTAL_API_TOKEN),
+    }
 
 
 @app.post("/run/ingest")
