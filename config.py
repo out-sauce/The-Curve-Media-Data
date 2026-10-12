@@ -46,6 +46,11 @@ ZERNIO_API_BASE = os.getenv("ZERNIO_API_BASE", "https://zernio.com/api")
 # Shared secret for verifying X-Zernio-Signature on the inbox webhook. When unset the
 # receiver fails closed — an unverified webhook is an open write endpoint.
 ZERNIO_WEBHOOK_SECRET = os.getenv("ZERNIO_WEBHOOK_SECRET", "")
+# The Zernio PROFILE this pipeline belongs to. Out Sauce's Zernio account holds every
+# client under its own profile (The Curve is the Default one; Juicy's WhatsApp is another,
+# since 12 Oct 2026), and the key is shared — so every LIST call must name the profile or it
+# reads the other clients' conversations too. Unset, the account's default profile is used.
+ZERNIO_PROFILE_ID = os.getenv("ZERNIO_PROFILE_ID", "")
 # Window for the daily follower-series gap-fill. 89 days is the documented ceiling on
 # Zernio's Instagram follower-history endpoint; follower-stats (what we actually call)
 # isn't documented as capped, but staying inside the same bound keeps the two
