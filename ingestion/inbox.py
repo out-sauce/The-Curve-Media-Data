@@ -104,6 +104,18 @@ _MAX_EVENT_ATTEMPTS = 5
 
 # ── webhook signature ─────────────────────────────────────────────────────────
 
+def _webhook_secret() -> str:
+    """
+    The secret the subscription was registered with. Through the portal (12 Oct 2026) that
+    is the hex sha256 of our portal token — a key this process derives from what it holds,
+    so nothing new is kept anywhere; before it, ZERNIO_WEBHOOK_SECRET.
+    """
+    from config import PORTAL_API_URL, PORTAL_API_TOKEN
+    if PORTAL_API_URL and PORTAL_API_TOKEN:
+        return hashlib.sha256(PORTAL_API_TOKEN.encode()).hexdigest()
+    return ZERNIO_WEBHOOK_SECRET
+
+
 def verify_signature(raw_body: bytes, header: str | None) -> bool:
     """
     Verify X-Zernio-Signature: a lowercase hex HMAC-SHA256 of the RAW request body.
@@ -116,11 +128,10 @@ def verify_signature(raw_body: bytes, header: str | None) -> bool:
     Fails closed when no secret is configured — an unverified webhook is an open write
     endpoint, and this one writes private message content.
     """
-    if not ZERNIO_WEBHOOK_SECRET or not header:
+    secret = _webhook_secret()
+    if not secret or not header:
         return False
-    expected = hmac.new(
-        ZERNIO_WEBHOOK_SECRET.encode(), raw_body, hashlib.sha256,
-    ).hexdigest()
+    expected = hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest()
     candidate = header.strip()
     if candidate.startswith("sha256="):
         candidate = candidate[len("sha256="):]
@@ -811,10 +822,28 @@ def register_webhook(public_url: str | None = None) -> dict:
     base = (public_url or PUBLIC_BASE_URL or "").rstrip("/")
     if not base:
         return {"status": "error", "detail": "PUBLIC_BASE_URL not set"}
+    target = f"{base}/webhooks/zernio"
+
+    # Through the portal: it registers the subscription in its "inbox" slot, scoped to our
+    # profile and signed with the sha256 of our portal token (what verify_signature checks).
+    from config import PORTAL_API_URL, PORTAL_API_TOKEN
+    if PORTAL_API_URL and PORTAL_API_TOKEN:
+        import re as _re
+        url = _re.sub(r"/(api)?/?$", "", PORTAL_API_URL.rstrip("/")) + "/api/external-zernio"
+        try:
+            resp = httpx.post(url, headers={"Authorization": f"Bearer {PORTAL_API_TOKEN}"},
+                              json={"action": "events_url", "url": target, "events": list(INBOX_WEBHOOK_EVENTS), "slot": "inbox"}, timeout=30)
+            data = resp.json()
+            if not data.get("ok"):
+                return {"status": "error", "detail": str(data.get("detail") or data.get("error"))[:300]}
+            hook = data.get("inbox_webhook") or {}
+            return {"status": "updated", "id": hook.get("id"), "url": target}
+        except Exception as exc:
+            logger.warning("Zernio webhook registration via portal failed: %s", str(exc)[:300])
+            return {"status": "error", "detail": str(exc)[:300]}
+
     if not ZERNIO_WEBHOOK_SECRET:
         return {"status": "error", "detail": "ZERNIO_WEBHOOK_SECRET not set"}
-
-    target = f"{base}/webhooks/zernio"
     body = {
         "name": "Curve pipeline inbox",
         "url": target,

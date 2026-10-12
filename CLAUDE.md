@@ -862,3 +862,18 @@ triggers stages over HTTP.
   promoted to `research/domains.py`. The research read-path scraper gained an env-toggled
   Browserbase route (`RESEARCH_USE_BROWSERBASE`, default off). A startup log asserts the
   single-replica assumption (in-process session registry).
+
+## Zernio through the portal (12 Oct 2026)
+
+With `PORTAL_API_URL` and `PORTAL_API_TOKEN` set (Railway), every Zernio call in
+`ingestion/zernio.py` goes through the Out Sauce portal's `/api/external-zernio`
+(`_portal_request`): the portal holds the Zernio key, pins The Curve's profile on
+every listing and refuses any account that is not ours — on the shared key that
+check is the whole of tenant isolation, and it no longer depends on this code
+remembering `profileId`. A relayed 429 / 5xx retries as before; any other refusal is
+a `ZernioAPIError` with Zernio's status and code. The inbox webhook is then verified
+with the sha256 of the portal token (`_webhook_secret`), and `register_webhook`
+asks the portal to register it in the company's `inbox` slot. Without the two
+variables the direct `ZERNIO_API_KEY` path is used unchanged. After setting them on
+Railway, `POST /register-webhook` once (x-api-key) so the subscription moves under
+the portal's secret.

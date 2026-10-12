@@ -151,6 +151,56 @@ def _retry_wait(resp: httpx.Response, fallback: float) -> float:
     return min(fallback, 60.0)
 
 
+class ZernioAPIError(Exception):
+    """A refused Zernio call relayed by the portal, with Zernio's own status and code."""
+
+    def __init__(self, message: str, status: int | None = None, code: str | None = None):
+        super().__init__(message)
+        self.status = status
+        self.code = code
+
+
+def _portal_configured() -> bool:
+    from config import PORTAL_API_URL, PORTAL_API_TOKEN
+    return bool(PORTAL_API_URL and PORTAL_API_TOKEN)
+
+
+def _portal_request(method: str, path: str, *, params: dict | None = None,
+                    json: dict | None = None) -> dict:
+    """
+    The same call through the Out Sauce portal's /api/external-zernio: the portal holds
+    the key and pins our profile and accounts on every call. A path here is "/v1/x/y";
+    the portal takes "x/y". Its 429 (our rate budget) and a relayed 429 / 5xx from Zernio
+    retry like the direct client; any other refusal is a ZernioAPIError carrying Zernio's
+    status and code.
+    """
+    from config import PORTAL_API_URL, PORTAL_API_TOKEN
+    import re as _re
+    base = _re.sub(r"/(api)?/?$", "", PORTAL_API_URL.rstrip("/")) + "/api/external-zernio"
+    endpoint = path[len("/v1/"):] if path.startswith("/v1/") else path.lstrip("/")
+    body = {"action": "proxy", "method": method, "endpoint": endpoint, "query": params or None, "body": json}
+    delay = 2.0
+    for attempt in range(_MAX_RETRIES):
+        resp = httpx.post(base, headers={"Authorization": f"Bearer {PORTAL_API_TOKEN}"}, json=body, timeout=60)
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {}
+        relayed = data.get("status") if isinstance(data, dict) else None
+        retryable = resp.status_code == 429 or resp.status_code >= 500 and resp.status_code != 502 or (resp.status_code == 502 and (relayed == 429 or (isinstance(relayed, int) and relayed >= 500)))
+        if retryable and attempt < _MAX_RETRIES - 1:
+            wait = _retry_wait(resp, delay)
+            logger.info("Zernio (portal) %s %s → %s, retrying in %.1fs", method, path, relayed or resp.status_code, wait)
+            time.sleep(wait)
+            delay *= 2
+            continue
+        if resp.status_code >= 400 or not (isinstance(data, dict) and data.get("ok")):
+            detail = (data.get("detail") or data.get("error") or resp.text[:300]) if isinstance(data, dict) else resp.text[:300]
+            raise ZernioAPIError(f"Zernio via portal {method} {path}: {detail}", status=relayed if isinstance(relayed, int) else resp.status_code, code=data.get("code") if isinstance(data, dict) else None)
+        return data.get("data") or {}
+    return {}
+
+
 def _request(method: str, path: str, *, params: dict | None = None,
              json: dict | None = None) -> dict:
     """
@@ -163,6 +213,8 @@ def _request(method: str, path: str, *, params: dict | None = None,
     (analytics_addon_required) in particular means the plan lacks analytics, and no
     amount of retrying fixes that.
     """
+    if _portal_configured():
+        return _portal_request(method, path, params=params, json=json)
     url = f"{ZERNIO_API_BASE}{path}"
     delay = 2.0
     for attempt in range(_MAX_RETRIES):

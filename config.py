@@ -51,6 +51,13 @@ ZERNIO_WEBHOOK_SECRET = os.getenv("ZERNIO_WEBHOOK_SECRET", "")
 # since 12 Oct 2026), and the key is shared — so every LIST call must name the profile or it
 # reads the other clients' conversations too. Unset, the account's default profile is used.
 ZERNIO_PROFILE_ID = os.getenv("ZERNIO_PROFILE_ID", "")
+# THE PORTAL, from 12 Oct 2026. When both are set, every Zernio call goes through the Out
+# Sauce portal's /api/external-zernio with this app's portal token — the portal holds the
+# Zernio key and checks on every call that the account named is The Curve's — and the
+# webhook is verified with the sha256 of that token. Unset, the direct key above is used,
+# so a deploy that predates the Railway variables keeps working.
+PORTAL_API_URL = os.getenv("PORTAL_API_URL", "")
+PORTAL_API_TOKEN = os.getenv("PORTAL_API_TOKEN", "")
 # Window for the daily follower-series gap-fill. 89 days is the documented ceiling on
 # Zernio's Instagram follower-history endpoint; follower-stats (what we actually call)
 # isn't documented as capped, but staying inside the same bound keeps the two
