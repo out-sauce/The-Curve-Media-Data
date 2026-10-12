@@ -49,7 +49,7 @@ from config import (
     INBOX_THREAD_REFRESH_DAYS,
     INBOX_EVENT_RETENTION_DAYS,
 )
-from ingestion.zernio import zernio_get, zernio_request
+from ingestion.zernio import zernio_get, zernio_profile_id, zernio_request
 from ingestion.storage import (
     claim_webhook_events,
     find_inbox_conversation,
@@ -509,7 +509,8 @@ def _sweep_conversations(full: bool) -> int:
     cursor = None
 
     for _ in range(max_pages):
-        params = {"limit": INBOX_PAGE_LIMIT, "sortOrder": "desc"}
+        # Scoped to OUR profile: the key is shared across Out Sauce's clients (12 Oct 2026).
+        params = {"limit": INBOX_PAGE_LIMIT, "sortOrder": "desc", "profileId": zernio_profile_id()}
         if cursor:
             params["cursor"] = cursor
         payload = zernio_get("/v1/inbox/conversations", params)
@@ -648,6 +649,7 @@ def _sweep_comments(full: bool) -> int:
             "sortOrder": "desc",
             "since": since.isoformat(),
             "minComments": 1,
+            "profileId": zernio_profile_id(),
         }
         if cursor:
             params["cursor"] = cursor
@@ -819,6 +821,9 @@ def register_webhook(public_url: str | None = None) -> dict:
         "secret": ZERNIO_WEBHOOK_SECRET,
         "events": list(INBOX_WEBHOOK_EVENTS),
         "isActive": True,
+        # Scoped to our profile, or a re-registration would widen the subscription back to
+        # every client on the shared key (it was unscoped until 12 Oct 2026).
+        "profileIds": [zernio_profile_id()],
     }
     try:
         existing = zernio_request("GET", "/v1/webhooks/settings")
@@ -826,7 +831,9 @@ def register_webhook(public_url: str | None = None) -> dict:
             (w for w in existing.get("webhooks") or [] if w.get("url") == target), None,
         )
         if match:
-            zernio_request("PUT", f"/v1/webhooks/settings/{match['_id']}", json=body)
+            # PUT takes the id IN THE BODY as `_id`: the id-in-path form answers 404
+            # (the Curve admin app learned this on its own registration).
+            zernio_request("PUT", "/v1/webhooks/settings", json={"_id": match["_id"], **body})
             return {"status": "updated", "id": match["_id"], "url": target}
         created = zernio_request("POST", "/v1/webhooks/settings", json=body)
         webhook = created.get("webhook") or created

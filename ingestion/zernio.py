@@ -1047,3 +1047,33 @@ def run_zernio_daily() -> None:
     daily pipeline; safe to run on demand.
     """
     _run(with_daily=True)
+
+
+# ── The profile every list call is scoped to ───────────────────────────────────
+
+_profile_id: str | None = None
+
+
+def zernio_profile_id() -> str:
+    """
+    This pipeline's Zernio profile id: ZERNIO_PROFILE_ID when set, else the account's
+    default profile, read once from GET /v1/profiles and cached for the process.
+
+    One Zernio key serves every Out Sauce client, each under its own profile, so a
+    listing that names no profile returns everyone's conversations and comments. The
+    webhook subscription is scoped the same way (profileIds on the registration).
+    """
+    global _profile_id
+    if _profile_id:
+        return _profile_id
+    from config import ZERNIO_PROFILE_ID
+    if ZERNIO_PROFILE_ID:
+        _profile_id = ZERNIO_PROFILE_ID
+        return _profile_id
+    payload = _get("/v1/profiles", {"limit": 100})
+    profiles = payload.get("profiles") or []
+    default = next((p for p in profiles if p.get("isDefault")), None) or (profiles[0] if profiles else None)
+    if not default or not default.get("_id"):
+        raise RuntimeError("Zernio returned no profile to scope the inbox sweep to; set ZERNIO_PROFILE_ID")
+    _profile_id = str(default["_id"])
+    return _profile_id
