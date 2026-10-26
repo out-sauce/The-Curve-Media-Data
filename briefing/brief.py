@@ -166,7 +166,13 @@ def rebrief_cluster(cluster_id: str) -> bool:
             .execute()
             .data
         ) or []
-        in_development = bool(cluster_rows) and cluster_rows[0].get("cluster_status") == "briefed"
+        status = cluster_rows[0].get("cluster_status") if cluster_rows else None
+        # A published story (migration 049) has been in an episode that went out: its
+        # summary is the record of what was covered, so it is never rewritten.
+        if status == "published":
+            logger.info("Rebrief skipped for %s: published", cluster_id)
+            return False
+        in_development = status == "briefed"
 
         settings = get_pipeline_settings()
         tov_doc = settings.get("tov_doc", "")

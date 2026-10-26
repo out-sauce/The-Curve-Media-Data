@@ -705,11 +705,14 @@ triggers stages over HTTP.
   day. The cluster is reset to `pending`, so score → tag → research → brief all re-run —
   the **only** deliberate demotion in the codebase (`_advance_clusters_to_researched`
   still never demotes). Research only scrapes the new articles (its `scrape_status IS
-  NULL/'failed'` filter already handles that). `briefed`/`archived`/`ready_for_content`
+  NULL/'failed'` filter already handles that). `briefed`/`archived`/`ready_for_content`/`published`
   clusters are never extended, so the content studio's manual output is untouchable.
   **The live `cluster_status` enum is `(pending, scored, researched, ready_for_content,
-  archived, briefed)`** — migration 021's header still lists `scoring`/`accepted`/
-  `rejected`/`published` but the type was since recreated without them, and passing a
+  archived, briefed, published)`** — `published` came back in migration 049 (26 Oct 2026):
+  the Admin app sets it, with `published_at`, once a story has been in a podcast episode
+  that went live; nothing here sets it, and a published story is never extended,
+  re-briefed (`rebrief_cluster`) or pruned (050). Migration 021's header still lists
+  `scoring`/`accepted`/`rejected`, but the type was since recreated without them, and passing a
   non-existent label makes PostgREST reject the **whole** query, so never add one to a
   status filter. (`custom_clustering/custom_cluster.py` still writes `'rejected'` and is
   therefore broken if ever revived.) `ready_for_content` exists both as a status and as a
