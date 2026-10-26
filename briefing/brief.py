@@ -147,9 +147,13 @@ def rebrief_cluster(cluster_id: str) -> bool:
     Regenerate the name + brief for a single cluster, overwriting any existing brief.
     This is the explicit "redo" used after on-demand research (the Admin story-level
     Research button, or a late-arriving extension import) — unlike run_briefing it
-    ignores date and does not skip clusters that already have a brief. Exception:
-    a 'briefed' cluster has been through the manual content-studio flow and its
-    brief column holds that manual output — never overwrite it with an auto brief.
+    ignores date and does not skip clusters that already have a brief.
+
+    `brief` is the pipeline's summary alone (since 26 Oct 2026 the Admin app keeps its
+    own writing — the prep sheet, the research agent's output — in `prep_notes`), so a
+    'briefed' cluster ("In development" in the app: someone commented on it, owns it or
+    wrote its prep sheet) is re-briefed like any other. Its NAME is left alone: the
+    team may have renamed a story they are working on.
     Still requires at least one article with a deep summary. Returns True when a
     brief was written. Never raises.
     """
@@ -162,9 +166,7 @@ def rebrief_cluster(cluster_id: str) -> bool:
             .execute()
             .data
         ) or []
-        if cluster_rows and cluster_rows[0].get("cluster_status") == "briefed":
-            logger.info("Re-brief: cluster %s is 'briefed' (manual studio output) — skipping", cluster_id)
-            return False
+        in_development = bool(cluster_rows) and cluster_rows[0].get("cluster_status") == "briefed"
 
         settings = get_pipeline_settings()
         tov_doc = settings.get("tov_doc", "")
@@ -183,11 +185,13 @@ def rebrief_cluster(cluster_id: str) -> bool:
             return False
 
         name, brief = result
-        get_client().table(CLUSTERS_TABLE).update({
-            "name": name,
+        update: dict[str, Any] = {
             "brief": brief,
             "briefed_at": datetime.now(timezone.utc).isoformat(),
-        }).eq("cluster_id", cluster_id).execute()
+        }
+        if not in_development:
+            update["name"] = name
+        get_client().table(CLUSTERS_TABLE).update(update).eq("cluster_id", cluster_id).execute()
         logger.info("Re-brief: cluster %s brief regenerated (%d chars)", cluster_id, len(brief))
         return True
     except Exception as exc:

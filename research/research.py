@@ -5,8 +5,8 @@ Runs after tagging. Only processes articles in scored clusters that score
 >= research_score_threshold (default 0.60). A cluster only transitions to
 'researched' once at least one of its articles has a scrape_status (any value);
 clusters where nothing was ever attempted (all articles skipped, scrape_status
-still NULL) stay 'scored'. 'briefed' is never set here — that status is
-reserved for the manual content-studio briefing flow in the Admin app.
+still NULL) stay 'scored'. 'briefed' is never set here — it is the Admin app's
+"In development" (someone commented on the story, owns it or wrote its prep sheet).
 
 Each article URL is rendered in a real logged-in Chromium tab (Playwright,
 research/browser_scraper.py), seeded with a per-publisher-domain login session
@@ -110,7 +110,7 @@ def _advance_clusters_to_researched(cluster_ids: list[str], supabase) -> int:
     has a scrape_status (any value: scraped/paywalled/bot_wall/failed all count;
     NULL means nothing was ever attempted, so the cluster stays 'scored').
     Never demotes: only 'pending'/'scored' clusters are advanced — 'briefed'
-    (the manual content-studio state) and 'archived' are left untouched.
+    (the Admin app's "In development") and 'archived' are left untouched.
     Returns the number of clusters advanced. Never raises.
     """
     if not cluster_ids:
@@ -504,8 +504,8 @@ def run_research_cluster(cluster_id: str) -> None:
     deep summaries now exist (overwriting any prior brief); articles still waiting
     on the extension refresh it again as each import lands. The cluster is then
     advanced scored → researched when at least one article has a scrape_status —
-    the auto-generated brief keeps it at 'researched'; 'briefed' is reserved for
-    the manual content-studio flow and is never set (or demoted) here.
+    the auto-generated brief keeps it at 'researched'; 'briefed' is the Admin app's
+    "In development" and is never set (or demoted) here.
     """
     logger.info("Research (cluster) started for %s", cluster_id)
 
