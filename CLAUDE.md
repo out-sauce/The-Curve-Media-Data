@@ -56,6 +56,21 @@ triggers stages over HTTP.
 
 ## Recent changes
 
+- **Stories nobody will use are deleted** (`migrations/047_prune_story_clusters.sql`, scoring
+  stage). After every scoring run (and on a day with nothing to score) `_prune_stories()` calls
+  the `prune_story_clusters` RPC: a story with a real score under 0.20 is deleted and its
+  articles kept but marked `excluded` / `status_reason = 'low_score'` with no story, because
+  ingestion upserts on `guid` (a deleted row would be re-fetched and re-clustered while the feed
+  still carries it) and clustering takes only `included` articles with no story; a story nobody
+  worked on or linked to is deleted with its articles at 30 days; low-score and orphaned
+  articles go at 30 days. Protected: researched / briefed / ready / manual stories, a research
+  list or brief, an article with a deep summary, and any story named by content `brief_ids`,
+  an idea, a newspaper edition, score feedback or a later story's `source_cluster_ids` (none
+  are FKs). "Scoring failed" 0.0 fallbacks are not low scores. The rules live only in the SQL
+  (`story_prune_candidates`), service_role only. First run 26 Oct 2026: 29,984 → 4,164 stories,
+  67,537 → ~36,000 articles (snapshotted first, snapshots dropped the same day). New index
+  `story_clusters(anchor_article_id)`: without it every article delete scanned the stories
+  table for the FK check and the first run timed out.
 - **Spotify for Creators podcast analytics via the extension** (`ingestion/podcast.py`,
   migrations 043 + 044, extension 1.8.0). Spotify has no public analytics API, so the
   Curve Auth extension pulls from the operator's logged-in Creators session. Everything

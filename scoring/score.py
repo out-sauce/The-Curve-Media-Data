@@ -8,6 +8,11 @@ with a score and reason for each.
 Transitions:
   story_clusters:  pending → scored  (all stories, regardless of score)
   news_articles:   unchanged (article status is managed independently)
+
+Then every run prunes (prune_story_clusters, migrations/047): a story scoring under 0.20
+is deleted and its articles marked excluded / 'low_score', and a story nobody worked on or
+linked to is deleted with its articles once it is 30 days old. The rules and thresholds
+live in that SQL function only.
 """
 
 import json
@@ -197,6 +202,18 @@ def _call_claude_batch(clusters: list[dict[str, Any]], articles_by_cluster: dict
 
 
 # ---------------------------------------------------------------------------
+def _prune_stories() -> None:
+    """
+    Delete the stories nobody will use (see the module docstring). Housekeeping, so it
+    never fails the stage: an error is logged and the next run catches up.
+    """
+    try:
+        result = get_client().rpc("prune_story_clusters", {"p_dry_run": False}).execute()
+        logger.info("Pruned stories: %s", result.data)
+    except Exception as exc:
+        logger.error("Story prune failed: %s", exc)
+
+
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -218,6 +235,8 @@ def run_scoring(run_date: str | None = None) -> None:
     clusters = _fetch_pending_clusters(target_date)
     if not clusters:
         logger.info("Scoring: no pending clusters to process")
+        # The 30-day rule still has to run on a day with nothing new to score.
+        _prune_stories()
         return
 
     logger.info(
@@ -269,3 +288,4 @@ def run_scoring(run_date: str | None = None) -> None:
         }).eq("cluster_id", cluster_id).execute()
 
     logger.info("Scoring complete -- %d clusters scored", len(results))
+    _prune_stories()
