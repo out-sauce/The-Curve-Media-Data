@@ -62,12 +62,13 @@ MAX_CANDIDATE_STORIES = 200
 # A cluster in one of these states is finished editorial output — new coverage forms a
 # fresh story rather than reopening it. 'briefed' is the manual content-studio state and
 # its brief column holds hand-written output; 'ready_for_content' has been promoted into
-# production. These are the live cluster_status enum labels — the full set is
-# (pending, scored, researched, ready_for_content, archived, briefed). Passing a label
-# that is not in the enum makes PostgREST reject the whole query, so do not add
-# 'published'/'accepted'/'rejected' here: migration 021's header lists them but the type
-# was since recreated without them.
-CLOSED_STATUSES = ("briefed", "archived", "ready_for_content")
+# production; 'published' (migration 049, set by the Admin app) has been in a podcast
+# episode that went live. These are the live cluster_status enum labels — the full set is
+# (pending, scored, researched, ready_for_content, archived, briefed, published). Passing
+# a label that is not in the enum makes PostgREST reject the whole query, so do not add
+# 'accepted'/'rejected' here: migration 021's header lists them but the type was since
+# recreated without them.
+CLOSED_STATUSES = ("briefed", "archived", "ready_for_content", "published")
 OPEN_STATUSES = ["pending", "scored", "researched"]
 
 # Articles per continuation call. The article list is cheap on input, but the response
