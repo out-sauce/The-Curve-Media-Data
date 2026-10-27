@@ -65,8 +65,8 @@ triggers stages over HTTP.
   worked on or linked to is deleted with its articles at 30 days; low-score and orphaned
   articles go at 30 days. Protected: researched / briefed / ready / manual stories, a research
   list or brief, an article with a deep summary, and any story named by content `brief_ids`,
-  an idea, a newspaper edition, score feedback or a later story's `source_cluster_ids` (none
-  are FKs). "Scoring failed" 0.0 fallbacks are not low scores. The rules live only in the SQL
+  an idea, a newspaper edition, score feedback, a team vote (`story_votes`, 051) or a later
+  story's `source_cluster_ids` (none but the votes are FKs). "Scoring failed" 0.0 fallbacks are not low scores. The rules live only in the SQL
   (`story_prune_candidates`), service_role only. First run 26 Oct 2026: 29,984 → 4,164 stories,
   67,537 → ~36,000 articles (snapshotted first, snapshots dropped the same day). New index
   `story_clusters(anchor_article_id)`: without it every article delete scanned the stories
