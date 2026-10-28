@@ -56,6 +56,21 @@ triggers stages over HTTP.
 
 ## Recent changes
 
+- **The brief stage drafts the pitch, not a summary** (28 Oct 2026, user-asked; the Admin app's
+  `pitch-is-summary`). `briefing/brief.py` writes the story's `name`, `pitch` (HTML paragraphs) and
+  `pitch_angles` (an HTML bullet list) instead of `brief`, with the Admin app's **Pitch Agent prompt**
+  (`agents` row slug `pitch`, edited in Settings → Agents; `FALLBACK_PROMPT` here is its seed) plus
+  the Audience and Tone-of-Voice docs, on `claude-opus-5-5` with a JSON schema. The name rule
+  (4–7 words) and the schema stay here; keep them in step with the app's `lib/story-pitch.ts`.
+  **A pitch a person saved is never redrafted**: the app stamps `story_clusters.pitch_edited_at`
+  and every write here is `.is_("pitch_edited_at", "null")`. `rebrief_cluster` (on-demand research,
+  extension imports) redrafts only the pipeline's own draft on a pending / scored / researched
+  story. The old summaries were copied into `pitch` (the app's
+  `supabase/20261028125832_pitch_is_summary.sql`); `brief` is legacy.
+- **The score reason says only why a story matters** (28 Oct 2026, user-asked): `scoring/score.py`'s
+  prompt now says never to retell the news, its names or its figures (the reason sits beside the
+  story on the Admin app's story page). The app's `lib/story-score.ts` says the same for stories
+  added by hand.
 - **Stories nobody will use are deleted** (`migrations/047_prune_story_clusters.sql`, scoring
   stage). After every scoring run (and on a day with nothing to score) `_prune_stories()` calls
   the `prune_story_clusters` RPC: a story with a real score under 0.20 is deleted and its

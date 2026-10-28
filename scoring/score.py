@@ -113,6 +113,7 @@ def _build_batch_prompt(clusters: list[dict[str, Any]], articles_by_cluster: dic
         "Score each of the following story clusters for relevance to the Curve audience.",
         'Return a JSON object {"scores": [...]} with one entry per cluster in the same order.',
         'Each entry must have: "index" (int), "score" (float 0.0-1.0), "reason" (one sentence).',
+        'The reason says only why the story matters, or does not, to the Curve audience. Never retell the news, its names or its figures: the reader has the story beside it.',
         'Example: {"scores": [{"index": 1, "score": 0.82, "reason": "..."}]}',
         "",
     ]

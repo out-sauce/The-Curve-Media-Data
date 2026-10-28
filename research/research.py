@@ -497,15 +497,15 @@ def run_research_article(article_id: str) -> None:
 def run_research_cluster(cluster_id: str) -> None:
     """
     Research a cluster on demand (the Admin story-level Research button), then
-    regenerate its brief. Articles that already have a deep summary are never
+    redraft its pitch. Articles that already have a deep summary are never
     re-scraped — only the rest are processed, routed by domain scrape mode:
     'manual' domains are enqueued for the extension lane (no server-side fetch),
-    everything else is scraped here. The brief is redone at the end from whatever
-    deep summaries now exist (overwriting any prior brief); articles still waiting
-    on the extension refresh it again as each import lands. The cluster is then
-    advanced scored → researched when at least one article has a scrape_status —
-    the auto-generated brief keeps it at 'researched'; 'briefed' is the Admin app's
-    "In development" and is never set (or demoted) here.
+    everything else is scraped here. The pitch is redrafted at the end from whatever
+    deep summaries now exist (overwriting the pipeline's own draft, never one a
+    person saved); articles still waiting on the extension refresh it again as each
+    import lands. The cluster is then advanced scored → researched when at least one
+    article has a scrape_status — the drafted pitch keeps it at 'researched';
+    'briefed' is the Admin app's "In development" and is never set (or demoted) here.
     """
     logger.info("Research (cluster) started for %s", cluster_id)
 
@@ -560,9 +560,9 @@ def run_research_cluster(cluster_id: str) -> None:
     _advance_clusters_to_researched([cluster_id], client)
     logger.info(
         "Research (cluster) complete — %s: %d already researched, %d scraped, "
-        "%d queued (extension), %d failed, brief %s",
+        "%d queued (extension), %d failed, pitch %s",
         cluster_id, already, scraped, queued, failed,
-        "regenerated" if rebriefed else "unchanged",
+        "redrafted" if rebriefed else "unchanged",
     )
 
 
@@ -710,10 +710,11 @@ def claim_pending(limit: int = 10) -> list[dict]:
 def _maybe_rebrief_cluster(article_id) -> None:
     """
     After a successful extension import, advance the article's cluster from
-    scored → researched (it now has >=1 article with a scrape_status) and refresh
-    the cluster brief so it reflects the new deep summary — the brief redo only
-    when the cluster already has a brief ("redo", e.g. queued from
-    run_research_cluster). A never-briefed cluster is left for the briefing stage.
+    scored → researched (it now has >=1 article with a scrape_status) and redraft
+    the cluster's pitch so it reflects the new deep summary — the redo only when
+    the cluster already has a pitch ("redo", e.g. queued from run_research_cluster),
+    and rebrief_cluster leaves a pitch a person has saved alone. A cluster with no
+    pitch yet is left for the briefing stage.
     Best-effort: a failure never breaks the import.
     """
     try:
@@ -725,13 +726,13 @@ def _maybe_rebrief_cluster(article_id) -> None:
         _advance_clusters_to_researched([cluster_id], client)
         clusters = (
             client.table(CLUSTERS_TABLE)
-            .select("brief")
+            .select("pitch")
             .eq("cluster_id", cluster_id)
             .limit(1)
             .execute()
             .data
         ) or []
-        if not clusters or not (clusters[0].get("brief") or "").strip():
+        if not clusters or not (clusters[0].get("pitch") or "").strip():
             return
         from briefing.brief import rebrief_cluster
         rebrief_cluster(cluster_id)
