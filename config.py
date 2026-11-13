@@ -58,6 +58,14 @@ ZERNIO_PROFILE_ID = os.getenv("ZERNIO_PROFILE_ID", "")
 # so a deploy that predates the Railway variables keeps working.
 PORTAL_API_URL = os.getenv("PORTAL_API_URL", "")
 PORTAL_API_TOKEN = os.getenv("PORTAL_API_TOKEN", "")
+# BRANDS, from 13 Nov 2026. The Curve also runs a sister company's socials from the Admin
+# app, so `social_accounts` can hold a row per BRAND per platform (its `brand_id`), each
+# brand in its own Zernio profile. Everything this pipeline measures is The Curve's: its
+# followers, its posts' stats, its inbox. So every read of social_accounts names this
+# brand, and an inbox event for another brand's account is set aside (ingestion/inbox.py).
+# The id is the fixed one the Admin app's migration seeds (lib/brand-meta.ts holds the same
+# value); the column defaults to it, so rows from before brands existed are The Curve's.
+CURVE_BRAND_ID = os.getenv("CURVE_BRAND_ID", "00000000-0000-4000-8000-000000000001")
 # Window for the daily follower-series gap-fill. 89 days is the documented ceiling on
 # Zernio's Instagram follower-history endpoint; follower-stats (what we actually call)
 # isn't documented as capped, but staying inside the same bound keeps the two

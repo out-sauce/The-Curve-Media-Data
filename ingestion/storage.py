@@ -14,6 +14,7 @@ from config import (
     SUPABASE_URL,
     SUPABASE_SERVICE_ROLE_KEY,
     COMPETITOR_THUMBNAILS_BUCKET,
+    CURVE_BRAND_ID,
 )
 
 logger = logging.getLogger(__name__)
@@ -354,6 +355,11 @@ def upsert_self_content_stats(rows: list[dict[str, Any]]) -> int:
     import (ingestion/podcast.py) resolves an episode's Admin podcast_episodes row
     by title+date at write time, and a link a human corrected in the Admin must
     never be stolen back by a later sweep.
+
+    brand_id says whose post it is (the Admin also runs a sister company's socials).
+    A row that carries one is written with it on INSERT only; a row with none is The
+    Curve's, through the column's default. It is never changed on update: a post does
+    not move between brands, and a row from before brands is The Curve's.
     """
     if not rows:
         return 0
@@ -371,6 +377,8 @@ def upsert_self_content_stats(rows: list[dict[str, Any]]) -> int:
         scraped = {k: row.get(k) for k in allowed}
         calendar_item_id = row.get("calendar_item_id")
         podcast_episode_id = row.get("podcast_episode_id")
+        # Only where the column exists, like every other key here.
+        brand = {"brand_id": row["brand_id"]} if row.get("brand_id") and "brand_id" in columns else {}
         try:
             existing = (
                 client.table("content_stats")
@@ -397,6 +405,7 @@ def upsert_self_content_stats(rows: list[dict[str, Any]]) -> int:
                     "calendar_item_id": calendar_item_id,
                     "podcast_episode_id": podcast_episode_id,
                     "stats_synced_at": now_iso,
+                    **brand,
                     **scraped,
                 }).execute()
             written += 1
@@ -421,6 +430,8 @@ def get_self_social_accounts() -> dict[str, str]:
         client.table("social_accounts")
         .select("id, platform")
         .in_("platform", ["instagram", "tiktok", "linkedin", "youtube"])
+        # The Curve's rows: another brand has its own row on the same platform.
+        .eq("brand_id", CURVE_BRAND_ID)
         .execute()
     )
     accounts: dict[str, str] = {}
@@ -443,6 +454,7 @@ def get_social_account_by_platform(platform: str) -> dict[str, Any] | None:
         client.table("social_accounts")
         .select("id, follower_count")
         .eq("platform", platform)
+        .eq("brand_id", CURVE_BRAND_ID)
         .limit(1)
         .execute()
     )
@@ -479,6 +491,9 @@ def get_zernio_connected_accounts() -> dict[str, dict[str, Any]]:
         client.table("social_accounts")
         .select("id, platform, account_id, connected")
         .in_("platform", ["instagram", "tiktok", "linkedin", "youtube"])
+        # The Curve's rows: without this, another brand's account on the same platform
+        # could be the one kept, and its followers and posts filed as The Curve's.
+        .eq("brand_id", CURVE_BRAND_ID)
         .eq("connected", True)
         .not_.is_("account_id", "null")
         .execute()
@@ -492,9 +507,85 @@ def get_zernio_connected_accounts() -> dict[str, dict[str, Any]]:
     return accounts
 
 
-def get_follower_snapshot_history(platform: str) -> list[tuple[str, int]]:
+def get_other_brand_zernio_accounts() -> list[dict[str, Any]]:
     """
-    [(recorded_at, follower_count)] for a platform, oldest first, nulls dropped.
+    The Zernio-connected accounts of every brand OTHER than The Curve, each with the
+    profile it is in: [{brand_id, brand_name, profile_id, platform, social_account_id,
+    zernio_account_id}].
+
+    The Admin app also runs a sister company's socials. Its accounts sit in a profile of
+    their own at Zernio, and the portal refuses an account that is not in the profile a
+    call names, so a brand's numbers can only be read by naming its profile
+    (ingestion/zernio.py). A brand with no profile is left out: there is no way to ask.
+    """
+    client = get_client()
+    brands = (
+        client.table("brands")
+        .select("id, name, zernio_profile_id")
+        .neq("id", CURVE_BRAND_ID)
+        .not_.is_("zernio_profile_id", "null")
+        .execute()
+    )
+    by_id = {row["id"]: row for row in brands.data or []}
+    if not by_id:
+        return []
+    rows = (
+        client.table("social_accounts")
+        .select("id, platform, account_id, brand_id")
+        .in_("brand_id", list(by_id))
+        .in_("platform", ["instagram", "tiktok", "linkedin", "youtube"])
+        .eq("connected", True)
+        .not_.is_("account_id", "null")
+        .execute()
+    )
+    return [
+        {
+            "brand_id": row["brand_id"],
+            "brand_name": by_id[row["brand_id"]]["name"],
+            "profile_id": by_id[row["brand_id"]]["zernio_profile_id"],
+            "platform": row["platform"],
+            "social_account_id": row["id"],
+            "zernio_account_id": row["account_id"],
+        }
+        for row in rows.data or []
+    ]
+
+
+def get_other_brand_identifiers() -> tuple[set[str], set[str]]:
+    """
+    (zernio account ids, zernio profile ids) that belong to a brand OTHER than The Curve.
+
+    The Admin app also runs a sister company's socials, and Zernio's inbox webhook covers
+    every profile the portal holds for us. These are how an event for the other brand is
+    recognised (ingestion/inbox.py): positively, from the app's own tables, so an event
+    this cannot place is still treated as The Curve's, as every event was before.
+    """
+    client = get_client()
+    accounts = (
+        client.table("social_accounts")
+        .select("account_id")
+        .neq("brand_id", CURVE_BRAND_ID)
+        .not_.is_("account_id", "null")
+        .execute()
+    )
+    profiles = (
+        client.table("brands")
+        .select("zernio_profile_id")
+        .neq("id", CURVE_BRAND_ID)
+        .not_.is_("zernio_profile_id", "null")
+        .execute()
+    )
+    return (
+        {row["account_id"] for row in accounts.data or []},
+        {row["zernio_profile_id"] for row in profiles.data or []},
+    )
+
+
+def get_follower_snapshot_history(platform: str, brand_id: str = CURVE_BRAND_ID) -> list[tuple[str, int]]:
+    """
+    [(recorded_at, follower_count)] for one brand's platform, oldest first, nulls
+    dropped. The Curve's unless a brand is named: a post is measured against its own
+    brand's audience, never another's.
 
     Backs the followers-at-time denominator for engagement_audience — a post must be
     measured against the audience it had when it published, not today's. Paginated
@@ -509,6 +600,7 @@ def get_follower_snapshot_history(platform: str) -> list[tuple[str, int]]:
             client.table("follower_snapshots")
             .select("recorded_at, follower_count")
             .eq("platform", platform)
+            .eq("brand_id", brand_id)
             .order("recorded_at")
             .range(offset, offset + page_size - 1)
             .execute()
@@ -539,6 +631,7 @@ def upsert_follower_snapshot(
     engagement_30d: dict | None = None,
     day: date | None = None,
     insert_only: bool = False,
+    brand_id: str | None = None,
 ) -> bool:
     """
     Record one follower snapshot for a self channel, one row per UTC day: update that
@@ -557,6 +650,9 @@ def upsert_follower_snapshot(
     it is the denominator behind every engagement_audience value. A backfill that
     silently replaced a hand-entered count with a vendor's reconstruction would rewrite
     history no one could audit, so the backfill fills gaps only.
+
+    brand_id is the account's brand when it is not The Curve's (whose rows take the
+    column's default). It is written on insert; the lookup is already the account's own.
     """
     client = get_client()
     if day is not None:
@@ -589,14 +685,17 @@ def upsert_follower_snapshot(
         client.table("follower_snapshots").insert({
             "social_account_id": social_account_id,
             "platform": platform,
+            **({"brand_id": brand_id} if brand_id else {}),
             **values,
         }).execute()
     return True
 
 
-def get_recent_story_rows(platform: str, since_iso: str) -> list[dict[str, Any]]:
+def get_recent_story_rows(platform: str, since_iso: str, brand_id: str = CURVE_BRAND_ID) -> list[dict[str, Any]]:
     """
-    Stored story rows posted since `since_iso`, with their provenance blob.
+    One brand's stored story rows posted since `since_iso`, with their provenance blob.
+    The Curve's unless a brand is named: the settle pass asks an ACCOUNT about each
+    story, and an account can only answer for its own.
 
     Backs the story "settle" pass. A story's metrics are only final once it expires, so
     whatever the last hourly poll captured while it was live is systematically an
@@ -610,6 +709,7 @@ def get_recent_story_rows(platform: str, since_iso: str) -> list[dict[str, Any]]
         client.table("content_stats")
         .select("post_id, posted_at, platform_specific")
         .eq("platform", platform)
+        .eq("brand_id", brand_id)
         .gte("posted_at", since_iso)
         .execute()
     )

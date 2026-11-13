@@ -37,6 +37,7 @@ import hmac
 import logging
 import re
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 from config import (
@@ -55,6 +56,7 @@ from ingestion.storage import (
     find_inbox_conversation,
     get_inbox_conversation_state,
     get_inbox_post_state,
+    get_other_brand_identifiers,
     get_webhook_event,
     log_source_run,
     mark_conversation_unread,
@@ -438,6 +440,42 @@ def _handle_message_event(payload: dict, event: str) -> str:
     return "processed"
 
 
+# ── brands ────────────────────────────────────────────────────────────────────
+# The inbox this pipeline mirrors is The Curve's. The Admin app also runs a sister
+# company's socials in a second Zernio profile, and one webhook covers both, so its
+# comments and DMs arrive here too. Until the inbox tables carry a brand they are set
+# aside rather than filed beside The Curve's with nothing to tell them apart.
+_OTHER_BRAND_TTL_SECONDS = 60.0
+_other_brand: tuple[float, set[str], set[str]] | None = None
+
+
+def _is_other_brand(payload: dict) -> bool:
+    """
+    True when the event's account or profile is known to be another brand's.
+
+    Known, not guessed: an event this cannot place is The Curve's, as all of them were
+    before brands existed. A failed lookup also reads as "not another brand's", so a
+    database hiccup never drops The Curve's own messages.
+    """
+    global _other_brand
+    account = payload.get("account") or {}
+    account_id = account.get("accountId") or account.get("id")
+    profile = account.get("profileId")
+    profile_id = profile.get("_id") if isinstance(profile, dict) else profile
+    if not account_id and not profile_id:
+        return False
+    now = time.monotonic()
+    if _other_brand is None or now - _other_brand[0] > _OTHER_BRAND_TTL_SECONDS:
+        try:
+            accounts, profiles = get_other_brand_identifiers()
+        except Exception as exc:
+            logger.warning("Brand lookup failed, treating the event as The Curve's: %s", str(exc)[:200])
+            return False
+        _other_brand = (now, accounts, profiles)
+    _, accounts, profiles = _other_brand
+    return account_id in accounts or profile_id in profiles
+
+
 def process_webhook_event(event_id: str) -> None:
     """
     Process one ledger row. Never raises — the receiver has already acked.
@@ -453,7 +491,9 @@ def process_webhook_event(event_id: str) -> None:
         event = row.get("event") or ""
         payload = row.get("payload") or {}
 
-        if event == "comment.received":
+        if _is_other_brand(payload):
+            status = "ignored"
+        elif event == "comment.received":
             status = _handle_comment_received(payload)
         elif event in (
             "message.received", "message.sent", "message.edited",

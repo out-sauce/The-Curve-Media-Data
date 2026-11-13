@@ -50,6 +50,8 @@ Never raises — failures log and skip, matching ingestion/competitors.py's conv
 
 import logging
 import time
+from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 
 import httpx
@@ -61,9 +63,11 @@ from config import (
     COMPETITOR_POST_LIMIT,
     COMPETITOR_LOOKBACK_DAYS,
     SELF_CONTENT_STATS_LOOKBACK_DAYS,
+    CURVE_BRAND_ID,
 )
 from ingestion.storage import (
     get_follower_snapshot_history,
+    get_other_brand_zernio_accounts,
     get_zernio_connected_accounts,
     get_self_competitor_id,
     update_social_account_follower_count,
@@ -120,6 +124,42 @@ _ACCOUNT_INSIGHT_METRICS = (
     "reach", "views", "accounts_engaged", "total_interactions",
     "likes", "comments", "shares", "saves",
 )
+
+
+# ── whose account a run is for ─────────────────────────────────────────────────
+# The Admin app also runs a sister company's socials. Each brand's accounts sit in a
+# profile of their own at Zernio, and the portal refuses an account that is not in the
+# profile a call names. So a run for another brand's account names that brand's
+# profile on every call, and stamps what it writes with the brand, so its followers
+# and posts are counted on their own and never as The Curve's.
+#
+# A ContextVar, not a module global: the scheduler runs other Zernio work (the inbox
+# sweep shares this transport) on other threads, and a brand's profile leaking into
+# one of those calls would list the wrong brand's conversations as The Curve's.
+
+@dataclass(frozen=True)
+class _Brand:
+    id: str
+    name: str
+    #: The brand's Zernio profile; None for The Curve's own, which names none.
+    profile_id: str | None
+
+
+_CURVE = _Brand(CURVE_BRAND_ID, "The Curve", None)
+_brand_var: ContextVar[_Brand] = ContextVar("zernio_brand", default=_CURVE)
+
+
+def _brand() -> _Brand:
+    return _brand_var.get()
+
+
+def _stamp(rows: list[dict]) -> list[dict]:
+    """Mark rows as another brand's. The Curve's carry nothing: the column defaults to it."""
+    brand = _brand()
+    if brand.profile_id:
+        for row in rows:
+            row["brand_id"] = brand.id
+    return rows
 
 
 # ── HTTP ───────────────────────────────────────────────────────────────────────
@@ -179,6 +219,10 @@ def _portal_request(method: str, path: str, *, params: dict | None = None,
     base = _re.sub(r"/(api)?/?$", "", PORTAL_API_URL.rstrip("/")) + "/api/external-zernio"
     endpoint = path[len("/v1/"):] if path.startswith("/v1/") else path.lstrip("/")
     body = {"action": "proxy", "method": method, "endpoint": endpoint, "query": params or None, "body": json}
+    # Another brand's account is only served through that brand's profile.
+    profile_id = _brand().profile_id
+    if profile_id:
+        body["profile_id"] = profile_id
     delay = 2.0
     for attempt in range(_MAX_RETRIES):
         resp = httpx.post(base, headers={"Authorization": f"Bearer {PORTAL_API_TOKEN}"}, json=body, timeout=60)
@@ -215,6 +259,10 @@ def _request(method: str, path: str, *, params: dict | None = None,
     """
     if _portal_configured():
         return _portal_request(method, path, params=params, json=json)
+    if _brand().profile_id:
+        # The direct client cannot pin a profile, so it could not prove whose account
+        # it was reading. Another brand's numbers come through the portal or not at all.
+        raise ZernioAPIError("Another brand's account is only read through the portal", status=None, code="portal_required")
     url = f"{ZERNIO_API_BASE}{path}"
     delay = 2.0
     for attempt in range(_MAX_RETRIES):
@@ -303,7 +351,7 @@ def _nz(value) -> int | None:
     return number or None
 
 
-_follower_history: dict[str, list[tuple[str, int]]] = {}
+_follower_history: dict[tuple[str, str], list[tuple[str, int]]] = {}
 
 
 def reset_follower_cache() -> None:
@@ -326,11 +374,15 @@ def _followers_at(platform: str, published_at: str | None) -> int | None:
     ~48.8k in August, which would understate every older post). Falls back to the
     earliest snapshot for a post that predates our history, and returns None when we
     have no snapshots for the platform at all.
+
+    The history is the run's own brand's: a sister brand's post is measured against
+    that brand's audience, never The Curve's.
     """
-    if platform not in _follower_history:
-        rows = get_follower_snapshot_history(platform)
-        _follower_history[platform] = [(str(recorded)[:10], count) for recorded, count in rows]
-    history = _follower_history[platform]
+    key = (_brand().id, platform)
+    if key not in _follower_history:
+        rows = get_follower_snapshot_history(platform, _brand().id)
+        _follower_history[key] = [(str(recorded)[:10], count) for recorded, count in rows]
+    history = _follower_history[key]
     if not history:
         return None
     if not published_at:
@@ -820,6 +872,7 @@ def _backfill_follower_series(social_account_id: str, platform: str,
         try:
             if upsert_follower_snapshot(
                 social_account_id, platform, followers, day=day, insert_only=True,
+                brand_id=_brand().id if _brand().profile_id else None,
             ):
                 filled += 1
         except Exception as exc:
@@ -884,7 +937,7 @@ def _write_demographics(social_account_id: str, platform: str,
                 "value_type": "count",
                 "snapshot_date": snapshot_date,
             })
-    return upsert_audience_demographics(rows)
+    return upsert_audience_demographics(_stamp(rows))
 
 
 # ── run ────────────────────────────────────────────────────────────────────────
@@ -930,7 +983,7 @@ def _run_stories(zernio_account_id: str, platform: str) -> int:
             rows.append(row)
 
     settle_cutoff = datetime.now(timezone.utc) - timedelta(hours=_STORY_SETTLE_HOURS)
-    for stored in get_recent_story_rows(_STORY_PLATFORM, settle_cutoff.isoformat()):
+    for stored in get_recent_story_rows(_STORY_PLATFORM, settle_cutoff.isoformat(), _brand().id):
         story_id = stored.get("post_id")
         provenance = stored.get("platform_specific") or {}
         if not story_id or story_id in active_ids:
@@ -953,14 +1006,15 @@ def _run_stories(zernio_account_id: str, platform: str) -> int:
     if not rows:
         return 0
     _attach_thumbnails(_STORY_PLATFORM, [r for r in rows if "_thumb_src" in r])
-    return upsert_self_content_stats(rows)
+    return upsert_self_content_stats(_stamp(rows))
 
 
 def _run_account(platform: str, account: dict, competitor_id: str | None,
                  with_daily: bool) -> None:
     zernio_account_id = account["zernio_account_id"]
     social_account_id = account["social_account_id"]
-    name = f"The Curve ({platform}, zernio)"
+    brand = _brand()
+    name = f"{brand.name} ({platform}, zernio)"
     content_rows_written = 0
     follower_count = None
     try:
@@ -998,6 +1052,7 @@ def _run_account(platform: str, account: dict, competitor_id: str | None,
         if follower_count is not None:
             upsert_follower_snapshot(
                 social_account_id, platform, follower_count, engagement_30d=insights,
+                brand_id=brand.id if brand.profile_id else None,
             )
             update_social_account_follower_count(social_account_id, follower_count)
         if series:
@@ -1019,7 +1074,7 @@ def _run_account(platform: str, account: dict, competitor_id: str | None,
 
         if rows:
             _attach_thumbnails(platform, rows)
-            content_rows_written = upsert_self_content_stats(rows)
+            content_rows_written = upsert_self_content_stats(_stamp(rows))
 
         # 3. Stories (Instagram only, hourly — they expire in 24h).
         if platform == "instagram":
@@ -1041,8 +1096,9 @@ def _run_account(platform: str, account: dict, competitor_id: str | None,
             except Exception as exc:
                 logger.warning("Zernio demographics run failed: %s", str(exc)[:300])
 
-        # 5. The Curve's own competitor card.
-        if competitor_id and platform == "instagram":
+        # 5. The Curve's own competitor card. Never another brand's: the card is The
+        #    Curve's row on the comparison leaderboard.
+        if competitor_id and platform == "instagram" and not brand.profile_id:
             try:
                 _write_competitor_card(
                     competitor_id, platform, rows, follower_count,
@@ -1055,13 +1111,28 @@ def _run_account(platform: str, account: dict, competitor_id: str | None,
                 )
 
         logger.info(
-            "Zernio %s: followers=%s / %d content_stats rows refreshed",
-            platform, follower_count, content_rows_written,
+            "Zernio %s %s: followers=%s / %d content_stats rows refreshed",
+            brand.name, platform, follower_count, content_rows_written,
         )
         log_source_run(name, _RUN_CATEGORY, "ok", content_rows_written)
     except Exception as exc:
-        logger.warning("Zernio %s run failed: %s", platform, str(exc)[:300])
+        logger.warning("Zernio %s %s run failed: %s", brand.name, platform, str(exc)[:300])
         log_source_run(name, _RUN_CATEGORY, "error", 0, str(exc)[:500])
+
+
+def _other_brand_accounts() -> list[dict]:
+    """
+    Every other brand's connected accounts, or none when they cannot be read safely:
+    without the portal there is no way to pin a brand's profile. A failed read is not
+    The Curve's problem, so it never stops The Curve's own run.
+    """
+    if not _portal_configured():
+        return []
+    try:
+        return get_other_brand_zernio_accounts()
+    except Exception as exc:
+        logger.warning("Could not read other brands' accounts: %s", str(exc)[:200])
+        return []
 
 
 def _run(with_daily: bool) -> None:
@@ -1069,7 +1140,8 @@ def _run(with_daily: bool) -> None:
         logger.warning("ZERNIO_API_KEY not set — skipping Zernio run")
         return
     accounts = get_zernio_connected_accounts()
-    if not accounts:
+    others = _other_brand_accounts()
+    if not accounts and not others:
         logger.info("No Zernio-connected self accounts yet — skipping")
         return
     reset_follower_cache()
@@ -1078,6 +1150,16 @@ def _run(with_daily: bool) -> None:
         account = accounts.get(platform)
         if account:
             _run_account(platform, account, competitor_id, with_daily)
+    # Each other brand's accounts, read through that brand's own profile and written
+    # as that brand's. After The Curve's, so a fault here costs The Curve nothing.
+    for other in others:
+        if other["platform"] not in _PLATFORMS:
+            continue
+        token = _brand_var.set(_Brand(other["brand_id"], other["brand_name"], other["profile_id"]))
+        try:
+            _run_account(other["platform"], other, None, with_daily)
+        finally:
+            _brand_var.reset(token)
 
 
 def run_zernio_hourly() -> None:
