@@ -1,13 +1,18 @@
+# Every line is pinned. Seven of these floated (">=") until 13 Nov 2026, so each
+# deploy installed whatever was newest that day: playwright 1.65.1, two days old,
+# needed a system library the image lacked and failed the build, on a change that
+# touched no dependency. The pins are what the last good deploy (28 Oct 2026)
+# resolved to. Raise one on purpose, in its own change, and watch that deploy.
 feedparser==6.0.11
-trafilatura>=1.12.0
+trafilatura==2.3.1
 httpx==0.27.0
 supabase==2.5.0
 APScheduler==3.10.4
 python-dotenv==1.0.1
 langdetect==1.0.9
-rapidfuzz>=3.0.0
-anthropic>=0.69.0  # structured outputs (output_config.format) used in scoring/score.py
-fastapi>=0.110.0
-uvicorn[standard]>=0.29.0
-playwright>=1.44.0  # research-stage browser scraper (Chromium, installed via Dockerfile)
-browserbase>=1.0.0  # headful remote browser for site-auth login capture (research/site_auth.py)
+rapidfuzz==3.14.6
+anthropic==2.3.0  # structured outputs (output_config.format) used in scoring/score.py
+fastapi==0.162.0
+uvicorn[standard]==0.50.1  # the newest that takes websockets 12, which supabase 2.5.0 holds us to
+playwright==1.64.1  # research-stage browser scraper (Chromium, installed via Dockerfile)
+browserbase==1.22.0  # headful remote browser for site-auth login capture (research/site_auth.py)
