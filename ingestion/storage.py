@@ -14,6 +14,7 @@ from config import (
     SUPABASE_URL,
     SUPABASE_SERVICE_ROLE_KEY,
     COMPETITOR_THUMBNAILS_BUCKET,
+    CURVE_BRAND_ID,
 )
 
 logger = logging.getLogger(__name__)
@@ -421,6 +422,8 @@ def get_self_social_accounts() -> dict[str, str]:
         client.table("social_accounts")
         .select("id, platform")
         .in_("platform", ["instagram", "tiktok", "linkedin", "youtube"])
+        # The Curve's rows: another brand has its own row on the same platform.
+        .eq("brand_id", CURVE_BRAND_ID)
         .execute()
     )
     accounts: dict[str, str] = {}
@@ -443,6 +446,7 @@ def get_social_account_by_platform(platform: str) -> dict[str, Any] | None:
         client.table("social_accounts")
         .select("id, follower_count")
         .eq("platform", platform)
+        .eq("brand_id", CURVE_BRAND_ID)
         .limit(1)
         .execute()
     )
@@ -479,6 +483,9 @@ def get_zernio_connected_accounts() -> dict[str, dict[str, Any]]:
         client.table("social_accounts")
         .select("id, platform, account_id, connected")
         .in_("platform", ["instagram", "tiktok", "linkedin", "youtube"])
+        # The Curve's rows: without this, another brand's account on the same platform
+        # could be the one kept, and its followers and posts filed as The Curve's.
+        .eq("brand_id", CURVE_BRAND_ID)
         .eq("connected", True)
         .not_.is_("account_id", "null")
         .execute()
@@ -490,6 +497,36 @@ def get_zernio_connected_accounts() -> dict[str, dict[str, Any]]:
             "zernio_account_id": row["account_id"],
         })
     return accounts
+
+
+def get_other_brand_identifiers() -> tuple[set[str], set[str]]:
+    """
+    (zernio account ids, zernio profile ids) that belong to a brand OTHER than The Curve.
+
+    The Admin app also runs a sister company's socials, and Zernio's inbox webhook covers
+    every profile the portal holds for us. These are how an event for the other brand is
+    recognised (ingestion/inbox.py): positively, from the app's own tables, so an event
+    this cannot place is still treated as The Curve's, as every event was before.
+    """
+    client = get_client()
+    accounts = (
+        client.table("social_accounts")
+        .select("account_id")
+        .neq("brand_id", CURVE_BRAND_ID)
+        .not_.is_("account_id", "null")
+        .execute()
+    )
+    profiles = (
+        client.table("brands")
+        .select("zernio_profile_id")
+        .neq("id", CURVE_BRAND_ID)
+        .not_.is_("zernio_profile_id", "null")
+        .execute()
+    )
+    return (
+        {row["account_id"] for row in accounts.data or []},
+        {row["zernio_profile_id"] for row in profiles.data or []},
+    )
 
 
 def get_follower_snapshot_history(platform: str) -> list[tuple[str, int]]:
