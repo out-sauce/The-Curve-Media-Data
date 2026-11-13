@@ -14,6 +14,15 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Playwright's own driver is a bundled Node binary, and it has to RUN before
+# `playwright install --with-deps` can fetch anything. Newer drivers link
+# libatomic, which the slim image does not carry: without it the step dies with
+# "libatomic.so.1: cannot open shared object file" (exit 127), as the 13 Nov 2026
+# deploy did. Installed here so a later playwright bump cannot fail the same way.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libatomic1 \
+    && rm -rf /var/lib/apt/lists/*
+
 # Install Chromium + the system libraries it needs (fonts, X libs, etc.).
 RUN playwright install --with-deps chromium
 
