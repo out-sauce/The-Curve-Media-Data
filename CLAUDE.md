@@ -369,6 +369,16 @@ triggers stages over HTTP.
   mirrored. **TikTok has no comment API and no DMs in Zernio at all** — one of the four
   brand channels is simply not covered, and the UI says so rather than showing an empty
   list.
+  **Every brand's inbox, each filed as its own** (26 Nov 2026). The Admin app also runs
+  a sister company's socials, in a profile of its own at Zernio, and one subscription
+  covers both. `inbox_posts.brand_id` / `inbox_conversations.brand_id` say whose account
+  a post or thread is on (The Curve's by default): the sweep walks her profile and then
+  each other brand's (`get_other_brands`, `brand_scope`), and a webhook event is filed
+  under the brand its ACCOUNT belongs to, its profile second (`_brand_of`). An event
+  that cannot be placed is The Curve's, as every event was before brands existed, and so
+  is one whose lookup failed — a database hiccup must never file her messages under
+  someone else. Every LISTING names `current_profile_id()`, never the bare default: the
+  wrong profile would mirror another brand's threads as The Curve's.
   **Three defects found on the first live Instagram sync (2026-08-18) and fixed.**
   All three were silent — the sweep logged `ok` throughout.
   - **`/v1/inbox/conversations/{id}/messages` REQUIRES `accountId`.** Without it every

@@ -50,6 +50,8 @@ Never raises — failures log and skip, matching ingestion/competitors.py's conv
 
 import logging
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -151,6 +153,40 @@ _brand_var: ContextVar[_Brand] = ContextVar("zernio_brand", default=_CURVE)
 
 def _brand() -> _Brand:
     return _brand_var.get()
+
+
+@contextmanager
+def brand_scope(brand_id: str, name: str, profile_id: str | None) -> Iterator[None]:
+    """
+    Run a block as one brand: every Zernio call inside it names that brand's profile
+    (`current_profile_id`) and everything it writes is stamped with the brand
+    (`brand_fields`). The inbox sweep uses it a brand at a time, as the stats run does.
+
+    A ContextVar underneath, so a brand set on one thread is not seen on another: the
+    scheduler runs the inbox sweep and the stats run side by side on this transport.
+    """
+    token = _brand_var.set(_Brand(brand_id, name, profile_id))
+    try:
+        yield
+    finally:
+        _brand_var.reset(token)
+
+
+def current_brand_id() -> str:
+    """Whose work this is: the brand in scope, The Curve's outside one."""
+    return _brand().id
+
+
+def brand_fields() -> dict:
+    """
+    `{"brand_id": ...}` for another brand's row, `{}` for The Curve's.
+
+    The Curve's rows carry nothing on purpose: the column defaults to her id, so a row
+    written by code that knows nothing of brands — an older deployment, a flow not yet
+    taught — is hers, which is what it always was.
+    """
+    brand = _brand()
+    return {"brand_id": brand.id} if brand.profile_id else {}
 
 
 def _stamp(rows: list[dict]) -> list[dict]:
@@ -1155,11 +1191,8 @@ def _run(with_daily: bool) -> None:
     for other in others:
         if other["platform"] not in _PLATFORMS:
             continue
-        token = _brand_var.set(_Brand(other["brand_id"], other["brand_name"], other["profile_id"]))
-        try:
+        with brand_scope(other["brand_id"], other["brand_name"], other["profile_id"]):
             _run_account(other["platform"], other, None, with_daily)
-        finally:
-            _brand_var.reset(token)
 
 
 def run_zernio_hourly() -> None:
@@ -1186,6 +1219,16 @@ def run_zernio_daily() -> None:
 # ── The profile every list call is scoped to ───────────────────────────────────
 
 _profile_id: str | None = None
+
+
+def current_profile_id() -> str:
+    """
+    The profile the call being made now belongs to: the brand's in scope, else this
+    pipeline's own (The Curve's). Every LISTING must name it — a listing that names no
+    profile returns every Out Sauce client's conversations and comments, and one that
+    names the wrong profile returns another brand's as The Curve's.
+    """
+    return _brand().profile_id or zernio_profile_id()
 
 
 def zernio_profile_id() -> str:

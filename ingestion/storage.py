@@ -551,34 +551,59 @@ def get_other_brand_zernio_accounts() -> list[dict[str, Any]]:
     ]
 
 
-def get_other_brand_identifiers() -> tuple[set[str], set[str]]:
+def get_other_brands() -> list[dict[str, Any]]:
     """
-    (zernio account ids, zernio profile ids) that belong to a brand OTHER than The Curve.
+    Every brand OTHER than The Curve that has a profile at Zernio:
+    [{id, name, profile_id}].
 
-    The Admin app also runs a sister company's socials, and Zernio's inbox webhook covers
-    every profile the portal holds for us. These are how an event for the other brand is
-    recognised (ingestion/inbox.py): positively, from the app's own tables, so an event
-    this cannot place is still treated as The Curve's, as every event was before.
+    A brand with no profile is left out — there is no way to ask Zernio anything about
+    it — and so is The Curve, whose profile is the pipeline's own default. The inbox
+    sweep walks this list, each brand through its own profile (ingestion/inbox.py).
     """
     client = get_client()
-    accounts = (
-        client.table("social_accounts")
-        .select("account_id")
-        .neq("brand_id", CURVE_BRAND_ID)
-        .not_.is_("account_id", "null")
-        .execute()
-    )
-    profiles = (
+    response = (
         client.table("brands")
-        .select("zernio_profile_id")
+        .select("id, name, zernio_profile_id")
         .neq("id", CURVE_BRAND_ID)
         .not_.is_("zernio_profile_id", "null")
         .execute()
     )
-    return (
-        {row["account_id"] for row in accounts.data or []},
-        {row["zernio_profile_id"] for row in profiles.data or []},
+    return [
+        {"id": row["id"], "name": row["name"], "profile_id": row["zernio_profile_id"]}
+        for row in response.data or []
+    ]
+
+
+def get_other_brand_owners() -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    """
+    Which brand a Zernio account id, or a Zernio profile id, belongs to — for every
+    brand OTHER than The Curve: ({account_id: brand}, {profile_id: brand}), each brand
+    {id, name, profile_id}.
+
+    The Admin app also runs a sister company's socials, and Zernio's inbox webhook
+    covers every profile the portal holds for us, so its comments and DMs arrive on the
+    same subscription. These maps are how such an event is FILED under the right brand
+    (ingestion/inbox.py): positively, from the app's own tables, so an event this cannot
+    place is still treated as The Curve's, as every event was before brands existed.
+    """
+    brands = {b["id"]: b for b in get_other_brands()}
+    if not brands:
+        return {}, {}
+    client = get_client()
+    accounts = (
+        client.table("social_accounts")
+        .select("account_id, brand_id")
+        .in_("brand_id", list(brands))
+        .not_.is_("account_id", "null")
+        .execute()
     )
+    by_account = {
+        row["account_id"]: brands[row["brand_id"]]
+        for row in accounts.data or []
+        if row["brand_id"] in brands
+    }
+    by_profile = {b["profile_id"]: b for b in brands.values()}
+    return by_account, by_profile
 
 
 def get_follower_snapshot_history(platform: str, brand_id: str = CURVE_BRAND_ID) -> list[tuple[str, int]]:
