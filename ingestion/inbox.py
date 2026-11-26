@@ -29,12 +29,20 @@ empty tab: TikTok has NO comment API and NO DMs in Zernio at all — and TikTok 
 of the four brand channels. YouTube, LinkedIn and Threads have comments but no DMs.
 DMs in practice means Instagram (and Facebook, if a Page is ever connected).
 
+EVERY BRAND'S INBOX, EACH FILED AS ITS OWN. The Admin app also runs a sister company's
+socials, in a profile of its own at Zernio, and one webhook subscription covers both.
+A row carries `brand_id` (whose account the comment or thread is on), so the sweep
+walks The Curve's profile and then each other brand's, and an event is filed under the
+brand its account belongs to. An event this cannot place is The Curve's, as every event
+was before brands existed.
+
 Never raises — failures log and skip, matching the rest of ingestion/.
 """
 
 import hashlib
 import hmac
 import logging
+from contextlib import nullcontext
 import re
 import threading
 import time
@@ -50,13 +58,21 @@ from config import (
     INBOX_THREAD_REFRESH_DAYS,
     INBOX_EVENT_RETENTION_DAYS,
 )
-from ingestion.zernio import zernio_get, zernio_profile_id, zernio_request
+from ingestion.zernio import (
+    brand_fields,
+    brand_scope,
+    current_profile_id,
+    zernio_get,
+    zernio_profile_id,
+    zernio_request,
+)
 from ingestion.storage import (
     claim_webhook_events,
     find_inbox_conversation,
     get_inbox_conversation_state,
     get_inbox_post_state,
-    get_other_brand_identifiers,
+    get_other_brand_owners,
+    get_other_brands,
     get_webhook_event,
     log_source_run,
     mark_conversation_unread,
@@ -177,6 +193,8 @@ def _attachment_rows(items) -> list[dict]:
 def _conversation_row(conversation: dict, account: dict, platform: str) -> dict:
     profile = conversation.get("instagramProfile") or {}
     return {
+        # Whose account it is on: nothing for The Curve's, whose id is the default.
+        **brand_fields(),
         "platform": platform,
         "account_id": account.get("accountId") or account.get("id"),
         "account_username": account.get("username"),
@@ -264,6 +282,7 @@ def _message_row(message: dict, conversation_uuid: str) -> dict:
 
 def _post_row(post: dict, account: dict, platform: str) -> dict:
     return {
+        **brand_fields(),
         "platform": platform,
         "account_id": account.get("accountId") or account.get("id"),
         "account_username": account.get("username"),
@@ -441,21 +460,22 @@ def _handle_message_event(payload: dict, event: str) -> str:
 
 
 # ── brands ────────────────────────────────────────────────────────────────────
-# The inbox this pipeline mirrors is The Curve's. The Admin app also runs a sister
-# company's socials in a second Zernio profile, and one webhook covers both, so its
-# comments and DMs arrive here too. Until the inbox tables carry a brand they are set
-# aside rather than filed beside The Curve's with nothing to tell them apart.
+# One webhook subscription covers every profile the portal holds for us, so a sister
+# brand's comments and DMs arrive on the same hook as The Curve's. An event is filed
+# under the brand its ACCOUNT belongs to (its profile is the fallback), and the row
+# carries that brand, so both inboxes are one queue in the app with each message
+# labelled.
+#
+# Known, not guessed: an event this cannot place is The Curve's, as all of them were
+# before brands existed, and a failed lookup reads the same way — a database hiccup
+# must never file The Curve's own messages under someone else.
 _OTHER_BRAND_TTL_SECONDS = 60.0
-_other_brand: tuple[float, set[str], set[str]] | None = None
+_other_brand: tuple[float, dict[str, dict], dict[str, dict]] | None = None
 
 
-def _is_other_brand(payload: dict) -> bool:
+def _brand_of(payload: dict) -> dict | None:
     """
-    True when the event's account or profile is known to be another brand's.
-
-    Known, not guessed: an event this cannot place is The Curve's, as all of them were
-    before brands existed. A failed lookup also reads as "not another brand's", so a
-    database hiccup never drops The Curve's own messages.
+    The brand an event belongs to — {id, name, profile_id} — or None for The Curve's.
     """
     global _other_brand
     account = payload.get("account") or {}
@@ -463,17 +483,17 @@ def _is_other_brand(payload: dict) -> bool:
     profile = account.get("profileId")
     profile_id = profile.get("_id") if isinstance(profile, dict) else profile
     if not account_id and not profile_id:
-        return False
+        return None
     now = time.monotonic()
     if _other_brand is None or now - _other_brand[0] > _OTHER_BRAND_TTL_SECONDS:
         try:
-            accounts, profiles = get_other_brand_identifiers()
+            by_account, by_profile = get_other_brand_owners()
         except Exception as exc:
-            logger.warning("Brand lookup failed, treating the event as The Curve's: %s", str(exc)[:200])
-            return False
-        _other_brand = (now, accounts, profiles)
-    _, accounts, profiles = _other_brand
-    return account_id in accounts or profile_id in profiles
+            logger.warning("Brand lookup failed, filing the event as The Curve's: %s", str(exc)[:200])
+            return None
+        _other_brand = (now, by_account, by_profile)
+    _, by_account, by_profile = _other_brand
+    return by_account.get(account_id) or by_profile.get(profile_id)
 
 
 def process_webhook_event(event_id: str) -> None:
@@ -491,20 +511,24 @@ def process_webhook_event(event_id: str) -> None:
         event = row.get("event") or ""
         payload = row.get("payload") or {}
 
-        if _is_other_brand(payload):
-            status = "ignored"
-        elif event == "comment.received":
-            status = _handle_comment_received(payload)
-        elif event in (
-            "message.received", "message.sent", "message.edited",
-            "message.deleted", "message.delivered", "message.read",
-        ):
-            status = _handle_message_event(payload, event)
-        elif event in ("conversation.started", "reaction.received"):
-            conversation_uuid, _ = _resolve_conversation(payload)
-            status = "processed" if conversation_uuid else "deferred"
-        else:
-            status = "ignored"
+        # Inside the event's own brand, so every row it writes is filed under it.
+        # The handlers call no Zernio endpoint, but the scope costs nothing and keeps
+        # one notion of whose work this is (ingestion/zernio.py brand_scope).
+        brand = _brand_of(payload)
+        scope = brand_scope(brand["id"], brand["name"], brand["profile_id"]) if brand else nullcontext()
+        with scope:
+            if event == "comment.received":
+                status = _handle_comment_received(payload)
+            elif event in (
+                "message.received", "message.sent", "message.edited",
+                "message.deleted", "message.delivered", "message.read",
+            ):
+                status = _handle_message_event(payload, event)
+            elif event in ("conversation.started", "reaction.received"):
+                conversation_uuid, _ = _resolve_conversation(payload)
+                status = "processed" if conversation_uuid else "deferred"
+            else:
+                status = "ignored"
 
         mark_webhook_event(event_id, status, attempts)
     except Exception as exc:
@@ -560,8 +584,10 @@ def _sweep_conversations(full: bool) -> int:
     cursor = None
 
     for _ in range(max_pages):
-        # Scoped to OUR profile: the key is shared across Out Sauce's clients (12 Oct 2026).
-        params = {"limit": INBOX_PAGE_LIMIT, "sortOrder": "desc", "profileId": zernio_profile_id()}
+        # Scoped to the profile in scope — this pipeline's own, or the brand the
+        # sweep is walking. The key is shared across Out Sauce's clients (12 Oct 2026),
+        # and the WRONG profile would file another brand's threads as The Curve's.
+        params = {"limit": INBOX_PAGE_LIMIT, "sortOrder": "desc", "profileId": current_profile_id()}
         if cursor:
             params["cursor"] = cursor
         payload = zernio_get("/v1/inbox/conversations", params)
@@ -700,7 +726,7 @@ def _sweep_comments(full: bool) -> int:
             "sortOrder": "desc",
             "since": since.isoformat(),
             "minComments": 1,
-            "profileId": zernio_profile_id(),
+            "profileId": current_profile_id(),
         }
         if cursor:
             params["cursor"] = cursor
@@ -808,6 +834,18 @@ def _sweep_comment_thread(platform_post_id: str, account_id: str | None,
             break
 
 
+def _other_brands() -> list[dict]:
+    """
+    Every other brand with a profile at Zernio, or none when they cannot be read. A
+    failed read is not The Curve's problem, so it never stops The Curve's own sweep.
+    """
+    try:
+        return get_other_brands()
+    except Exception as exc:
+        logger.warning("Could not read other brands: %s", str(exc)[:200])
+        return []
+
+
 def run_inbox_sweep(full: bool = False) -> None:
     """
     Reconcile the mirror against Zernio.
@@ -828,6 +866,17 @@ def run_inbox_sweep(full: bool = False) -> None:
             logger.info("Zernio inbox: re-processed %d pending webhook events", drained)
         total += _sweep_comments(full)
         total += _sweep_conversations(full)
+        # Then each other brand, through ITS profile and stamped as its own. After The
+        # Curve's, so a fault reading a brand costs The Curve's sweep nothing, and each
+        # brand is independent of the next.
+        for brand in _other_brands():
+            try:
+                with brand_scope(brand["id"], brand["name"], brand["profile_id"]):
+                    touched = _sweep_comments(full) + _sweep_conversations(full)
+                total += touched
+                logger.info("Zernio inbox sweep (%s): %d touched", brand["name"], touched)
+            except Exception as exc:
+                logger.warning("Zernio inbox sweep for %s failed: %s", brand["name"], str(exc)[:200])
         if full:
             pruned = prune_webhook_events(INBOX_EVENT_RETENTION_DAYS)
             if pruned:
@@ -890,9 +939,11 @@ def register_webhook(public_url: str | None = None) -> dict:
         "secret": ZERNIO_WEBHOOK_SECRET,
         "events": list(INBOX_WEBHOOK_EVENTS),
         "isActive": True,
-        # Scoped to our profile, or a re-registration would widen the subscription back to
-        # every client on the shared key (it was unscoped until 12 Oct 2026).
-        "profileIds": [zernio_profile_id()],
+        # Scoped to OUR profiles — The Curve's and every brand's whose socials we run
+        # — never unscoped: a re-registration would otherwise widen the subscription
+        # back to every client on the shared key (it was unscoped until 12 Oct 2026).
+        # A brand missing here is a brand whose comments and DMs never arrive.
+        "profileIds": [zernio_profile_id(), *(b["profile_id"] for b in _other_brands())],
     }
     try:
         existing = zernio_request("GET", "/v1/webhooks/settings")
